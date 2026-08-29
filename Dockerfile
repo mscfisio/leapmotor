@@ -42,7 +42,6 @@ EXPOSE 4000
 # Persist the data dir even when the user forgets `-v ...:/data`: Docker creates an
 # anonymous volume, so trips/charges/login survive a container recreate instead of
 # living in the throwaway container layer.
-VOLUME /data
 
 # Liveness: hit /healthz (200 while awaiting setup or polling recently, 503 if wedged).
 # Uses python (no curl in the slim image). start-period covers first boot.
