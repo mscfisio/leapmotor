@@ -1,19 +1,35 @@
 """Read-only DB queries for the web layer."""
 import json
+import logging
 import math
+import re
 import sqlite3
 import statistics
 import time
 import zlib
+from dataclasses import dataclass
 from datetime import date, datetime, timezone, timedelta
+from itertools import groupby, pairwise
 from pathlib import Path
 from typing import Optional
 import os
+import sys
+import contextlib
+import threading
 
 import i18n
 import crypto  # hard import at module top: a missing crypto dep must fail web boot loudly,
               # never silently degrade a per-request secret read
 import capability_profile
+import gps_position
+
+# The poller's reading of a frame, on the path for one import: the two directories share module names.
+_POLLER_DIR = str(Path(__file__).resolve().parent.parent / "poller")
+sys.path.insert(0, _POLLER_DIR)
+try:
+    from charge_signals import _sf, _si, is_charging, is_plugged_in
+finally:
+    sys.path.remove(_POLLER_DIR)
 
 # Timestamps are stored in UTC (poller uses datetime.now(timezone.utc)); the UI must show
 # LOCAL time. The zone is resolved with this precedence (see _local_tz):
@@ -60,9 +76,27 @@ def _resolve_tz(name: str):
     return _env_tz()
 
 
+# How long the zone's NAME is held before it is read again. The ZoneInfo was already memoised; the
+# read that says which zone was not, and it happens once per timestamp localised: profiled on a
+# real database, one open of the Statistics page issued 1207 queries and 1172 of them were this
+# one, each on its own SQLite connection. A zone changes when someone changes it in Settings, never
+# while a page is being drawn, and a change made through this process drops the cache at once — so
+# the only thing this window can delay is a change made by the OTHER process.
+# → tests/test_the_clock_is_not_read_once_per_row.py
+def _invalidate_timezone() -> None:
+    """Kept for callers that used to drop a held zone name. Nothing is held any more: the zone is
+    resolved once per loop and handed down (see `_local_dt(tz=...)`), so there is no cache to
+    invalidate and a setting written by the OTHER process is never served stale."""
+    return None
+
+
 def _local_tz():
     """The zone every timestamp is displayed in — precedence UI setting > env TZ > system local.
-    Cheap: one indexed settings read + a memoised ZoneInfo. Never raises (broken DB → container tz)."""
+    One indexed settings read + a memoised ZoneInfo. Never raises (broken DB → container tz).
+
+    🔴 It is one read PER CALL, and callers that localise many rows must not call it per row: that
+    cost 1172 reads to open the Statistics page once, each on its own SQLite connection. Resolve it
+    once and pass it to `_local_dt(tz=...)`. → tests/test_the_clock_is_not_read_once_per_row.py"""
     try:
         name = get_setting("timezone", "")
     except Exception:
@@ -73,9 +107,12 @@ def _local_tz():
     return _TZ_CACHE["tz"]
 
 
-def _local_dt(s) -> Optional[datetime]:
-    """Parse a stored UTC timestamp and return it as an aware datetime in the
-    local timezone. Returns None if the value is missing/unparseable."""
+def _local_dt(s, tz=None) -> Optional[datetime]:
+    """Parse a stored UTC timestamp and return it as an aware datetime in the local timezone.
+    Returns None if the value is missing/unparseable.
+
+    `tz` is for loops: resolving the zone reads a setting, and a page that localises a thousand
+    rows must read it once, not a thousand times."""
     if not s:
         return None
     try:
@@ -84,7 +121,7 @@ def _local_dt(s) -> Optional[datetime]:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(_local_tz())
+    return dt.astimezone(tz or _local_tz())
 
 
 def local_to_utc_iso(s, tz=None):
@@ -137,6 +174,12 @@ def detected_tz_name() -> str:
     except Exception:  # noqa: BLE001
         pass
     return "UTC"
+
+
+def display_tz_name() -> str:
+    """The IANA name of the zone every time on screen is shown in, for the browser to format a time
+    itself: each moment then gets its own offset, which a drive across a clock change needs."""
+    return getattr(_local_tz(), "key", None) or detected_tz_name()
 
 
 def pin_auto_timezone() -> str:
@@ -200,10 +243,14 @@ def timezone_options() -> dict:
     return out
 
 
-def _local_iso(s):
+def _local_iso(s, tz=None):
     """Convert a stored UTC timestamp string to a local-time ISO string, so that
-    template slices like started_at[11:16] display local time. Falls back to input."""
-    dt = _local_dt(s)
+    template slices like started_at[11:16] display local time. Falls back to input.
+
+    `tz` is for loops, exactly like `_local_dt`: resolving the zone reads a setting, and a page
+    that localises a thousand rows must read it once — the monthly report was reading it 1280
+    times. → tests/test_the_clock_is_not_read_once_per_row.py"""
+    dt = _local_dt(s, tz)
     return dt.isoformat() if dt else s
 
 
@@ -225,29 +272,52 @@ def get_charge_local_date(charge_id: int) -> "date | None":
 
 # In-memory optimistic overlay: after a command, keep the expected state for
 # _OPT_TTL seconds so the poller can't overwrite it before the UI refreshes.
-_opt_overrides: dict = {}
-_opt_expiry: float = 0.0
+# Per VEHICLE: {vehicle_id: (overrides, expires_at)}. The row this overlay mirrors is already
+# scoped when it is written (see write_optimistic_status) — the in-memory copy was not, so a command
+# sent to one car was replayed onto whichever car was selected next, for up to _OPT_TTL seconds.
+_opt_by_vehicle: dict = {}
 _OPT_TTL = 30
 
 
 # AC, DC and HPC are acronyms and mean the same in every language Mate speaks — those stay.
 # ⚠️ The comment that used to sit here said ALL of these were "intentionally language-neutral", and
-# that was the wrong half of the rule: **Home, FREE and Manual are ordinary English words**. On a
+# that was the wrong half of the rule: **Home and FREE are ordinary English words**. On a
 # Polish interface the charge badge read "Home" while the monthly report, using its own key, read
 # "Dom" — the app contradicting itself on one screen (@konrad300, #210).
 #
-# 🔑 Two of the three words already existed, translated by native speakers, so they are REUSED:
-# `report_home` is the very key whose "Dom" exposed the mismatch, and `charge_free` was already
-# there. Only "Manual" had to be added.
-_CHARGE_TYPE_LABEL_KEY = {"HOME": "report_home", "FREE": "charge_free", "MANUAL": "charge_manual"}
+# 🔑 Both already existed, translated by native speakers, so they are REUSED: `report_home` is the
+# very key whose "Dom" exposed the mismatch, and `charge_free` was already there.
+#
+# 'MANUAL' used to be a seventh member of this dict — a pricing-basis flag wearing a location's
+# name, not a real type. It no longer is: `location_type` is always one of the five below now, and
+# "was this priced by hand" lives in its own column, `cost_manual`. See db migration + charges.
+_CHARGE_TYPE_LABEL_KEY = {"HOME": "report_home", "FREE": "charge_free"}
 CHARGE_TYPES = {
     "HOME": {"label": "Home", "icon": "🏠", "color": "#22c55e"},
     "AC":   {"label": "AC",   "icon": "🔌", "color": "#60a5fa"},
     "FAST": {"label": "DC",   "icon": "⚡", "color": "#fb923c"},
     "HPC":  {"label": "HPC",  "icon": "🚀", "color": "#e879f9"},
     "FREE": {"label": "FREE", "icon": "🆓", "color": "#a3e635"},
-    "MANUAL": {"label": "Manual", "icon": "✎", "color": "#94a3b8"},
 }
+
+def manual_charge_type(charge_type) -> tuple:
+    """(location_type, charge_type) for a charge the user types in or edits — #309.
+
+    Both halves used to fold every answer into AC or FAST, because both forms could only offer AC
+    and DC: a charge typed as Home, HPC or Free came back **AC** the moment its owner corrected a
+    cost or a time. The type is what the price (`PRICE_KEYS`), the statistics and the Charges
+    filter are all keyed on, so that is a charge moving from one column of the accounts to another
+    because somebody fixed a typo.
+
+    Any of the five real types is kept. "DC" is still accepted and still means FAST, so an older
+    page or a script keeps working, and anything unknown falls back to AC as it always did. The
+    AC/DC tag stays DERIVED — it describes the socket, not the place: Home and Free are AC, HPC and
+    DC are DC.
+    """
+    chosen = {"DC": "FAST"}.get(str(charge_type or "").upper(), str(charge_type or "").upper())
+    loc = chosen if chosen in CHARGE_TYPES else "AC"
+    return loc, ("DC" if loc in ("FAST", "HPC") else "AC")
+
 
 def charge_types_localised() -> dict:
     """CHARGE_TYPES with the three English WORDS in the reader's language (#210).
@@ -266,6 +336,26 @@ def charge_types_localised() -> dict:
         label = t(key) if key else meta["label"]
         out[code] = {**meta, "label": label or meta["label"]}
     return out
+
+
+def is_manual_charge(charge) -> bool:
+    """A charge the owner priced by hand and never gave a real type — "✎ Manual" on its badge, and
+    NOT a charge waiting to be confirmed.
+
+    Until v3.15.18 Manual was a type in the menu: pick it, type the receipt's total, done. v3.16.0
+    moved the price into its own column (`cost_manual`), which was right, and let every charge with
+    no real type read "❓ To confirm" — which was a regression for everyone who had used Manual:
+    their old charges came back asking to be confirmed, and a price typed on a new one no longer
+    settled it (add-on #2, @termy91it; measured on a v3.15.18 database opened by v3.17.2). The
+    owner already answered, with the price: this is what they said.
+
+    One definition for the badge, the banner, the Home vs Public card, the monthly report and the
+    search — a count that disagrees with the badge is the bug #240 was. Both the legacy 'MANUAL'
+    placeholder and NULL qualify; a charge with a real type is that type, priced by hand or not.
+    Works on a dict or a sqlite3.Row; a row read before the poller's migration has no cost_manual
+    and is not Manual."""
+    return (charge["location_type"] not in CHARGE_TYPES
+            and "cost_manual" in charge.keys() and bool(charge["cost_manual"]))
 
 
 PRICE_KEYS = {
@@ -325,10 +415,11 @@ def reev_tank_l(car_type: Optional[str] = None) -> float:
             car_type = ""
     return _REEV_TANK_L_BY_MODEL.get((car_type or "").strip().upper()[:3], _REEV_TANK_L)
 
-# REEV only: signal 3736 does not mean what its name says, so on a range-extender it is not read
-# at all.
+# Signal 3736 is named chargeCompleted, and no car seen sets it at a completed charge, so it is not read as
+# one. The official app interprets it as isHaveFullCharge and shows only a tip on it (with healthy charging
+# on, the charge must reach 100 % to calibrate the battery).
 #
-# It was mapped as "chargeCompleted" with the note "validate on a real charge". Nobody had. Nine
+# Its note said "validate on a real charge". Nobody had. Nine
 # complete charges over sixteen days from a B10 REEV (beta #12, michapr) say it is the opposite:
 #
 #   flag → 1   cable just connected, current −2.0…−3.8 A, 85 to 915 minutes remaining, SoC 15-76 %
@@ -344,14 +435,9 @@ def reev_tank_l(car_type: Optional[str] = None) -> float:
 # when a charge was nearly done and a user was most likely to look. A tolerance is the wrong shape
 # of fix for a signal read backwards.
 #
-# So on a REEV the flag is dropped. Mate says "plugged in", which is true in every frame of the
-# bundle, instead of a completion it cannot establish. Deriving a real "finished" is the next step
-# and needs one thing this data does not settle: a car plugged in and WAITING for a scheduled
-# charge also sits at flag 0, so the inverse reading alone would announce a completion for a charge
-# that never happened.
-#
-# BEVs are untouched. There is no BEV bundle carrying 3736, the flag may well be honest there, and
-# it is working today — this is not the moment to change it blind.
+# No BEV seen sets it either, so "Charge complete" is the battery at the car's limit (get_latest_status),
+# within a point: cars stop on it or a point under.
+_AT_THE_LIMIT_PCT = 1.0
 
 
 def _reev_engine_on(db, vehicle_id, started_at, ended_at) -> Optional[dict]:
@@ -421,8 +507,20 @@ def _reev_engine_on(db, vehicle_id, started_at, ended_at) -> Optional[dict]:
     return {"engine_km": round(engine_km, 1), "engine_fuel_pct": round(engine_fuel_pct, 2)}
 
 
+def _cloud_fuel_index() -> dict:
+    """{trip_id: litres} from the car's own cloud, for `_reev_trip_fuel` to prefer. Built ONCE per
+    read like `_trip_fuel_rate_fn`: the match walks every staged record, which is fine once and
+    quadratic per trip. Empty on a BEV, on an install whose cloud has never synced, and for any
+    drive outside the cloud's 28-day window — and an empty index simply leaves the tank's answer."""
+    try:
+        from trip_energy import cloud_fuel_by_trip
+        return cloud_fuel_by_trip(_get())
+    except sqlite3.Error:
+        return {}
+
+
 def _reev_trip_fuel(fuel_start_pct, fuel_end_pct, distance_km, engine=None,
-                    fuel_start_l=None, fuel_end_l=None, tank_l=None) -> dict:
+                    fuel_start_l=None, fuel_end_l=None, tank_l=None, cloud_l=None) -> dict:
     """REEV Phase C — per-trip fuel from the tank-% drop. There's no 'engine on' PID: the range-extender
     ran iff the fuel level dropped more than the signal-noise floor. `engine` (from _reev_engine_on) is
     the generator's driving footprint; when present the L/100 km is fuel-burned-while-driving over
@@ -435,9 +533,28 @@ def _reev_trip_fuel(fuel_start_pct, fuel_end_pct, distance_km, engine=None,
     has them; the tank-% × assumed-capacity path below is the fallback for a BEV, an unknown model,
     or any trip recorded before v2.14.1. `tank_l` overrides the assumed capacity (per model)."""
     out = {"fuel_used_l": None, "fuel_l_100km": None, "engine_ran": False, "engine_km": None,
-           "fuel_refuelled": False}
-    if fuel_start_pct is None or fuel_end_pct is None:
+           "fuel_refuelled": False, "mate_fuel_l": None, "cloud_fuel_l": cloud_l,
+           "fuel_source": None}
+
+    def _from_cloud(tank_l_value, engine_km_value):
+        """The cloud's litres, with the tank's kept beside them. Applied at every exit below, because
+        the tank has several ways of having no answer (no columns, a mid-drive refuel, a drop under
+        the noise floor) and the cloud's figure is just as good on all of them."""
+        out["mate_fuel_l"] = tank_l_value
+        out["fuel_source"] = "cloud"
+        out["fuel_used_l"] = round(cloud_l, 3)
+        # The generator ran iff something was burned. A cloud 0.0 must not leave `engine_ran` true
+        # from the tank's noise floor, and it must not leave it false when the cloud saw litres the
+        # tank's threshold swallowed.
+        out["engine_ran"] = cloud_l > 0
+        out["engine_km"] = engine_km_value
+        out["fuel_l_100km"] = (round(cloud_l / distance_km * 100, 1)
+                               if distance_km and distance_km > 0.5 and cloud_l > 0 else None)
         return out
+
+    _engine_km = (engine["engine_km"] if engine and engine.get("engine_km", 0) > 0.5 else None)
+    if fuel_start_pct is None or fuel_end_pct is None:
+        return _from_cloud(None, _engine_km) if cloud_l is not None else out
     drop = fuel_start_pct - fuel_end_pct
     # The tank ended FULLER than it started: he filled up during the drive. The litres are then
     # start − end = a negative number, which fell straight into the "nothing burned" branch below
@@ -450,8 +567,11 @@ def _reev_trip_fuel(fuel_start_pct, fuel_end_pct, distance_km, engine=None,
     # know is: something may well have been burned, and we cannot say how much. That is unknown,
     # not zero — and a zero is what quietly disappears into every fuel total.
     if drop < -_REEV_FUEL_MIN_DROP:
+        # 🔑 The tank ended fuller, so IT cannot say what was burned — but the cloud can, and on this
+        # one case it turns an "unknown" into a figure. `fuel_refuelled` stays true either way: the
+        # tank really did move up, and a page that shows the litres should still be able to say so.
         out["fuel_refuelled"] = True
-        return out
+        return _from_cloud(None, _engine_km) if cloud_l is not None else out
     cap = tank_l if tank_l else reev_tank_l()
     measured = (fuel_start_l - fuel_end_l) if (fuel_start_l is not None and fuel_end_l is not None) else None
     # The noise floor belongs to whichever signal is actually being read. 3235 (%) moves in steps of
@@ -463,12 +583,32 @@ def _reev_trip_fuel(fuel_start_pct, fuel_end_pct, distance_km, engine=None,
     # trips; beta #22 @pdifeo: ~2.1 L over 35 km reported as 0.3). The tank constants were right
     # all along; the guard was on the wrong signal, and it ran BEFORE the fine one was even read.
     if measured is not None and measured > _REEV_FUEL_MIN_L:
-        out["fuel_used_l"] = round(measured, 3)
+        tank = round(measured, 3)
     elif measured is None and drop > _REEV_FUEL_MIN_DROP:
-        out["fuel_used_l"] = round(drop / 100.0 * cap, 2)
+        tank = round(drop / 100.0 * cap, 2)
+    elif measured == 0:
+        # 🔑 IDENTICAL at both ends, on a counter that resolves MILLILITRES: that is a measurement
+        # saying the generator never ran, not an absence of one. It used to fall into the `None`
+        # below beside "the tank was never read", and the page showed the two the same way — a blank.
+        # Measured on @ebagnoli's 150 trips (29/09/2026): 79 land here, every one of them exactly
+        # 0.0, not one in the 0–5 mL band. The percentage gauge gets NO such branch: signal 3235
+        # steps by 0.1, about 47 mL of the tank, so a motionless gauge is compatible with a burn.
+        tank = 0.0
     else:
-        return out                      # nothing burned, or too little to tell from noise
-    out["engine_ran"] = True
+        tank = None                     # nothing burned, or too little to tell from noise
+    if cloud_l is not None:
+        return _from_cloud(tank, _engine_km)
+    out["mate_fuel_l"] = tank
+    if tank is None:
+        return out
+    out["fuel_source"] = "mate"
+    out["fuel_used_l"] = tank
+    # `tank` is 0.0 on a drive the counter measured as pure-electric (see above). Everything below
+    # is about a drive that BURNED something: a zero has no generator footprint to name and no rate
+    # to print — 0 L/100 km is arithmetic on a zero, and it would read as a measured efficiency.
+    out["engine_ran"] = tank > 0
+    if not tank:
+        return out
     # engine_km is still measured and still shown — it says how far the generator actually drove —
     # but it is NO LONGER the denominator. The L/100 km is over the WHOLE distance, which is what
     # the car itself reports (getPlugIn's oc100km) and therefore what the owner sees in the official
@@ -523,11 +663,120 @@ def _conn(db_path: str) -> sqlite3.Connection:
 DB_PATH = os.environ.get("DB_PATH", "leapmotor_mate.db")
 
 
+class _SharedRead:
+    """A read-only connection shared by everything running on one thread.
+
+    Opening the connection was the expensive part of a small read: `get_setting` costs ~124 µs not
+    because the query is hard but because the connection is new and its page cache is cold. One
+    `get_vampire_drain` opened **1610** of them, `polling_summary` 579, and 119 queries in this
+    module go through that path.
+
+    Nothing is held back by sharing it. The connection is `mode=ro`, and SQLite gives each statement
+    its own read transaction, so a commit from the poller — a different process — is visible on the
+    very next read. That is the difference from the cache this replaces: a cached VALUE goes stale
+    when someone else writes, a shared connection does not.
+
+    `close()` does nothing, on purpose. About a hundred call sites close the connection they were
+    handed, and they were right to when each got its own; closing the shared one would break every
+    later read on the thread. It is let go when the thread ends, when `DB_PATH` moves, or when the
+    file under that path is replaced.
+
+    `__slots__` is deliberate: an attempt to set an attribute on it (`row_factory`, say) raises here
+    instead of quietly applying to one reader's wrapper and not to the connection everyone shares.
+    """
+
+    __slots__ = ("_inner",)
+
+    def __init__(self, inner: sqlite3.Connection):
+        self._inner = inner
+
+    def execute(self, *args, **kwargs):
+        return self._inner.execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        return self._inner.executemany(*args, **kwargs)
+
+    def close(self):
+        return None
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+_read_connections = threading.local()
+
+
+def _drop_read_connection():
+    """Let go of this thread's shared read connection, if it holds one."""
+    held = getattr(_read_connections, "held", None)
+    _read_connections.held = None
+    if held is not None:
+        try:
+            held[1]._inner.close()
+        except Exception:                      # noqa: BLE001  — a closed or broken handle is fine
+            pass
+
+
 def _get():
-    return _conn(DB_PATH)
+    """This thread's read connection to `DB_PATH`, opened once.
+
+    Keyed on the path AND on the file it currently names. A restore from backup used to swap a new
+    file under the same name (it now copies into the live file, #383), and the demo flag still points
+    the path at another file; without the device/inode in the key the reader would go on reading the
+    file that was replaced under it, and would never say so. The `stat` costs about a microsecond
+    against the ~30 the connection costs.
+    """
+    path = DB_PATH
+    try:
+        info = os.stat(path)
+        key = (path, info.st_dev, info.st_ino)
+    except OSError:
+        key = (path, None, None)               # not there yet: a fresh install, before the first poll
+    held = getattr(_read_connections, "held", None)
+    if held is not None:
+        if held[0] == key:
+            return held[1]
+        _drop_read_connection()
+    shared = _SharedRead(_conn(path))          # only held once the connection actually opened
+    _read_connections.held = (key, shared)
+    return shared
 
 
 ACTIVE_VEHICLE_SETTING = "active_vehicle_vin"
+_read_vehicle_scope = threading.local()
+
+
+@contextlib.contextmanager
+def vehicle_scope(vehicle_id: int):
+    """Every scoped read inside is this car's, whichever the sidebar picked: for work that goes car by car
+    (a sweep). Synchronous work only, as held_vehicle_scope says."""
+    previous = getattr(_read_vehicle_scope, "vehicle_id", None)
+    _read_vehicle_scope.vehicle_id = (vehicle_id,)
+    try:
+        yield
+    finally:
+        _read_vehicle_scope.vehicle_id = previous
+
+
+@contextlib.contextmanager
+def held_vehicle_scope():
+    """Hold the car every scoped read uses, for one SYNCHRONOUS stretch of work.
+
+    `_current_vehicle_id` costs a query, and a page asks it around sixty times — 87 of the 178
+    queries behind the battery card were that one question. Pinning it once answers them all.
+
+    🔴 `_read_vehicle_scope` is a `threading.local` and this is an async app: a pin held across an
+    `await` would leak into whatever else the loop runs on that thread. Only wrap work that does
+    not await. A per-REQUEST scope would need contextvars, which is its own change.
+    → tests/test_the_battery_page_asks_which_car_once.py
+    """
+    previous = getattr(_read_vehicle_scope, "vehicle_id", None)
+    if previous is None:
+        _read_vehicle_scope.vehicle_id = (_current_vehicle_id(),)
+    try:
+        yield
+    finally:
+        _read_vehicle_scope.vehicle_id = previous
 
 
 def _current_vehicle_id():
@@ -543,6 +792,9 @@ def _current_vehicle_id():
     Returns None only before the first vehicle is registered; `vehicle_id = COALESCE(?, vehicle_id)`
     then matches everything, so a fresh or minimal database behaves as it always did.
     """
+    pinned = getattr(_read_vehicle_scope, "vehicle_id", None)
+    if pinned is not None:
+        return pinned[0]
     try:
         row = _get().execute(
             "SELECT id FROM vehicles ORDER BY vin <> COALESCE("
@@ -724,17 +976,21 @@ def never_reported_temps() -> set:
     return {k for k in _OPTIONAL_TEMPS if not int(row[k] or 0)}
 
 
+def _schedule_vin() -> str:
+    """The VIN the charge-window keys of the car on screen are filed under ('' when unknown)."""
+    try:
+        row = _get().execute("SELECT vin FROM vehicles WHERE id = COALESCE(?, id) ORDER BY id "
+                             "LIMIT 1", (_current_vehicle_id(),)).fetchone()
+        return (row["vin"] if row and row["vin"] else "").lower()
+    except sqlite3.Error:
+        return ""
+
+
 def get_charge_schedule_window() -> dict:
     """The charging plan of the car ON SCREEN (#186). The poller reads each car's own plan from the
     cloud; one shared key meant the car polled last overwrote the other, and the Scheduling page
     showed one plan under both. Falls back to the shared keys, which is what installs have today."""
-    vin = ""
-    try:
-        row = _get().execute("SELECT vin FROM vehicles WHERE id = COALESCE(?, id) ORDER BY id "
-                             "LIMIT 1", (_current_vehicle_id(),)).fetchone()
-        vin = (row["vin"] if row and row["vin"] else "").lower()
-    except sqlite3.Error:
-        pass
+    vin = _schedule_vin()
 
     def _one(name, default=""):
         own = get_setting(f"charge_sched_{name}_{vin}", "") if vin else ""
@@ -743,6 +999,17 @@ def get_charge_schedule_window() -> dict:
     return {"enabled": _one("enabled", "0") == "1",
             "start": (_one("start") or "").strip(),
             "end": (_one("end") or "").strip()}
+
+
+def set_charge_schedule_window(enabled: bool, start: str, end: str) -> None:
+    """A plan the car just took from the Scheduling page, under the keys `get_charge_schedule_window`
+    reads first: the car's own, which the poller otherwise refreshes only every 30 min (#173). Writing
+    the shared keys alone left the chip on the old plan once the poller had filed one under the car
+    (#186), and switched off on #395 the chip still showed it on. The poller's next read replaces it."""
+    suffix = f"_{vin}" if (vin := _schedule_vin()) else ""
+    set_setting(f"charge_sched_enabled{suffix}", "1" if enabled else "0")
+    set_setting(f"charge_sched_start{suffix}", start)
+    set_setting(f"charge_sched_end{suffix}", end)
 
 
 def _selected_or_first(db) -> Optional[int]:
@@ -779,6 +1046,10 @@ _IMPORT_MATCH_KWH = 0.05
 
 
 def get_setting(key: str, default: str = "") -> str:
+    if key == ACTIVE_VEHICLE_SETTING and getattr(_read_vehicle_scope, "vehicle_id", None) is not None:
+        # Cloud reads resolve their target through this setting, too. Only the export
+        # worker sees the pinned value; the actual sidebar setting is never overwritten.
+        return (get_vehicle()[0] or {}).get("vin") or default
     db = _get()
     row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     return row["value"] if row else default
@@ -810,8 +1081,8 @@ def get_account_user() -> str:
 # a secret — the values are stored verbatim.
 AUDITED_SETTINGS = (
     "poll_parked", "poll_driving", "charge_detect_min_a", "charge_reconstruct_min_pct",
-    "vampire_min_drop_pct", "vampire_min_hours", "charge_dc_min_kw", "soh_temp_min_c",
-    "map_station_min_sessions", "positions_retention_days",
+    "vampire_min_drop_pct", "vampire_min_hours", "charge_dc_min_kw",
+    "soh_temp_min_c", "map_station_min_sessions", "positions_retention_days",
 )
 
 
@@ -819,6 +1090,21 @@ def _ensure_settings_audit(db) -> None:
     db.execute("CREATE TABLE IF NOT EXISTS settings_audit ("
                "id INTEGER PRIMARY KEY AUTOINCREMENT, changed_at TEXT NOT NULL, key TEXT NOT NULL,"
                " old_value TEXT, new_value TEXT)")
+
+
+def log_login(outcome: str, process: str = "web", reason=None) -> None:
+    """The web's own login attempts, in the same table the poller writes (poll_log). Best-effort:
+    a row that cannot be written must not cost the command that needed the login."""
+    try:
+        db = _conn_rw()
+        db.execute(
+            "INSERT INTO poll_log (at, kind, outcome, process, reason) VALUES (?, 'login', ?, ?, ?)",
+            (datetime.now(timezone.utc).isoformat(), outcome, process,
+             None if reason is None else str(reason)[:200]))
+        db.commit()
+        db.close()
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).debug("poll_log skipped: %s", exc)
 
 
 def get_settings_audit(limit: int = 40) -> list:
@@ -988,24 +1274,111 @@ def _safe_unlink(path: str) -> None:
         pass
 
 
+def _db_snapshot(dest: str) -> None:
+    """Copy the live DB to `dest` as a CONSISTENT point-in-time snapshot, using SQLite's own backup
+    API — which holds a read transaction for the copy, so a writer committing meanwhile cannot show
+    through half-applied. Separate function so the export can fall back when it raises."""
+    src = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        out = sqlite3.connect(dest)
+        try:
+            src.backup(out)
+        finally:
+            out.close()
+    finally:
+        src.close()
+
+
 def gzip_db_stream(path: str | None = None, chunk_size: int = 256 * 1024):
-    """Yield the SQLite database at `path` (default DB_PATH) as a gzip byte stream, read and compressed
-    in chunks so even a large backup never lands in memory whole (disc #264). The Export endpoint serves
-    this as `leapmotor_mate.db.gz`; restore_database transparently un-gzips it, and a raw .db still
-    restores too. Checkpoint first (the caller's job) so the WAL is already folded into the file read.
-    Level 6 — SQLite's telemetry rows gzip well, and 6 keeps the CPU cost small on a Pi."""
+    """Yield the SQLite database as a gzip byte stream, read and compressed in chunks so even a large
+    backup never lands in memory whole (disc #264). The Export endpoint serves this as
+    `leapmotor_mate.db.gz`; restore_database transparently un-gzips it, and a raw .db still restores.
+    Level 6 — SQLite's telemetry rows gzip well, and 6 keeps the CPU cost small on a Pi.
+
+    With no `path`, a SNAPSHOT of the live DB is taken first and that is what gets streamed. The
+    checkpoint the caller does only settles instant zero: the poller keeps writing for the whole
+    download, which on a Pi with a big database and a slow line lasts minutes. Measured — a download
+    that began at 4000 rows, with 4000 written midway, produced a backup of 4005: not the state
+    before, not the state after, an instant that never existed. (It was not corrupt; a VACUUM
+    rewriting pages under the reader could go further, but that was not reproduced.)
+
+    ⚠️ The snapshot needs room for a second copy of the DB for as long as the download lasts. If it
+    cannot be taken — no disk space, an I/O error — the old behaviour is used instead: an imperfect
+    backup beats no backup, and nobody loses the export because their device is full.
+
+    An explicit `path` is streamed as-is, with no snapshot: it already IS a file nobody is writing."""
+    tmp = None
+    if not path:
+        tmp = f"{DB_PATH}.snapshot.tmp"
+        _safe_unlink(tmp)                      # un residuo di uno scaricamento interrotto a forza
+        try:
+            _db_snapshot(tmp)
+            path = tmp
+        except Exception as e:                 # noqa: BLE001 — spazio, I/O, permessi: si ripiega
+            # Il ripiego NON è silenzioso: chi legge i registri deve poter sapere che quel backup
+            # è stato preso alla vecchia maniera. `db_reader` non ha un registro suo (9000 righe che
+            # non registrano niente), quindi si prende quello di sistema qui, come gli altri import
+            # locali di questo file.
+            import logging
+            logging.getLogger("db_reader").warning(
+                "backup snapshot failed (%s) — streaming the live file instead", e)
+            _safe_unlink(tmp)
+            tmp, path = None, DB_PATH
     comp = zlib.compressobj(6, zlib.DEFLATED, 31)   # wbits=31 → gzip header/trailer (not bare deflate)
-    with open(path or DB_PATH, "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            out = comp.compress(chunk)
-            if out:
-                yield out
-    tail = comp.flush()
-    if tail:
-        yield tail
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                out = comp.compress(chunk)
+                if out:
+                    yield out
+        tail = comp.flush()
+        if tail:
+            yield tail
+    finally:
+        # Anche se l'utente chiude il browser a metà: il generatore viene chiuso e si passa di qui,
+        # altrimenti ogni scaricamento interrotto lascerebbe una copia del database sul volume.
+        if tmp:
+            _safe_unlink(tmp)
+
+
+# The largest database a .db.gz backup may hold. gzip reaches about 1000:1 on a file of zeros, so a
+# few megabytes uploaded could ask for gigabytes; this is far above any real installation's database
+# and well below a disk.
+RESTORE_MAX_BYTES = 4 * 1024 ** 3
+
+
+def _gunzip_backup(blob: bytes, path: str, chunk_size: int = 256 * 1024) -> None:
+    """Write the database inside a gzip backup to `path`, a chunk at a time, so it is never in memory
+    whole — the export streams for the same reason (gzip_db_stream) — and refuse one that would grow
+    past RESTORE_MAX_BYTES. Raises ValueError; the caller removes the file.
+
+    zlib, not gzip: zlib is already in every build (zipfile's ZIP_DEFLATED pulls it), so this needs no
+    new module in the frozen MateDesktop shell. wbits=31 decodes the gzip wrapper; our export writes
+    one gzip member."""
+    inflate = zlib.decompressobj(31)
+    written = 0
+    try:
+        with open(path, "wb") as f:
+            # Fed a slice at a time: what a call leaves unread (unconsumed_tail) is a copy, and a
+            # copy of the rest of a whole backup at every step would cost more than the restore.
+            for start in range(0, len(blob), chunk_size):
+                data = blob[start:start + chunk_size]
+                while data and not inflate.eof:
+                    out = inflate.decompress(data, chunk_size)
+                    written += len(out)
+                    if written > RESTORE_MAX_BYTES:
+                        raise ValueError("backup is too large")
+                    f.write(out)
+                    data = inflate.unconsumed_tail
+                if inflate.eof:
+                    break
+    except zlib.error as e:                # any malformed gzip is a bad upload, not a server bug
+        raise ValueError("not a valid gzip backup") from e
+    if not inflate.eof:
+        raise ValueError("not a valid gzip backup")
 
 
 def restore_database(blob: bytes) -> dict:
@@ -1020,49 +1393,64 @@ def restore_database(blob: bytes) -> dict:
     and they simply log in afterwards.
 
     Raises ValueError on a bad/foreign file WITHOUT touching the live DB. The caller restarts the app
-    (exit 42 → run.sh) so both processes reopen the restored DB and run migrations."""
-    if blob[:2] == b"\x1f\x8b":                       # a gzip-compressed backup (.db.gz, disc #264)
-        try:
-            # wbits=31 decodes the gzip wrapper → the raw SQLite bytes below (a raw .db skips this).
-            # zlib, not gzip: zlib is already in every build (zipfile's ZIP_DEFLATED pulls it), so this
-            # needs no new module in the frozen MateDesktop shell. Our export writes one gzip member.
-            blob = zlib.decompress(blob, 31)
-        except Exception as e:  # noqa: BLE001 — any malformed gzip is a bad upload, not a server bug
-            raise ValueError("not a valid gzip backup") from e
-    if blob[:16] != b"SQLite format 3\x00":
-        raise ValueError("not a valid SQLite database file")
+    (exit 42 → run.sh) so both processes reopen the restored DB and run migrations.
+
+    The backup goes INTO the live database, through SQLite's own backup API, never over it: the
+    poller holds the database open for as long as it runs, and on Windows a file another process
+    holds cannot be replaced — every restore on MateDesktop for Windows answered HTTP 500 with
+    `[WinError 5] Accesso negato` (#383, @matttiaromano; measured on 1.2.0 with 4.7.17). The page copy takes SQLite's write lock, so a poller
+    write waits for it as for any other; the file name, and the poller's handle, stay untouched.
+    → tests/test_a_restore_does_not_replace_the_file_the_poller_holds.py"""
     tmp = DB_PATH + ".restore.tmp"
-    with open(tmp, "wb") as f:
-        f.write(blob)
     try:
+        if blob[:2] == b"\x1f\x8b":                   # a gzip-compressed backup (.db.gz, disc #264)
+            _gunzip_backup(blob, tmp)
+        else:
+            with open(tmp, "wb") as f:
+                f.write(blob)
+        with open(tmp, "rb") as f:
+            if f.read(16) != b"SQLite format 3\x00":
+                raise ValueError("not a valid SQLite database file")
+        # The connection is closed before the file is deleted on EVERY path: a refused backup left
+        # its temporary file behind on Windows, where an open file cannot be removed (the Windows
+        # CI job, the first time it ran these tests).
         con = sqlite3.connect(tmp)
-        con.row_factory = sqlite3.Row
-        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        missing = _RESTORE_REQUIRED_TABLES - tables
-        if missing:
-            raise ValueError("not a LeapMotor Mate backup (missing tables: %s)" % ", ".join(sorted(missing)))
-        # Carry over the CURRENT (fresh) encrypted secrets so the just-entered login survives the swap.
-        rw = _conn_rw()
         try:
-            fresh = rw.execute("SELECT key, value FROM settings WHERE value LIKE ?",
-                               (_SECRET_PREFIX + "%",)).fetchall()
+            con.row_factory = sqlite3.Row
+            tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            missing = _RESTORE_REQUIRED_TABLES - tables
+            if missing:
+                raise ValueError("not a LeapMotor Mate backup (missing tables: %s)" % ", ".join(sorted(missing)))
+            # Carry over the CURRENT (fresh) encrypted secrets so the just-entered login survives the swap.
+            rw = _conn_rw()
+            try:
+                fresh = rw.execute("SELECT key, value FROM settings WHERE value LIKE ?",
+                                   (_SECRET_PREFIX + "%",)).fetchall()
+            finally:
+                rw.close()
+            con.execute("DELETE FROM settings WHERE value LIKE ?", (_SECRET_PREFIX + "%",))
+            for r in fresh:
+                con.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (r["key"], r["value"]))
+            con.commit()
+            counts = {}
+            for t in ("raw_signals_log", "positions", "trips", "charges", "research_logbook"):
+                counts[t] = con.execute("SELECT COUNT(*) c FROM \"%s\"" % t).fetchone()["c"] if t in tables else 0
         finally:
-            rw.close()
-        con.execute("DELETE FROM settings WHERE value LIKE ?", (_SECRET_PREFIX + "%",))
-        for r in fresh:
-            con.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (r["key"], r["value"]))
-        con.commit()
-        counts = {}
-        for t in ("raw_signals_log", "positions", "trips", "charges", "research_logbook"):
-            counts[t] = con.execute("SELECT COUNT(*) c FROM \"%s\"" % t).fetchone()["c"] if t in tables else 0
-        con.close()
+            con.close()
     except Exception:
         _safe_unlink(tmp)
         raise
-    # Atomic swap, then drop the OLD WAL sidecars so the new file is never read with a stale WAL.
-    os.replace(tmp, DB_PATH)
-    for ext in ("-wal", "-shm"):
-        _safe_unlink(DB_PATH + ext)
+    try:
+        src = sqlite3.connect(tmp)
+        dst = sqlite3.connect(DB_PATH, timeout=30)
+        try:
+            src.backup(dst)                        # every page of the backup into the live file
+            dst.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            dst.close()
+            src.close()
+    finally:
+        _safe_unlink(tmp)
     return {"counts": counts, "secrets_preserved": len(fresh)}
 
 
@@ -1118,11 +1506,9 @@ def get_operate_pin(vin: str = "") -> str:
     second one would have failed, and **only the commands**: reads carry no PIN, so the pages would
     have looked perfectly healthy while the buttons quietly did nothing.
 
-    🔑 The cloud checks it per VIN — `/operPwd/verify` takes `operatePassword` *and* `vin`. That does
-    not prove two cars must differ; it proves the API is built so they can.
-
-    ⚠️ The fallback is the whole safety of it. No per-car PIN → the install-wide one, which is what
-    every install alive today has: one car, or two cars sharing a PIN, see no change at all.
+    🔑 The cloud checks it per VIN — `/operPwd/verify` takes `operatePassword` *and* `vin` — and the
+    PIN is set on the car itself, so each car has its own. `LEAPMOTOR_PIN` gives every car the same
+    one, for an install configured from its environment.
     """
     if not vin:
         row = None
@@ -1132,15 +1518,11 @@ def get_operate_pin(vin: str = "") -> str:
         except sqlite3.Error:
             pass
         vin = (row["vin"] if row and row["vin"] else "")
-    if vin:
-        own = get_secret(_pin_key(vin), "")
-        if own:
-            return own
-    return get_secret("leapmotor_pin", "") or os.environ.get("LEAPMOTOR_PIN", "")
+    return (get_secret(_pin_key(vin), "") if vin else "") or os.environ.get("LEAPMOTOR_PIN", "")
 
 
 def set_operate_pin(pin: str, vin: str) -> None:
-    """Give one car its own PIN — or clear it, which returns that car to the install-wide one."""
+    """Store one car's PIN — or clear it, which leaves that car with `LEAPMOTOR_PIN` or none."""
     set_secret(_pin_key(vin), pin or "")
 
 
@@ -1161,6 +1543,15 @@ def boost_selected_car(seconds: float = 60.0) -> None:
         pass
     key = f"boost_until_{vin.lower()}" if vin else "boost_until"
     set_setting(key, str(_t.time() + seconds))
+
+
+def boost_every_car(seconds: float) -> None:
+    """Poll every car quickly for a while — for a caller that cannot say which car it means: the
+    "getting in the car" shortcut behind /api/boost. Same per-car key as boost_selected_car."""
+    import time as _t
+    until = str(_t.time() + seconds)
+    for v in get_vehicles():
+        set_setting(f"boost_until_{v['vin'].lower()}", until)
 
 
 def per_car_pin_keys() -> list:
@@ -1337,6 +1728,12 @@ def get_charge_prices() -> dict:
 # price_*_kwh values double as the "off-band" price in time-of-use mode.
 _TOU_TYPES = ["HOME", "AC", "FAST", "HPC"]
 
+# Every pricing mode the Costs page offers. ONE list, read by both the writer (`save_cost_modes`)
+# and the reader (`get_cost_config`) — they used to carry a copy each, and when 'custom_kwh' shipped
+# (v3.14.24, beta #13) only the reader's copy was updated: the page offered the mode, the save threw
+# it away, and it came back 'flat' on the next load. Adding a mode means adding it HERE, once.
+_COST_MODES = ("flat", "tou", "dynamic", "custom_kwh", "solar_manual")
+
 
 def _mode_allowed(ctype: str, mode: str) -> bool:
     """Dynamic (HA sensor) is HOME-ONLY (Silvio 02/07): no HA integration exposes a price for
@@ -1347,9 +1744,13 @@ def _mode_allowed(ctype: str, mode: str) -> bool:
     'custom_kwh' is HOME-only for the same reason turned around: it prices the charge on a
     kWh figure the OWNER's own HA helper produces (beta #13, @ebagnoli — solar at home, where
     only part of a charge is bought from the grid). Nobody has such a helper for a public
-    charger, and the operator's bill is not ours to second-guess."""
+    charger, and the operator's bill is not ours to second-guess.
+
+    'solar_manual' (#272, @kingean93) is the same case without Home Assistant: the owner types the
+    solar kWh of each charge and Mate subtracts them from the measured wallbox energy. HOME-only
+    for the same reason — a public charger delivers nobody's roof."""
     return (mode in ("flat", "tou")
-            or (mode in ("dynamic", "custom_kwh") and ctype == "HOME"))
+            or (mode in ("dynamic", "custom_kwh", "solar_manual") and ctype == "HOME"))
 
 
 def get_cost_config() -> dict:
@@ -1373,8 +1774,7 @@ def get_cost_config() -> dict:
         m = m if isinstance(m, dict) else {}
     except (ValueError, TypeError):
         m = {}
-    modes = {t: (m.get(t) if m.get(t) in ("flat", "tou", "dynamic", "custom_kwh")
-                 and _mode_allowed(t, m.get(t))
+    modes = {t: (m.get(t) if m.get(t) in _COST_MODES and _mode_allowed(t, m.get(t))
                  else _default_mode_for(t, legacy))
              for t in _TOU_TYPES}
     return {
@@ -1398,14 +1798,20 @@ def _default_mode_for(ctype: str, legacy: str) -> str:
 
 
 def save_cost_modes(modes: dict) -> None:
-    """Persist the per-charge-type pricing modes (#106). Values are sanitised to the three known
-    modes AND to `_mode_allowed` (dynamic is HOME-only — rejected here too, not just at read
-    time, so a raw API call can't park an away type on 'dynamic' in storage); unknown/rejected/
+    """Persist the per-charge-type pricing modes (#106). Values are sanitised to the known modes
+    AND to `_mode_allowed` (dynamic and custom_kwh are HOME-only — rejected here too, not just at
+    read time, so a raw API call can't park an away type on them in storage); unknown/rejected/
     missing types fall back to the legacy global mode at read time. When all four types agree,
     the legacy `cost_mode` is aligned too, so single-mode users keep a coherent value
-    everywhere."""
+    everywhere.
+
+    ⚠️ This tuple and `get_cost_config`'s are the SAME list read twice; keep them together. When
+    'custom_kwh' shipped (v3.14.24, beta #13) only the reader learned it, so the mode the page
+    offered was silently dropped on save and came back 'flat' on the next page load. The feature
+    was untestable through the UI while its own test — which mocks get_cost_config — stayed green.
+    `test_every_mode_the_page_offers_can_be_saved` now pins the page's menu to this list."""
     clean = {t: v for t, v in (modes or {}).items()
-             if t in _TOU_TYPES and v in ("flat", "tou", "dynamic") and _mode_allowed(t, v)}
+             if t in _TOU_TYPES and v in _COST_MODES and _mode_allowed(t, v)}
     set_setting("cost_modes", json.dumps(clean))
     vals = set(clean.values())
     if len(clean) == len(_TOU_TYPES) and len(vals) == 1:
@@ -1450,6 +1856,22 @@ def save_dynamic_price_entity_for(ctype: str, entity_id: str) -> None:
         m = {}
     m[ctype] = (entity_id or "").strip()
     set_setting("dynamic_price_entities", json.dumps(m))
+
+
+def home_prices_by_solar() -> bool:
+    """Whether Casa is priced by subtracting the owner's own solar (#272). Asked once PER CHARGE
+    CARD, so it reads the one setting it needs instead of `get_cost_config()`, which also parses
+    the time-of-use bands and resolves all four charge types: measured at 459 µs a call against
+    18 µs here, and a month of charges asks this thirty times.
+
+    Still routed through `_mode_allowed`, so a mode saved before that rule existed — or by a raw
+    API call — cannot turn the field on for a type that may not have it."""
+    try:
+        m = json.loads(get_setting("cost_modes", "") or "{}")
+    except (ValueError, TypeError):
+        return False
+    mode = m.get("HOME") if isinstance(m, dict) else None
+    return mode == "solar_manual" and _mode_allowed("HOME", "solar_manual")
 
 
 def get_custom_kwh_entity_for(ctype: str) -> str:
@@ -1683,6 +2105,24 @@ def _match_band(bands: list, weekday: int, minute: int):
     return None
 
 
+def _band_priced(bands: list, ctype: str) -> bool:
+    """True se ALMENO UNA fascia prezza esplicitamente questo tipo di ricarica — zero compreso.
+
+    Serve a separare due zeri che in archivio sono identici:
+      · lo zero DIGITATO in una fascia   → è un prezzo, e «gratis» è la risposta giusta;
+      · la tariffa BASE a zero            → non è un prezzo: quasi sempre l'ha scritta la pagina
+        Costi da sola, che precompilava tutti e quattro i campi con `0.00`, e chi riempiva solo
+        «Casa» si portava in archivio tre zeri mai toccati.
+
+    Senza questa distinzione le due modalità rispondevano in modo opposto allo STESSO zero: a
+    tariffa fissa la ricarica restava non prezzata, a fasce risultava gratis — 40 kWh in rapida
+    pagati davvero entravano nella media come pagati zero e diluivano la miscela di ogni viaggio
+    successivo. Si allinea al ramo a tariffa fissa, che questa regola ce l'ha da sempre, perché
+    l'altra direzione prezzerebbe a zero le ricariche di chiunque abbia quello 0.00 in archivio.
+    Per «questa ricarica è stata gratis» c'è il contrassegno apposta (#120)."""
+    return any((b.get("prices") or {}).get(ctype) is not None for b in (bands or []))
+
+
 def _resolve_band_price(bands: list, ctype: str, weekday: int, minute: int,
                         base: float, base_set: bool):
     """TYPE-AWARE band price for a moment (#106 fix): the first band covering this moment
@@ -1701,31 +2141,113 @@ def _resolve_band_price(bands: list, ctype: str, weekday: int, minute: int,
     return base, base_set
 
 
-def _next_charge_start_utc(db, started_at) -> Optional[str]:
+def _next_charge_start_utc(db, started_at, exclude_ids=()) -> Optional[str]:
     """UTC start of the first charge beginning strictly after `started_at` (a raw stored
     value), or None. Used to cap a charge's power-sample window: an orphan/overlapping
     charge whose ended_at bled past a later charge (see the poller's close_orphan_charges)
-    must NOT absorb the next charge's power samples into its own window or cost."""
+    must NOT absorb the next charge's power samples into its own window or cost.
+
+    `exclude_ids` are rows that are not "a later charge" at all: the other pieces of THIS
+    plug-in, which the car split and a merge joined back (#341). Counting one of those as the
+    next charge cut the session's own curve at its first piece."""
+    holes = ",".join("?" * len(exclude_ids))
     try:
         row = db.execute(
-            "SELECT MIN(started_at) AS s FROM charges WHERE vehicle_id = COALESCE(?, vehicle_id) AND started_at > ?",
-            (_current_vehicle_id(), started_at)
+            "SELECT MIN(started_at) AS s FROM charges WHERE vehicle_id = COALESCE(?, vehicle_id) AND started_at > ?"
+            + (f" AND id NOT IN ({holes})" if exclude_ids else ""),
+            (_current_vehicle_id(), started_at, *exclude_ids)
         ).fetchone()
     except sqlite3.Error:
         return None   # no charges table (isolated unit tests) → no cap
     return _iso_to_utc(row["s"]) if (row and row["s"]) else None
 
 
-def _power_window_bounds(db, started_at, ended_at):
+# ── Which `positions` rows belong to a charge ────────────────────────────────────────────────────
+# `positions.charging` is the car's OWN flag (`poller/client._is_charging`, which needs a current
+# into the pack of at least `_CHARGE_CURRENT_MIN_A` — the user's charge-detection setting, 2.0 A by
+# default). Some cars stop asserting it while they are still charging. @arzthilfe's C10 (#341) drops
+# it the moment his wallbox goes from 11 A to 8 A, because the pack current then reads 1.7 A:
+#
+#     22:17:21  plug=1 chg=1 A=-2.3      <- 11 A
+#     22:17:52  plug=1 chg=0 A=-1.7      <- 8 A: the flag goes, the current does not
+#
+# and the night carries on at A=-1.6/-1.7 with `State: charging` and the SoC rising 78.9 → 92.2.
+# 146 of that session's 1177 polls are flagged. The SESSION is right — the state machine also holds
+# it on the cable — so it is one row, unmerged; only the queries that read it back by the raw flag
+# lost seven hours of it, the power chart he reported among them.
+#
+# Inside a session's window a NEGATIVE pack current IS charge, whatever the flag says. The two extra
+# gates are the ones `_is_charging` uses, for the same reason: a car in gear or moving has a strongly
+# negative pack current from regen, and an abandoned session whose `ended_at` bled past the drive
+# that followed it (poller.close_orphan_charges) would otherwise pull that drive in.
+#
+# MEASURED on a real 375k-row history: of the 8581 unflagged rows with a charging-sign current, the
+# motion gate excludes 8580. The one it keeps is 69 s inside a session whose flag had not caught up —
+# one that should count. And NO parked sample sits between -0.5 A and 0, so the floor is below
+# everything measured rather than fitted to it.
+_CHARGE_SAMPLE_MIN_A = 0.5     # |pack current| under this, parked, is not energy
+
+
+def _charging_sample(alias: str = "") -> str:
+    """SQL predicate: this row is a sample of the charge whose window contains it.
+
+    ⚠️ Only sound INSIDE a charge's window. On its own it matches every regen frame of every drive
+    (the motion gate is a guard against a bled window, not a substitute for the window).
+
+    🔴 Matched by idx_positions_charge_sample (schema.py) literally, not derived from this
+    function — moving `_CHARGE_SAMPLE_MIN_A` or this shape without moving the index's WHERE
+    clause the same way turns every per-charge query back into a table walk."""
+    q = f"{alias}." if alias else ""
+    return (f"({q}charging = 1 OR ({q}charge_current_a <= -{_CHARGE_SAMPLE_MIN_A} "
+            f"AND COALESCE({q}speed_kmh, 0) <= 2 AND COALESCE({q}gear, 'P') = 'P'))")
+
+
+def _power_window_bounds(db, started_at, ended_at, exclude_ids=()):
     """(lower_utc, upper, upper_is_exclusive) for a charge's charging=1 samples, capping
     the upper bound at the next charge's start so a window/cost never leaks across charges.
-    When capped, the upper bound is EXCLUSIVE (the next charge owns samples at its start)."""
+    When capped, the upper bound is EXCLUSIVE (the next charge owns samples at its start).
+    `exclude_ids`: rows that are this same plug-in's other pieces — see _next_charge_start_utc."""
     lo = _iso_to_utc(started_at) or started_at
     hi = _iso_to_utc(ended_at) or lo
-    nxt = _next_charge_start_utc(db, started_at)
+    nxt = _next_charge_start_utc(db, started_at, exclude_ids)
     if nxt and nxt <= hi:
         return lo, nxt, True
     return lo, hi, False
+
+
+def _charge_group_span(db, charge_id: int, started_at, ended_at):
+    """(start, end, other_piece_ids) for the whole plug-in this row belongs to.
+
+    A charge the car reported as several rows is ONE session everywhere the user looks — the
+    header, the kilowatt-hours, the duration all come from `_charge_group_stats`. Its power curve
+    has to span the same thing (#341, @arzthilfe: turning the wallbox down from 11 A to 8 A ended
+    the chart at that moment, while the session ran on for another nine hours).
+
+    `end` is None when any piece is still running: an open session has no upper bound yet. Alone,
+    the row's own two timestamps and no ids, which is the query every unmerged charge already made.
+
+    Only the PARENT widens. It is the row the session is read from — a merged child keeps the
+    window it always had, so nothing that asks for a piece by id starts seeing the session twice.
+
+    The ids come back so the cap can skip them: the second piece starts exactly where the first
+    ends, and `_next_charge_start_utc` counting it as "the next charge" is what trimmed the curve
+    in the first place.
+
+    ⚠️ The CURVE only. The cost and energy readers price each piece separately and the group sums
+    them afterwards, so widening their window would bill the same kilowatt-hours twice.
+    → tests/test_a_merged_charges_power_curve_covers_the_whole_session.py"""
+    if not _charges_have_merge(db):
+        return started_at, ended_at, ()
+    kids = [r["id"] for r in db.execute(
+        "SELECT id FROM charges WHERE merged_into_id = ?", (charge_id,)).fetchall()]
+    if not kids:
+        return started_at, ended_at, ()
+    holes = ",".join("?" * len(kids))
+    rows = db.execute(f"SELECT started_at, ended_at FROM charges WHERE id IN ({holes})",
+                      tuple(kids)).fetchall()
+    starts = [started_at] + [r["started_at"] for r in rows if r["started_at"]]
+    ends = [ended_at] + [r["ended_at"] for r in rows]
+    return min(starts), (max(ends) if all(ends) else None), (charge_id, *kids)
 
 
 def _dynamic_sensor_cost(charge, energy: float, base: float, ctype: str = None) -> Optional[float]:
@@ -1745,7 +2267,7 @@ def _dynamic_sensor_cost(charge, energy: float, base: float, ctype: str = None) 
     lo, hi, excl = _power_window_bounds(db, charge["started_at"], charge["ended_at"])
     rows = db.execute(
         "SELECT recorded_at, charge_voltage_v, charge_current_a FROM positions "
-        "WHERE vehicle_id = COALESCE(?, vehicle_id) AND charging = 1 AND recorded_at >= ? AND recorded_at "
+        "WHERE vehicle_id = COALESCE(?, vehicle_id) AND " + _charging_sample() + " AND recorded_at >= ? AND recorded_at "
         + ("<" if excl else "<=")
         + " ? ORDER BY recorded_at",
         (_current_vehicle_id(), lo, hi),
@@ -1794,8 +2316,9 @@ def _custom_kwh_cost(charge, energy: float, base: float, ctype: str = "HOME") ->
     PRICE and weights it over the power curve; what he has is a number of kWh, already worked out,
     and what he wants is one multiplication.
 
-    So this reads the entity's LAST value inside the charge's window and multiplies. Not the rise
-    across the window, not an average: the value, as Silvio put it — the helper's job is to present
+    So this reads the entity's LAST value inside the session's window (up to the car's close of it,
+    since the helper may post its figure after the charge stopped adding energy) and multiplies. Not
+    the rise across the window, not an average: the value, as Silvio put it — the helper's job is to present
     the kWh this charge should be billed for, and ours is to price them. That is a deliberate
     simplification: a helper exposing a lifetime counter instead of a per-charge figure will price
     a fortune, and no guard here can tell the two apart.
@@ -1813,7 +2336,8 @@ def _custom_kwh_cost(charge, energy: float, base: float, ctype: str = "HOME") ->
 
     import ha_client   # local: ha_client imports db_reader, so this avoids a circular import
     db = _get()
-    lo, hi, _excl = _power_window_bounds(db, charge["started_at"], charge["ended_at"])
+    closed = charge["closed_at"] if "closed_at" in charge.keys() else None
+    lo, hi, _excl = _power_window_bounds(db, charge["started_at"], closed or charge["ended_at"])
     hist = ha_client.get_history(entity_id, lo, hi)
     if not hist:
         return flat
@@ -1821,6 +2345,33 @@ def _custom_kwh_cost(charge, energy: float, base: float, ctype: str = "HOME") ->
     if kwh is None or kwh < 0:
         return flat
     return round(kwh * base, 2)
+
+
+def _solar_kwh_cost(charge, energy: float, base: float) -> Optional[float]:
+    """Cost = (the measured energy MINUS the owner's own solar kWh) x the fixed price (#272,
+    @kingean93).
+
+    The sibling of `_custom_kwh_cost` for an owner with solar and no Home Assistant helper: there
+    the entity states how many kWh were BOUGHT, here the owner types how many came off the roof and
+    Mate subtracts. Opposite directions, same destination — and the subtraction is the one the owner
+    can read straight off an inverter, which is why it is the number we ask for.
+
+    `energy` is what the caller already resolved as the billed figure — the wallbox counter delta on
+    a HOME charge that has one. That is the only basis this mode is offered against: the field is
+    hidden where no meter measured the charge, because a subtraction needs a minuend that was
+    measured, not a battery estimate standing in for one.
+
+    Like every mode here it PRICES the charge and nothing else: the energy Mate reports stays the
+    measured one. And like `custom_kwh` it falls back to energy x base whenever the figure is
+    absent — a charge nobody typed a number on is a charge billed in full, never an uncosted one."""
+    solar = charge["solar_kwh"] if "solar_kwh" in charge.keys() else None
+    flat = round(energy * base, 2) if base else None
+    if not base or solar is None or solar <= 0:
+        return flat
+    # Clamped rather than trusted: the route refuses a figure above the measured energy, but a
+    # charge can be re-priced later against a meter total that shrank (a dropped implausible
+    # wallbox reading, #46/#215), and a negative cost is not a discount anybody offers.
+    return round(max(energy - solar, 0.0) * base, 2)
 
 
 def compute_cost(charge, config: Optional[dict] = None, ac_kwh: Optional[float] = None):
@@ -1836,6 +2387,8 @@ def compute_cost(charge, config: Optional[dict] = None, ac_kwh: Optional[float] 
                       sensor's history instead of a static band (see _dynamic_sensor_cost)
         custom_kwh  → the fixed price x a kWh figure the owner's own HA helper produces
                       (see _custom_kwh_cost) — for a charge only partly bought from the grid
+        solar_manual→ the fixed price x (the measured energy MINUS the solar kWh the owner typed
+                      on the charge itself) — the same case with no HA helper (see _solar_kwh_cost)
 
     `ac_kwh`: for HOME charges on a configured wallbox, the caller passes the real AC energy the
     wallbox delivered (what you actually pay the utility, incl. AC→DC conversion losses). When given
@@ -1858,6 +2411,10 @@ def compute_cost(charge, config: Optional[dict] = None, ac_kwh: Optional[float] 
     if location_type == "FREE":
         return 0.0
 
+    if "charging_place_rate" in charge.keys() and charge["charging_place_rate"] is not None:
+        import charging_places
+        return charging_places.cost(dict(charge), ac_kwh)
+
     if config is None:
         config = get_cost_config()
     prices = get_charge_prices()
@@ -1877,6 +2434,9 @@ def compute_cost(charge, config: Optional[dict] = None, ac_kwh: Optional[float] 
     if mode == "custom_kwh":
         return _custom_kwh_cost(charge, energy, base, ctype=location_type)
 
+    if mode == "solar_manual":
+        return _solar_kwh_cost(charge, energy, base)
+
     bands = config.get("bands") or []
     if mode != "tou" or not bands:
         return round(energy * base, 2) if base else None
@@ -1888,8 +2448,8 @@ def compute_cost(charge, config: Optional[dict] = None, ac_kwh: Optional[float] 
         price, is_set = _resolve_band_price(bands, location_type,
                                             dt.weekday(), dt.hour * 60 + dt.minute,
                                             base, base_set)
-        if not is_set and price == 0:
-            return None
+        if price == 0 and not _band_priced(bands, location_type):
+            return None       # tariffa base a zero → non è un prezzo, come nel ramo a tariffa fissa
         return round(energy * price, 2)
 
     if config.get("method") == "start":
@@ -1906,7 +2466,7 @@ def compute_cost(charge, config: Optional[dict] = None, ac_kwh: Optional[float] 
     lo, hi, excl = _power_window_bounds(db, charge["started_at"], charge["ended_at"])
     rows = db.execute(
         "SELECT recorded_at, charge_voltage_v, charge_current_a FROM positions "
-        "WHERE vehicle_id = COALESCE(?, vehicle_id) AND charging = 1 AND recorded_at >= ? AND recorded_at "
+        "WHERE vehicle_id = COALESCE(?, vehicle_id) AND " + _charging_sample() + " AND recorded_at >= ? AND recorded_at "
         + ("<" if excl else "<=")
         + " ? ORDER BY recorded_at",
         (_current_vehicle_id(), lo, hi),
@@ -1936,8 +2496,8 @@ def compute_cost(charge, config: Optional[dict] = None, ac_kwh: Optional[float] 
 
     if total_e <= 0:               # no usable curve → fall back to the start band
         return _start_band_cost()
-    if not any_set and weighted == 0:
-        return None
+    if weighted == 0 and not _band_priced(bands, location_type):
+        return None                # stessa regola del ramo "start": una base a zero non è un prezzo
     # scale the time-weighted average price onto the authoritative (SOC) energy,
     # so the total stays consistent with the energy shown elsewhere.
     return round(energy * (weighted / total_e), 2)
@@ -1962,7 +2522,9 @@ def _merged_piece_ids(db, charge_id: int) -> list:
 def update_charge_type(charge_id: int, location_type: str,
                        manual_cost: Optional[float] = None,
                        gross_kwh: Optional[float] = None,
-                       *, _segment: bool = False,
+                       solar_kwh: Optional[float] = None,
+                       *, cost_manual: Optional[bool] = None,
+                       _segment: bool = False,
                        _free: Optional[int] = None,
                        _no_cost: bool = False) -> dict:
     """Set location_type and (re)compute the cost from the pricing config in effect now (flat or
@@ -1971,12 +2533,32 @@ def update_charge_type(charge_id: int, location_type: str,
     delta — exact, not estimated) when available; otherwise, and for every other type, on the
     battery (DC/SoC) energy.
 
-    `MANUAL` is the user-entered total actually paid (the public-charging jungle — subscriptions,
-    session/idle fees, pay-method rates — can't be modelled by a per-kWh tariff). It OVERRIDES the
-    automatic cost: `manual_cost` is stored verbatim and the automatic costers (auto-confirm and the
-    one-time repairs) leave a MANUAL charge's cost alone. It still feeds the WAC like any priced
-    charge (rate = cost ÷ billed DC energy)."""
-    db = _conn_rw()
+    `location_type` is ALWAYS the truthful physical type now (HOME/AC/FAST/HPC/FREE) — it used to
+    double as 'MANUAL', a pricing-basis flag wearing a location's name, which meant picking Manual
+    on a real HPC session lost its HPC tag for good. `cost_manual` (the charges.cost_manual column)
+    carries that second meaning instead, independent of type: `True` (from the pencil-cost field,
+    `set_charge_cost`) stores `manual_cost` verbatim and freezes it against every automatic
+    recompute; `False` clears a manual price back to the computed one; `None` (every OTHER caller —
+    a badge re-tag, a FREE toggle, a gross/solar edit) leaves it exactly as it was, so retagging a
+    manually-priced charge's TYPE can never silently touch its PRICE. It still feeds the WAC like
+    any priced charge (rate = cost ÷ billed DC energy)."""
+    with _conn_rw() as db:
+        return _update_charge_type(db, charge_id, location_type, manual_cost, solar_kwh=solar_kwh,
+                                   cost_manual=cost_manual, _segment=_segment, _free=_free,
+                                   _no_cost=_no_cost, gross_kwh=gross_kwh)
+
+
+def _update_charge_type(db, charge_id: int, location_type: str,
+                        manual_cost: float | None = None,
+                        gross_kwh: float | None = None,
+                        solar_kwh: float | None = None,
+                        *, cost_manual: bool | None = None,
+                        _segment: bool = False,
+                        _free: int | None = None,
+                        _no_cost: bool = False) -> dict:
+    """Write the parent and its pieces within the caller's transaction."""
+    if location_type not in CHARGE_TYPES:
+        return {}
     row = db.execute("SELECT * FROM charges WHERE id=?", (charge_id,)).fetchone()
     if not row:
         return {}
@@ -1990,42 +2572,68 @@ def update_charge_type(charge_id: int, location_type: str,
     charge["is_free"] = free
     gross = gross_kwh if gross_kwh is not None else (
         charge["gross_kwh"] if "gross_kwh" in charge.keys() else None)
+    # #272 — the solar figure the owner typed, read by `_solar_kwh_cost` off this same dict. Put
+    # the incoming value in BEFORE compute_cost runs, or the price would be computed against the
+    # figure the row still holds and only the column would change.
+    if solar_kwh is not None:
+        charge["solar_kwh"] = solar_kwh
+    meter = charge.get("ac_energy_kwh")
+    # A public charger has no meter Mate can read, so the owner may type what its display said
+    # (#222 @ghuaywen-ai). It plays exactly the role the wallbox counter plays at home: you pay
+    # for what left the charger, conversion losses included, so it PRICES the charge here — and
+    # since 04/08 it is ALSO the energy Mate reports for that charge. `_billed_kwh` takes it
+    # over the battery figure; the reasoning for that change lives in its docstring, not here.
+    if location_type == "HOME" and meter and meter > 0:
+        billed = meter
+    elif gross and gross > 0:
+        billed = gross
+    else:
+        billed = None
+
     if _no_cost:
         # A piece of a group whose price is the GROUP's and already sits on the row that carries it
-        # (a MANUAL total, or a typed #222 meter reading). The page SUMS the pieces, so a second
-        # figure here would bill the same energy twice.
-        cost = None
-    elif location_type == "MANUAL":
-        # Keep the existing cost if no amount was supplied (e.g. re-tagging without re-typing it).
+        # (a manually-priced total, or a typed #222 meter reading). The page SUMS the pieces, so a
+        # second figure here would bill the same energy twice. The flag itself is untouched — this
+        # piece has no cost to freeze or thaw either way.
+        cost, new_cost_manual = None, charge.get("cost_manual")
+    elif manual_cost is not None or cost_manual is True:
+        # A new (or re-typed) manual total from the pencil-cost field.
         cost = round(manual_cost, 2) if manual_cost is not None else charge.get("cost")
+        new_cost_manual = 1
+    elif cost_manual is False:
+        # The pencil-cost field was cleared: fall back to the computed default.
+        cost, new_cost_manual = compute_cost(charge, ac_kwh=billed), 0
+    elif charge.get("cost_manual"):
+        # An ordinary re-tag (badge click, FREE toggle, gross/solar edit) on a charge that is
+        # ALREADY manually priced: the type may be wrong and worth fixing, the price the owner
+        # typed is not — leave both the cost and the flag exactly as they are.
+        cost, new_cost_manual = charge.get("cost"), 1
     else:
-        meter = charge.get("ac_energy_kwh")
-        # A public charger has no meter Mate can read, so the owner may type what its display said
-        # (#222 @ghuaywen-ai). It plays exactly the role the wallbox counter plays at home: it
-        # PRICES the charge — you pay for what left the charger, conversion losses included — and
-        # nothing else. It never becomes the energy Mate reports or totals (_billed_kwh is
-        # untouched), because that one is measured and this one is typed.
-        if location_type == "HOME" and meter and meter > 0:
-            billed = meter
-        elif gross and gross > 0:
-            billed = gross
-        else:
-            billed = None
         cost = compute_cost(charge, ac_kwh=billed)   # returns 0.0 when the charge is marked free
+        new_cost_manual = 0
 
-    # gross_kwh only joins the UPDATE when it is actually being set: a re-tag must not rewrite a
-    # column it is not changing, and the write then never assumes a column a caller's table may not
-    # have (the cost-floor tests build a minimal charges table by hand).
-    # ...and only where the column exists. The poller owns that migration, so between an update and
-    # its next start a typed figure would hit an UPDATE naming a column that is not there — a 500 on
-    # the form instead of a stored number. Not storing it for those few seconds is the lesser harm.
+    # Built as a column list rather than three hand-written SQL strings: gross_kwh and solar_kwh
+    # only join the UPDATE when actually being set (a re-tag must not rewrite a column it isn't
+    # changing, and never names one a caller's minimal test table doesn't have), and now
+    # cost_manual joins too — on every call, not just those two rare ones — so a fourth hardcoded
+    # branch per combination stops being the shape that fits.
+    # ...and each only where the column exists. The poller owns these migrations, so between an
+    # update and its next start a typed figure would hit an UPDATE naming a column that is not
+    # there — a 500 on the form instead of a stored number. Not storing it for those few seconds is
+    # the lesser harm.
+    set_cols = ["location_type=?", "cost=?", "is_free=?"]
+    params: list = [location_type, cost, free]
     if gross_kwh is not None and _charges_have_gross(db):
-        db.execute("UPDATE charges SET location_type=?, cost=?, is_free=?, gross_kwh=? WHERE id=?",
-                   (location_type, cost, free, gross_kwh, charge_id))
-    else:
-        db.execute("UPDATE charges SET location_type=?, cost=?, is_free=? WHERE id=?",
-                   (location_type, cost, free, charge_id))
-    db.commit()
+        set_cols.append("gross_kwh=?")
+        params.append(gross_kwh)
+    elif solar_kwh is not None and _charges_have_solar(db):
+        set_cols.append("solar_kwh=?")
+        params.append(solar_kwh)
+    if _charges_have_cost_manual(db):
+        set_cols.append("cost_manual=?")
+        params.append(new_cost_manual)
+    params.append(charge_id)
+    db.execute(f"UPDATE charges SET {', '.join(set_cols)} WHERE id=?", params)
     out = dict(db.execute("SELECT * FROM charges WHERE id=?", (charge_id,)).fetchone())
 
     # A merged charge is drawn as ONE row and its figures are the SUM of its pieces. Writing only
@@ -2034,20 +2642,20 @@ def update_charge_type(charge_id: int, location_type: str,
     #
     # Each piece is priced by THIS function, so there is one pricing rule and not a second copy of
     # it: a piece bills on its own wallbox delta or its own energy, exactly as it would unmerged.
-    # Two figures are the GROUP's rather than a piece's and must not be charged twice — a MANUAL
-    # total and a typed gross_kwh (#222) — so they stay on the row that carries them and the other
-    # pieces take no cost at all.
+    # Two figures are the GROUP's rather than a piece's and must not be charged twice — a manually
+    # typed total and a typed gross_kwh (#222) — so they stay on the row that carries them and the
+    # other pieces take no cost at all. `out["cost_manual"]` — the value THIS call just wrote, not
+    # the one `charge` held before it ran — is what decides that for the cascade below.
     #
     # What is NOT touched: the typed number itself. unmerge_charges promises the rows come back
     # exactly as they were, and splitting 30 kWh into 20 + 10 across two rows would break that
     # promise for a figure the owner typed by hand.
     #
-    # After the commit, never before: these calls open their own write connection, and SQLite would
-    # be waiting on a transaction this one has not closed yet.
+    # All pieces share the parent's transaction so a failed child cannot leave a partial price.
     if not _segment:
         for oid in _merged_piece_ids(db, charge_id):
-            update_charge_type(oid, location_type, _segment=True, _free=free,
-                               _no_cost=(location_type == "MANUAL" or bool(gross and gross > 0)))
+            _update_charge_type(db, oid, location_type, _segment=True, _free=free,
+                                _no_cost=(bool(out.get("cost_manual")) or bool(gross and gross > 0)))
     return out
 
 
@@ -2066,20 +2674,22 @@ def repair_merged_charge_pieces() -> int:
     at current prices would quietly rewrite a piece of history to patch an omission. And the parent
     itself is never written: only the children, only where they are missing.
 
-    A price that belongs to the GROUP and already sits on the parent — a MANUAL total, a typed
-    gross_kwh (#222) — gives the children the type and no cost, the same answer a fresh confirm
-    gives. Safe to run twice: the second pass finds nothing, because it selects on the absence it
-    fills."""
+    A price that belongs to the GROUP and already sits on the parent — a manually typed total, a
+    typed gross_kwh (#222) — gives the children the type and no cost, the same answer a fresh
+    confirm gives. Safe to run twice: the second pass finds nothing, because it selects on the
+    absence it fills."""
     db = _conn_rw()
     if not _charges_have_merge(db):
         return 0
     has_gross = _charges_have_gross(db)
     g = "p.gross_kwh" if has_gross else "NULL"
+    cm = "p.cost_manual" if _charges_have_cost_manual(db) else "NULL"
     try:
         rows = db.execute(
             f"""SELECT c.id AS cid, c.energy_added_kwh AS c_kwh, c.ac_energy_kwh AS c_meter,
                        p.id AS pid, p.location_type AS ptype, p.cost AS pcost,
-                       p.energy_added_kwh AS p_kwh, p.ac_energy_kwh AS p_meter, {g} AS p_gross
+                       p.energy_added_kwh AS p_kwh, p.ac_energy_kwh AS p_meter, {g} AS p_gross,
+                       {cm} AS p_cost_manual
                   FROM charges c JOIN charges p ON p.id = c.merged_into_id
                  WHERE c.location_type IS NULL AND p.location_type IS NOT NULL""").fetchall()
     except sqlite3.Error:
@@ -2087,7 +2697,7 @@ def repair_merged_charge_pieces() -> int:
     n = 0
     for r in rows:
         ptype = r["ptype"]
-        whole = ptype == "MANUAL" or bool(r["p_gross"] and r["p_gross"] > 0)
+        whole = bool(r["p_cost_manual"]) or bool(r["p_gross"] and r["p_gross"] > 0)
         cost = None
         if not whole and r["pcost"] is not None:
             # what the parent was billed ON, in _billed_kwh's own order
@@ -2103,6 +2713,57 @@ def repair_merged_charge_pieces() -> int:
     return n
 
 
+def get_charge(charge_id: int) -> dict:
+    """One charge, read-only, exactly as stored — no join, no composition. For a route that needs
+    to re-render the CURRENT state without changing anything (e.g. rejecting an unparseable typed
+    value rather than silently treating it as a clear)."""
+    row = _get().execute("SELECT * FROM charges WHERE id=?", (charge_id,)).fetchone()
+    return dict(row) if row else {}
+
+
+def set_charge_cost(charge_id: int, cost: Optional[float]) -> dict:
+    """The pencil-cost field: the REAL total the owner paid, independent of the charge's type. This
+    is what 'Manual' used to mean as a location_type — picking it lost the charge's real type
+    (HOME/AC/FAST/HPC) for good, which is the whole bug this column exists to fix. Now the type
+    stays whatever it truthfully is, and this is the only thing that changes.
+
+    ⚠️ Opposite convention from `set_charge_gross_kwh`/`set_charge_solar_kwh` — on PURPOSE, do not
+    align them. Those two fields always open EMPTY, so a stray open-and-Enter must be a no-op; this
+    one opens PRE-FILLED with the current effective cost, so an empty submission is a deliberate
+    CLEAR — it means "go back to the computed default", not "leave whatever's there". `cost=None`
+    on an ALREADY-TYPED charge is that clear, routed through `update_charge_type(...,
+    cost_manual=False)`, which recomputes the normal price the same way a fresh badge confirm would.
+
+    A charge with no REAL type yet (`location_type IS NULL`, or the legacy `'MANUAL'` placeholder)
+    is a genuinely different case, not routed through `update_charge_type` at all: that function
+    needs a real type to compute a default FROM, and this field's own docstring promise —
+    "independent of the charge's type" — means the box the template offers unconditionally (it is
+    NOT gated on `location_type` the way gross_kwh/solar_kwh are) must actually work before a type
+    is picked, not silently swallow what was typed. First version of this fix (see git log) made it
+    a no-op instead of a 500 — quieter, but still wrong: 200 OK, the box closes, and the figure the
+    owner just typed never lands anywhere (found in review, PR #284). So here: write (or, on an
+    empty submission, clear) `cost`/`cost_manual` directly. There is no computed default without a
+    real type, so "clear" here just means "nothing typed" rather than "recompute" — the type badge,
+    confirmed later, is what actually prices the charge from scratch if nothing was hand-typed."""
+    db = _conn_rw()
+    row = db.execute("SELECT * FROM charges WHERE id=?", (charge_id,)).fetchone()
+    if not row:
+        return {}
+    location_type = row["location_type"]
+    if location_type in CHARGE_TYPES:
+        if cost is None:
+            return update_charge_type(charge_id, location_type, cost_manual=False)
+        return update_charge_type(charge_id, location_type, manual_cost=cost, cost_manual=True)
+    if not _charges_have_cost_manual(db):
+        return dict(row)
+    if cost is None:
+        db.execute("UPDATE charges SET cost=NULL, cost_manual=0 WHERE id=?", (charge_id,))
+    else:
+        db.execute("UPDATE charges SET cost=?, cost_manual=1 WHERE id=?", (round(cost, 2), charge_id))
+    db.commit()
+    return dict(db.execute("SELECT * FROM charges WHERE id=?", (charge_id,)).fetchone())
+
+
 def set_charge_gross_kwh(charge_id: int, gross_kwh: Optional[float]) -> dict:
     """#222 — store the kWh the charger's own display said it delivered, and NOTHING else about the
     charge. Its own type is handed back to update_charge_type unchanged, so the cost is recomputed on
@@ -2113,14 +2774,55 @@ def set_charge_gross_kwh(charge_id: int, gross_kwh: Optional[float]) -> dict:
     the field opens empty every time, so an accidental open followed by Enter has to be a no-op
     rather than an erasure. Zero is the deliberate way to take a wrong number back — every reader
     tests `gross_kwh > 0`, so a stored zero reads as never-typed and the cost falls straight back to
-    the measured basis."""
+    the measured basis.
+
+    `location_type not in CHARGE_TYPES`, not `not row["location_type"]` — a leftover `'MANUAL'` row
+    is truthy but not a real type, and update_charge_type now rejects anything outside CHARGE_TYPES
+    (see set_charge_cost's docstring for the 500 that bare truthiness check used to cause)."""
+    with _conn_rw() as db:
+        # The value, its scope and all affected costs must describe the same edit.
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT * FROM charges WHERE id=?", (charge_id,)).fetchone()
+        if not row or row["location_type"] not in CHARGE_TYPES:
+            return dict(row) if row else {}
+        if gross_kwh is None:
+            return dict(row)
+        if _charges_have_gross_from(db):
+            # A replacement may cover fewer pieces after an unmerge; retire its old scope first.
+            db.execute("UPDATE charges SET gross_kwh_from=NULL WHERE gross_kwh_from=?", (charge_id,))
+            if gross_kwh > 0:
+                ids = [charge_id, *_merged_piece_ids(db, charge_id)]
+                db.execute(f"UPDATE charges SET gross_kwh_from=? WHERE id IN ({','.join('?' * len(ids))})",
+                           (charge_id, *ids))
+        return _update_charge_type(db, charge_id, row["location_type"], gross_kwh=gross_kwh)
+
+
+def set_charge_solar_kwh(charge_id: int, solar_kwh: Optional[float]) -> dict:
+    """#272 — store the kWh of this charge that came off the owner's own roof, and nothing else.
+
+    Mirrors `set_charge_gross_kwh`: the type goes back to `update_charge_type` unchanged so the cost
+    is recomputed on the one rule, an untyped charge is left alone, and `None` (an empty box) writes
+    nothing — the field opens empty every time, so an accidental open followed by Enter must be a
+    no-op rather than an erasure. Zero is the deliberate way to take a wrong number back.
+
+    Returns `{"error": "too_much", "max": <kWh>}` when the figure exceeds the energy the wallbox
+    measured. Refusing beats clamping here: the whole risk of this field is the owner typing the
+    OPPOSITE number — what they bought instead of what the sun gave — and a silent clamp would
+    price that mistake as a free charge without ever saying so. Equal to the measured energy is
+    accepted: a charge entirely off the roof costs nothing, and that is a real case.
+
+    `location_type not in CHARGE_TYPES`, not `not row["location_type"]` — see set_charge_cost's
+    docstring: a leftover `'MANUAL'` row is truthy but not a real type."""
     db = _conn_rw()
     row = db.execute("SELECT * FROM charges WHERE id=?", (charge_id,)).fetchone()
-    if not row or not row["location_type"]:
+    if not row or row["location_type"] not in CHARGE_TYPES:
         return dict(row) if row else {}
-    if gross_kwh is None:
+    if solar_kwh is None:
         return dict(row)
-    return update_charge_type(charge_id, row["location_type"], gross_kwh=gross_kwh)
+    measured = row["ac_energy_kwh"] or 0.0
+    if solar_kwh > measured:
+        return {**dict(row), "error": "too_much", "max": round(measured, 2)}
+    return update_charge_type(charge_id, row["location_type"], solar_kwh=solar_kwh)
 
 
 def set_charge_free(charge_id: int, free: bool) -> dict:
@@ -2129,7 +2831,12 @@ def set_charge_free(charge_id: int, free: bool) -> dict:
     meter), so this is a user declaration, not a measurement. The charge KEEPS its Home location
     (so it stays on the Home side of the Home-vs-Public split, unlike the FREE location_type which
     is 'free away') and its cost is pinned to 0. Unmarking recomputes the normal home cost. HOME-only:
-    a no-op on any other type (free-away is the FREE type)."""
+    a no-op on any other type (free-away is the FREE type).
+
+    `cost_manual=False` on the call below is deliberate, not the usual "ordinary re-tag preserves a
+    typed price" rule: a home charge someone had manually priced, then marks free, means free — the
+    mark is itself an explicit declaration and must win over a now-stale typed figure, in either
+    direction (free → 0.0, unmarked → the normal computed price, never the old manual one)."""
     db = _conn_rw()
     row = db.execute("SELECT * FROM charges WHERE id=?", (charge_id,)).fetchone()
     if not row:
@@ -2145,7 +2852,7 @@ def set_charge_free(charge_id: int, free: bool) -> dict:
     # row AND for every other piece of a merged group. Doing the arithmetic here instead left a
     # marked group costing its children's share: the page sums the pieces, and the mark stopped at
     # the row that was clicked.
-    return update_charge_type(charge_id, "HOME")
+    return update_charge_type(charge_id, "HOME", cost_manual=False)
 
 
 def auto_confirm_home_charges() -> int:
@@ -2172,6 +2879,48 @@ def auto_confirm_home_charges() -> int:
     for r in rows:
         update_charge_type(r["id"], "HOME")
     return len(rows)
+
+
+def price_default_home_charges() -> int:
+    """Price the charges that «I always charge at home» (v3.14.15, disc #255) created ALREADY typed.
+
+    That opt-in makes a charge be born `location_type='HOME'` instead of untyped, to spare an owner
+    who only ever charges at home one confirm per session. But the costing engine runs on a CONFIRM
+    — by hand, or the wallbox auto-confirm above. Born confirmed, the charge went through neither:
+    green HOME badge, cost '—'. And since the period spend and the average €/kWh count only priced
+    charges, turning that switch on quietly stopped both from counting anything.
+
+    🔑 Each hit goes through `update_charge_type` — the SAME path as a manual confirm, exactly like
+    its wallbox sibling. That is also why the backlog needs no separate rule about "which tariff":
+    an old charge is priced exactly as it would be if the owner pressed its badge today, and TOU
+    bands read the charge's own hour either way.
+
+    ⚠️ Only NULL costs are filled. A confirmed cost is frozen ('new charges only'), and a charge
+    marked free (#120) holds 0.0, which is not NULL — neither is rewritten.
+
+    ⚠️ Bails out unless a home tariff is actually configured: with nothing to price with, the rows
+    would stay in the set and be re-selected on every single page render.
+
+    Runs on page renders, like its siblings (a settings probe + one SELECT, normally 0 rows).
+    Returns how many were priced."""
+    try:
+        if get_setting("home_charges_default", "0") != "1":
+            return 0
+        if not float(get_charge_prices().get("price_home_kwh") or 0):
+            return 0
+        rows = _get().execute(
+            "SELECT id FROM charges WHERE vehicle_id = COALESCE(?, vehicle_id) "
+            "AND location_type = 'HOME' AND ended_at IS NOT NULL AND cost IS NULL "
+            "AND COALESCE(energy_added_kwh, 0) > 0",
+            (_current_vehicle_id(),)
+        ).fetchall()
+    except (sqlite3.Error, TypeError, ValueError):   # fresh install, or no usable price
+        return 0
+    fatte = 0
+    for r in rows:
+        update_charge_type(r["id"], "HOME")
+        fatte += 1
+    return fatte
 
 
 # ── 📍 charging-station labels (resolved by web/charger_locator.py) ───────────
@@ -2235,8 +2984,8 @@ def get_charge_location(charge_id: int) -> Optional[dict]:
     get_location_lookup_candidates (only lists NOT-yet-labelled charges for the
     background sweep), this fetches any one charge regardless of its current label."""
     row = _get().execute(
-        "SELECT id, latitude, longitude, location_type, location_name, location_url "
-        "FROM charges WHERE id=?",
+        "SELECT id, vehicle_id, latitude, longitude, location_type, location_name, location_url, "
+        "charging_place_name FROM charges WHERE id=?",
         (charge_id,)).fetchone()
     return dict(row) if row else None
 
@@ -2268,12 +3017,14 @@ def set_charge_location_url(charge_id: int, url: str) -> None:
     db.commit()
 
 
-def save_charge_note(charge_id: int, note: str) -> None:
-    """#107: persist the optional free-text user note on a charge (empty string clears it)."""
+def save_charge_note(charge_id: int, note: str) -> str:
+    """#107: persist the optional free-text user note on a charge (empty string clears it); returns
+    the note as stored."""
     note = (note or "").strip()[:1000]
     db = _conn_rw()
     db.execute("UPDATE charges SET note=? WHERE id=?", (note or None, charge_id))
     db.commit()
+    return note
 
 
 # #107: driving-mode tag values Mate accepts (manual — the cloud doesn't expose drive mode).
@@ -2369,35 +3120,40 @@ def add_manual_charge(started_at: str, energy_kwh: float, cost: Optional[float] 
     so the lifetime totals / monthly report reflect them (#87). Date + energy are the essentials;
     cost, AC/DC and — optionally — start/end SoC can be given (the latter drives the card's SoC-gain
     tile, requested by @rossiadobe on #67). It stays SoH-safe either way: a manual charge has no power
-    curve, so get_battery_health integrates ~0 energy and skips it regardless of SoC. location_type=
-    'MANUAL' keeps the automatic costers from overwriting the cost the user typed, and manual_entry=1
-    is what says the row was TYPED (#188) — the location_type alone can't, since it doubles as the
-    cost basis a user picks on a real charge."""
+    curve, so get_battery_health integrates ~0 energy and skips it regardless of SoC.
+
+    `location_type` is the real AC/FAST type from the form's own AC/DC choice — it used to be the
+    literal string 'MANUAL', which meant a hand-typed HPC-ish session could never be found by
+    searching HPC. `cost_manual=1` is what now keeps the automatic costers from overwriting the
+    cost the user typed (a hand-typed row's cost is manual by definition), and `manual_entry=1` is
+    still what says the row was TYPED at all (#188) — a question `cost_manual` can't answer, since
+    a REAL charge priced by hand is also `cost_manual=1`. Left as a plain INSERT rather than routed
+    through `update_charge_type`/`compute_cost`: a row with no cost typed must stay `cost=NULL`
+    exactly as it always has, not suddenly get auto-priced now that its type is a real one."""
     db = _conn_rw()
     try:
         vehicle_id = _selected_or_first(db)
-        ct = "DC" if str(charge_type).upper() in ("DC", "FAST", "HPC") else "AC"
+        loc_type, ct = manual_charge_type(charge_type)
         # #237 — the odometer only joins the INSERT where the column exists: the migration lives in
         # the poller and the web never alters the database (see `_charges_have_odometer`). Zero is
         # not stored, for the same reason the poller refuses it: an odometer of 0 would place the
-        # session at the factory gate rather than say nothing.
+        # session at the factory gate rather than say nothing. cost_manual joins the same way,
+        # guarded on its own migration.
         odo = float(odometer_km) if odometer_km else None
+        cols = ["vehicle_id", "started_at", "ended_at", "energy_added_kwh", "duration_min",
+                "charge_type", "location_type", "cost", "start_soc", "end_soc", "reconstructed",
+                "manual_entry"]
+        vals: list = [vehicle_id, started_at, ended_at or started_at, energy_kwh,
+                      _span_minutes(started_at, ended_at), ct, loc_type, cost, start_soc, end_soc,
+                      0, 1]
         if odo is not None and _charges_have_odometer(db):
-            cur = db.execute(
-                "INSERT INTO charges (vehicle_id, started_at, ended_at, energy_added_kwh, "
-                "duration_min, charge_type, location_type, cost, start_soc, end_soc, "
-                "odometer_km, reconstructed, manual_entry) "
-                "VALUES (?, ?, ?, ?, ?, ?, 'MANUAL', ?, ?, ?, ?, 0, 1)",
-                (vehicle_id, started_at, ended_at or started_at, energy_kwh,
-                 _span_minutes(started_at, ended_at), ct, cost, start_soc, end_soc, odo))
-            db.commit()
-            return cur.lastrowid  # type: ignore[return-value]
-        cur = db.execute(
-            "INSERT INTO charges (vehicle_id, started_at, ended_at, energy_added_kwh, duration_min, "
-            "charge_type, location_type, cost, start_soc, end_soc, reconstructed, manual_entry) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'MANUAL', ?, ?, ?, 0, 1)",
-            (vehicle_id, started_at, ended_at or started_at, energy_kwh,
-             _span_minutes(started_at, ended_at), ct, cost, start_soc, end_soc))
+            cols.append("odometer_km")
+            vals.append(odo)
+        if _charges_have_cost_manual(db):
+            cols.append("cost_manual")
+            vals.append(1)
+        placeholders = ", ".join("?" * len(vals))
+        cur = db.execute(f"INSERT INTO charges ({', '.join(cols)}) VALUES ({placeholders})", vals)
         db.commit()
         # lastrowid is Optional only for a cursor that last ran something other than an INSERT;
         # this one just inserted into a table with an INTEGER PRIMARY KEY, so it is the new id.
@@ -2430,31 +3186,36 @@ def update_manual_charge(charge_id: int, started_at: str, energy_kwh: float,
     spreadsheet and could then change only its note, its AC/DC tag and its cost, while the times and
     the SoC (which the add form never even asked for) were frozen for good.
 
+    `location_type` is kept in step with the AC/DC tag here too (`"FAST" if ct=="DC" else "AC"`) —
+    it is the real, searchable type now, not the old 'MANUAL' placeholder, so editing the tag must
+    still move it. `cost_manual` is left untouched: this row was already manually priced the moment
+    it was typed in, and an edit to the amount doesn't change that.
+
     Guarded on manual_entry=1, and that guard is the point: on a MEASURED charge these fields are
     readings, and handing them to a form would let a typo overwrite what the car reported. Returns
     False — changing nothing — when the id isn't a typed-in charge."""
     db = _conn_rw()
     try:
-        ct = "DC" if str(charge_type).upper() in ("DC", "FAST", "HPC") else "AC"
+        loc_type, ct = manual_charge_type(charge_type)
         # #237 — the odometer is written only where the column exists, and clearing it is a real
         # answer: someone who realises they typed the wrong reading must be able to take it back
         # out, not be stuck with a wrong kilometre for ever.
         if _charges_have_odometer(db):
             cur = db.execute(
                 "UPDATE charges SET started_at=?, ended_at=?, energy_added_kwh=?, duration_min=?, "
-                "charge_type=?, cost=?, start_soc=?, end_soc=?, odometer_km=? "
+                "charge_type=?, location_type=?, cost=?, start_soc=?, end_soc=?, odometer_km=? "
                 "WHERE id=? AND manual_entry=1",
                 (started_at, ended_at or started_at, energy_kwh,
-                 _span_minutes(started_at, ended_at), ct, cost, start_soc, end_soc,
+                 _span_minutes(started_at, ended_at), ct, loc_type, cost, start_soc, end_soc,
                  (float(odometer_km) if odometer_km else None), charge_id))
             db.commit()
             return cur.rowcount > 0
         cur = db.execute(
             "UPDATE charges SET started_at=?, ended_at=?, energy_added_kwh=?, duration_min=?, "
-            "charge_type=?, cost=?, start_soc=?, end_soc=? "
+            "charge_type=?, location_type=?, cost=?, start_soc=?, end_soc=? "
             "WHERE id=? AND manual_entry=1",
             (started_at, ended_at or started_at, energy_kwh, _span_minutes(started_at, ended_at),
-             ct, cost, start_soc, end_soc, charge_id))
+             ct, loc_type, cost, start_soc, end_soc, charge_id))
         db.commit()
         return cur.rowcount > 0
     finally:
@@ -2553,11 +3314,27 @@ def repair_manual_charge_timezones() -> int:
 # so the user logs each refuel here (litres + €/L, or total + litres). Web-owned table (create-if-
 # missing, like command_log) because the data is entered from the web UI — no poller round-trip.
 def _ensure_fuel_purchases(db: sqlite3.Connection) -> None:
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS fuel_purchases ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT, vehicle_id INTEGER, ts TEXT NOT NULL, "
-        "liters REAL NOT NULL, price_per_l REAL NOT NULL, total_cost REAL, "
-        "fuel_before_pct REAL, note TEXT, created_at TEXT)")
+    """Create the refuels table if it is not there. Refuels are typed in by hand, so the table is
+    made on first use rather than in the poller's schema.
+
+    🔴 Thirteen call sites hand this a READ connection, which is opened `mode=ro` and cannot create
+    anything — and most of them wrap this call and their own query in ONE `except sqlite3.Error`, so
+    a failure here silently skips the query. That was invisible while every read opened its own
+    connection: `CREATE TABLE IF NOT EXISTS` is a no-op against a connection whose cached schema
+    already holds the table, so a fresh reader never tried to write and never raised. A connection
+    opened BEFORE the first refuel does try, and raises "attempt to write a readonly database" from
+    then on — which made the total drop every refuel (test_reev_total_consumption). So the refusal is
+    swallowed here, where it is expected, instead of being allowed to eat somebody's read.
+    A writer that genuinely cannot create the table still fails loudly on its own INSERT.
+    """
+    try:
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS fuel_purchases ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, vehicle_id INTEGER, ts TEXT NOT NULL, "
+            "liters REAL NOT NULL, price_per_l REAL NOT NULL, total_cost REAL, "
+            "fuel_before_pct REAL, note TEXT, created_at TEXT)")
+    except sqlite3.OperationalError:
+        pass
 
 
 def _fuel_before_pct(db: sqlite3.Connection, vehicle_id, ts: str):
@@ -2576,14 +3353,21 @@ def _fuel_before_pct(db: sqlite3.Connection, vehicle_id, ts: str):
 
 def add_fuel_purchase(ts: str, liters: float, price_per_l: Optional[float] = None,
                       total_cost: Optional[float] = None, note: Optional[str] = None,
-                      fuel_before_pct: Optional[float] = None) -> int:
+                      fuel_before_pct: Optional[float] = None,
+                      vehicle_id: Optional[int] = None) -> int:
     """Log one REEV refuel. Either `price_per_l` or `total_cost` is enough — the other is derived
     (€/L = total/litres, or total = €/L·litres). Snapshots the tank % just before `ts` so the WAC
     weight is frozen against pruning. Feeds fuel_blended_price_at → the per-trip fuel cost.
 
     `fuel_before_pct` overrides that snapshot, and confirming a detected refuel is why it exists: the
     detection's own instant is the first reading that already shows the FULL tank, so re-deriving the
-    residual from "the last reading at or before ts" would hand back the level after the fill."""
+    residual from "the last reading at or before ts" would hand back the level after the fill.
+
+    `vehicle_id` overrides the SIDEBAR car, and confirming a detected refuel is why THAT exists too:
+    the detection knows which car burned the fuel, and the sidebar may be showing the other one. The
+    detection row is deleted right after the confirm, so filing it under the wrong car cannot be
+    repaired later — nothing is left that remembers whose it was. Typed-by-hand refuels keep the
+    sidebar car: there the selected car IS the user's answer. → [[multi-car-scoping-audit]]"""
     liters = float(liters)
     if liters <= 0:
         raise ValueError("liters must be > 0")
@@ -2600,7 +3384,8 @@ def add_fuel_purchase(ts: str, liters: float, price_per_l: Optional[float] = Non
     db = _conn_rw()
     try:
         _ensure_fuel_purchases(db)
-        vehicle_id = _selected_or_first(db)
+        if vehicle_id is None:
+            vehicle_id = _selected_or_first(db)
         fb = fuel_before_pct if fuel_before_pct is not None else _fuel_before_pct(db, vehicle_id, ts)
         cur = db.execute(
             "INSERT INTO fuel_purchases (vehicle_id, ts, liters, price_per_l, total_cost, "
@@ -2615,16 +3400,164 @@ def add_fuel_purchase(ts: str, liters: float, price_per_l: Optional[float] = Non
 
 
 def list_fuel_purchases(limit: int = 200) -> list:
-    """The user's refuels, newest first — for the Rifornimenti page and the tank state."""
+    """The user's refuels, newest first — for the Rifornimenti page and the tank state.
+
+    ⚠️ SCOPED to the selected car, like every other reader of this table (reev_actual_spend, the WAC
+    rate map, fuel_blended_price_at, generate_fuel_auto_note). It was the one that wasn't: on two
+    REEVs the page summed both cars while the Statistics spend card summed one, two different numbers
+    under the same word. The two calendars go through here, so they are scoped by this line too —
+    which is exactly why the scope belongs HERE and not in each of them.
+    → [[multi-car-scoping-audit]] · [[feedback-two-numbers-one-word]]"""
     db = _conn_rw()
     try:
         _ensure_fuel_purchases(db)
         rows = db.execute(
             "SELECT id, ts, liters, price_per_l, total_cost, fuel_before_pct, note "
-            "FROM fuel_purchases ORDER BY ts DESC, id DESC LIMIT ?", (int(limit),)).fetchall()
+            "FROM fuel_purchases WHERE vehicle_id = COALESCE(?, vehicle_id) "
+            "ORDER BY ts DESC, id DESC LIMIT ?", (_current_vehicle_id(), int(limit))).fetchall()
         return [dict(r) for r in rows]
     finally:
         db.close()
+
+
+# The cloud's OWN per-trip record, as the API-v2 history worker stages it in
+# api_lab_cloud_history_records — allow-listed for the BetaTester bundle, and the single source of
+# both the columns and their order (main.py's writer reads this tuple; two lists would drift, and a
+# drifted column disappears silently).
+#
+# `driveReevOil` is why this exists: the fuel that ONE drive burned, by the car's own cloud. Measured
+# 27/09/2026 on 183 records of a B10 — present on every one, reading 0.0, which is correct for a BEV
+# and no answer for a range-extender. Its UNIT is LITRES, settled on 29/09/2026 against @ebagnoli's
+# 19/09 drive: the official app states 77 km / 0.3 kWh / 4.9 L for it and the record reads
+# `totalMileage` 77.0, `totalEnergy` 0.3, `driveReevOil` 4.9 — three fields agreeing at once, which
+# a factor of a thousand could not survive. It is also the figure Mate now shows for such a drive
+# (see `trip_energy.cloud_fuel_by_trip`), so this export is what would catch it drifting.
+# `accountId` is dropped and the VIN masked — these rows identify an account and the pack travels.
+# `started_at`/`ended_at` are derived because matching a record to a trip is the whole point: one REEV
+# drive whose litres we know independently is what calibrates the unit.
+RESEARCH_CLOUD_TRIP_FIELDS = (
+    "started_at", "ended_at", "vin_masked", "zone",
+    "routeStartTs", "routeEndTs",
+    # distance twice: the km field is always an integer, the miles field carries the tenths
+    "totalMileage", "totalMileageInMi",
+    "totalEnergy", "maxSpeed", "maxSpeedInMi",
+    "driveReevOil",
+)
+
+
+def _cloud_ms_to_iso(value):
+    """Epoch milliseconds → ISO UTC, or None. The raw field is exported next to it, so a value the
+    cloud sends in some other shape costs a readable column and not the row."""
+    from datetime import datetime, timezone
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(value / 1000, timezone.utc).isoformat()
+    except (ValueError, OSError, OverflowError):
+        return None
+
+
+def journal_mode() -> str | None:
+    """The journal mode this database is REALLY in, straight from the file.
+
+    `PRAGMA journal_mode=WAL` falls back silently where the filesystem cannot give SQLite the shared
+    memory it needs — a network share, which is what a NAS volume often is — and then readers block
+    writers and a busy moment reads as `database is locked` (#338). Nothing recorded which of the two
+    an installation was in, so no bundle could tell the two diagnoses apart. Read-only: asking for
+    the mode without assigning one does not change it."""
+    try:
+        row = _get().execute("PRAGMA journal_mode").fetchone()
+    except sqlite3.Error:
+        return None
+    return row[0] if row else None
+
+
+def cloud_history_state() -> dict:
+    """What the cloud history worker has actually staged, as COUNTS — for the public diagnostics
+    text. Answers the first question a range-extender report has to answer: did the worker run, how
+    many drives did it stage, and is `driveReevOil` populated or flat zero? Those are opposite
+    conclusions ("the cloud sent no fuel" is not a Mate defect), and until now neither was visible.
+
+    Counts and ranges only: no VIN, no accountId, no per-drive rows — that file is attached to public
+    issues. The rows themselves go in the encrypted pack (research_cloud_trip_records).
+
+    The import switch is reported as its two RAW inputs (the setting as stored, and how many trips
+    carry a cloud link) instead of re-deciding it here: the decision belongs to
+    poller/mate_api_runtime/cloud_import_policy.py, and a second copy of it would drift."""
+    import json as _json
+    db = _get()
+    tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'"
+                                      " AND name LIKE 'api_lab_cloud%'")}
+    state = {"staged": "api_lab_cloud_history_records" in tables, "mileage": 0, "charge": 0,
+             "first_at": None, "last_at": None, "oil_present": 0, "oil_positive": 0,
+             "oil_max": None, "promoted_trips": 0, "import_setting": None, "last_sync": None}
+    if "api_lab_cloud_trip_links" in tables:
+        state["promoted_trips"] = db.execute(
+            "SELECT COUNT(*) FROM api_lab_cloud_trip_links").fetchone()[0]
+    state["import_setting"] = get_setting("api_v2_import_cloud_trips", None)
+    state["last_sync"] = get_setting("api_v2_history_sync", None)
+    if not state["staged"]:
+        return state
+    for kind, count in db.execute("SELECT kind, COUNT(*) FROM api_lab_cloud_history_records"
+                                  " GROUP BY kind"):
+        if kind in ("mileage", "charge"):
+            state[kind] = count
+    starts = []
+    for (payload,) in db.execute("SELECT payload_json FROM api_lab_cloud_history_records"
+                                 " WHERE kind='mileage'"):
+        try:
+            record = _json.loads(payload)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        started = _cloud_ms_to_iso(record.get("routeStartTs"))
+        if started:
+            starts.append(started)
+        oil = record.get("driveReevOil")
+        # 🔑 Present-and-zero is an ANSWER (a BEV reports exactly that); absent is not. Counted apart.
+        if isinstance(oil, (int, float)) and not isinstance(oil, bool):
+            state["oil_present"] += 1
+            if oil > 0:
+                state["oil_positive"] += 1
+            if state["oil_max"] is None or oil > state["oil_max"]:
+                state["oil_max"] = oil
+    if starts:
+        state["first_at"], state["last_at"] = min(starts), max(starts)
+    return state
+
+
+def research_cloud_trip_records() -> list:
+    """The staged cloud per-trip records for the BetaTester bundle's cloud_trip_records.csv, oldest
+    first. Reads what is STORED — not another live probe: on the one readable bundle we have (21/09)
+    all five live probes returned `{"code":3,"message":"Token is invalid","data":null}`, because the
+    probe logs in at export time. A staged table needs no token.
+
+    Absent table (every install that never ran the history worker, which is most of them) and
+    unparseable payloads both yield nothing rather than raising: this runs inside an export whose
+    other files must still be produced."""
+    import json as _json
+    db = _get()
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table'"
+                      " AND name='api_lab_cloud_history_records'").fetchone():
+        return []
+    from diagnostics import mask_vin       # local: diagnostics imports this module at its top
+    out = []
+    for (payload,) in db.execute("SELECT payload_json FROM api_lab_cloud_history_records"
+                                 " WHERE kind='mileage'"):
+        try:
+            record = _json.loads(payload)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        row = {key: record.get(key) for key in RESEARCH_CLOUD_TRIP_FIELDS}
+        row["started_at"] = _cloud_ms_to_iso(record.get("routeStartTs"))
+        row["ended_at"] = _cloud_ms_to_iso(record.get("routeEndTs"))
+        row["vin_masked"] = mask_vin(record.get("vin"))
+        out.append(row)
+    out.sort(key=lambda r: (r["routeStartTs"] is None, r["routeStartTs"] or 0))
+    return out
 
 
 def research_fuel_purchases() -> list:
@@ -2683,10 +3616,14 @@ def get_fuel_calendar_day(year: int, month: int, day: int) -> list[dict]:
 
 
 def delete_fuel_purchase(purchase_id: int) -> bool:
+    """⚠️ Scoped: an id belonging to the OTHER car is refused, not deleted. After the list fix such
+    a row is no longer on screen to click — this is the second lock, for a hand-made request."""
     db = _conn_rw()
     try:
         _ensure_fuel_purchases(db)
-        cur = db.execute("DELETE FROM fuel_purchases WHERE id = ?", (int(purchase_id),))
+        cur = db.execute("DELETE FROM fuel_purchases WHERE id = ? "
+                         "AND vehicle_id = COALESCE(?, vehicle_id)",
+                         (int(purchase_id), _current_vehicle_id()))
         db.commit()
         return cur.rowcount > 0
     finally:
@@ -2719,8 +3656,9 @@ def update_fuel_purchase(purchase_id: int, liters: Optional[float] = None,
     try:
         _ensure_fuel_purchases(db)
         row = db.execute(
-            "SELECT vehicle_id, ts, liters, price_per_l, total_cost FROM fuel_purchases WHERE id = ?",
-            (int(purchase_id),)).fetchone()
+            "SELECT vehicle_id, ts, liters, price_per_l, total_cost FROM fuel_purchases "
+            "WHERE id = ? AND vehicle_id = COALESCE(?, vehicle_id)",   # ⚠️ mai l'auto accanto
+            (int(purchase_id), _current_vehicle_id())).fetchone()
         if row is None:
             return False
         cur_ts = row["ts"]
@@ -2814,6 +3752,12 @@ def _ensure_fuel_detected(db: sqlite3.Connection) -> None:
         "status TEXT NOT NULL DEFAULT 'pending', created_at TEXT)")
 
 
+def _fuel_watermark_key(vehicle_id: int) -> str:
+    """How far the refuel scan got, for ONE car. Named here rather than inline so the reader and
+    the writer cannot drift apart — they are 50 lines and one early return away from each other."""
+    return f"fuel_scan_watermark_{vehicle_id}"
+
+
 def scan_fuel_refuels(vehicle_id: Optional[int] = None) -> int:
     """Walk the tank readings the car has already logged and record every rise as a pending refuel.
     Returns how many new ones it found.
@@ -2829,7 +3773,16 @@ def scan_fuel_refuels(vehicle_id: Optional[int] = None) -> int:
     try:
         _ensure_fuel_detected(db)
         _ensure_fuel_purchases(db)
-        mark = get_setting("fuel_scan_watermark", "")
+        # Per VEHICLE, like every other per-car setting here (`is_reev_<vin>`,
+        # `charge_limit_percent_<vin>`): the walk below is scoped to one car, so a single
+        # install-wide mark let the first car to scan carry the second one past its own history —
+        # and since the mark only moves forward, those refuels were skipped for good. Keyed on the
+        # id rather than the VIN because that is what this function is given and what the query
+        # filters on. The old shared key is deliberately NOT migrated onto either car: re-reading a
+        # car's log costs one longer scan and cannot duplicate anything (`_flush_fuel_run` refuses
+        # a run already filed or already logged by hand), while carrying it over would preserve the
+        # very skip this fixes.
+        mark = get_setting(_fuel_watermark_key(vid), "")
         rows = db.execute(
             "SELECT recorded_at, fuel_level_pct, fuel_liters FROM positions "
             "WHERE vehicle_id = ? AND fuel_level_pct IS NOT NULL AND recorded_at >= ? "
@@ -2879,8 +3832,8 @@ def scan_fuel_refuels(vehicle_id: Optional[int] = None) -> int:
         if run is not None:
             found += _flush_fuel_run(db, vid, run, tank)
         # Stop one pair short: the final reading may yet be the "before" of a rise still arriving.
-        db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('fuel_scan_watermark', ?)",
-                   (rows[-2]["recorded_at"],))
+        db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                   (_fuel_watermark_key(vid), rows[-2]["recorded_at"]))
         db.commit()
         return found
     except sqlite3.Error:
@@ -2994,7 +3947,10 @@ def confirm_fuel_detected(det_id: int, liters: Optional[float] = None,
     n_liters = float(liters) if liters else float(row["liters"])
     pid = add_fuel_purchase(row["ts"], n_liters, price_per_l=price_per_l,
                             total_cost=total_cost, note=note,
-                            fuel_before_pct=row["fuel_before_pct"])
+                            fuel_before_pct=row["fuel_before_pct"],
+                            # ⚠️ l'auto del RILEVAMENTO, non quella nella barra: fra due secondi
+                            # la riga qui sotto viene cancellata e nessuno saprà più di chi era.
+                            vehicle_id=row["vehicle_id"])
     db = _conn_rw()
     try:
         db.execute("DELETE FROM fuel_detected WHERE id = ?", (int(det_id),))
@@ -3057,6 +4013,26 @@ def upsert_vehicle(vin: str, car_type: str) -> None:
     db.commit()
 
 
+def configured_charge_limit(vin: str = "") -> int | None:
+    """The car's REAL max-charge limit — the SoC it will actually stop at — for the Overview hero's
+    "to X%" ETA label and for "Charge complete". It is `config["3"]["percent"]` exactly as the CAR
+    reports it, captured by the poll loop on every change (it tracks the app's slider "even when the
+    limit is changed from the official app", poller/main.py) and stored under the per-VIN key. So set
+    the limit to 75 or 80 on the car and the hero reads exactly that.
+
+    🔒 It is NEVER a value typed into Mate. The poll loop only ever writes the per-VIN key from the
+    car's own report; the shared (non-VIN) `charge_limit_percent` key is what Mate's Set-limit button
+    writes — a typed value — and is deliberately NOT consulted here. When the car hasn't reported a
+    limit yet, this is None → the template shows the remaining time with no target, never a guessed
+    100. → #33 (@pdifeo)."""
+    if not vin:
+        return None
+    try:
+        return int(get_setting(f"charge_limit_percent_{vin.lower()}", "") or 0) or None
+    except (TypeError, ValueError):
+        return None
+
+
 def get_vehicle():
     db = _get()
     # `ORDER BY id` is load-bearing, not decoration: `vin` is UNIQUE, so SQLite has a covering
@@ -3071,9 +4047,7 @@ def get_vehicle():
 
 def clear_optimistic_status() -> None:
     """Remove the in-memory optimistic overlay (called when API does not confirm the command)."""
-    global _opt_overrides, _opt_expiry
-    _opt_overrides = {}
-    _opt_expiry = 0.0
+    _opt_by_vehicle.pop(_current_vehicle_id(), None)
 
 
 def extend_optimistic_status() -> None:
@@ -3081,9 +4055,10 @@ def extend_optimistic_status() -> None:
     The post-command verification can poll the cloud for up to ~30s waiting for the
     car's state to propagate; without this the overlay would expire mid-wait and the
     UI would briefly flash the stale pre-command state (GitHub #34)."""
-    global _opt_expiry
-    if _opt_overrides:
-        _opt_expiry = time.time() + _OPT_TTL
+    vid = _current_vehicle_id()
+    entry = _opt_by_vehicle.get(vid)
+    if entry and entry[0]:
+        _opt_by_vehicle[vid] = (entry[0], time.time() + _OPT_TTL)
 
 
 def write_optimistic_status(overrides: dict) -> None:
@@ -3091,7 +4066,6 @@ def write_optimistic_status(overrides: dict) -> None:
        Also caches overrides in memory so get_latest_status() can re-apply them
        even if the poller overwrites the DB row before the UI refresh fires.
     """
-    global _opt_overrides, _opt_expiry
     db = _conn_rw()
     # Clone the CURRENT vehicle's latest row (scoped) — an unscoped "latest" could clone another
     # car's position and insert the optimistic override under the wrong vehicle_id. No-op single-car.
@@ -3107,15 +4081,14 @@ def write_optimistic_status(overrides: dict) -> None:
     placeholders = ", ".join("?" for _ in d)
     db.execute(f"INSERT INTO positions ({cols}) VALUES ({placeholders})", list(d.values()))
     db.commit()
-    _opt_overrides = dict(overrides)
-    _opt_expiry = time.time() + _OPT_TTL
+    _opt_by_vehicle[_current_vehicle_id()] = (dict(overrides), time.time() + _OPT_TTL)
 
 
 # ── GPS sign on the web write path (GitHub #158 — same root cause as #30/#43) ───────────
 # The cloud sends the coordinates twice: signals 2/3 are SIGNED, 3724/3725 (and 2190/2191) are
-# unsigned magnitudes. The poller resolves this properly (client._resolve_coord), but this
-# module keeps its own copy of the parse for the after-a-command / Refresh-button write — and
-# that copy read ONLY the unsigned pair. So a west-of-Greenwich car had its history stored
+# unsigned magnitudes. The poller resolves this properly, but this module kept its own copy of
+# the parse for the after-a-command / Refresh-button write — and that copy read ONLY the unsigned
+# pair. So a west-of-Greenwich car had its history stored
 # correctly by the poller and then, on the very next Refresh, the NEWEST row filed at the
 # mirrored longitude: Andreexylus' Lisbon B10 (-9.14) jumped to +9.14, i.e. the sea off
 # Sardinia, which is what the Overview map shows. Everything east of Greenwich was unaffected,
@@ -3124,136 +4097,81 @@ def write_optimistic_status(overrides: dict) -> None:
 # The signed pair arrives in the very same dict get_fresh_signals() already returns, so it costs
 # nothing to prefer it. When a poll omits it, re-apply the sign the poller persisted (#43) —
 # the web is a separate process and can't see the poller's in-memory sign, but it can read the
-# setting the poller writes. Unknown sign → magnitude as-is, i.e. exactly today's behaviour.
-_COORD_SIGNALS = {"lat": ("3", ("3725", "2190")), "lon": ("2", ("3724", "2191"))}
-
-# Twin of poller/client._MERIDIAN_NEAR_DEG (#232) — the two processes must not disagree about
-# where the car is, so test_gps_sign_survives_a_bad_poll.py asserts they stay equal.
-_MERIDIAN_NEAR_DEG = 1.0
+# setting the poller writes. Unknown sign → magnitude as-is. Both now resolve through gps_position.
 
 
-def _coord_from_signals(signals: dict, axis: str) -> float:
-    """One GPS axis from a raw signal dict: signed signal first, else magnitude × remembered sign."""
-    def _f(raw) -> float:
-        if raw in (None, ""):
-            return 0.0
-        try:
-            return float(raw)
-        except (TypeError, ValueError):
-            return 0.0
-
-    signed_id, unsigned_ids = _COORD_SIGNALS[axis]
+def _remembered_sign(axis: str, vin: Optional[str]) -> float:
+    """The sign the poller learned for this car (db.set_gps_signs writes it per VIN), else the
+    shared key every install predating that has. -1.0, 1.0, or 0.0 = never learned one."""
+    own = get_setting(f"gps_{axis}_sign_{vin.lower()}", "") if vin else ""
     try:
-        sign = float(get_setting(f"gps_{axis}_sign", "0") or 0)
+        sign = float(own or get_setting(f"gps_{axis}_sign", "0") or 0)
     except (TypeError, ValueError):
         sign = 0.0
-    known = -1.0 if sign < 0 else (1.0 if sign > 0 else 0.0)     # 0.0 = never learned one
-
-    s = _f(signals.get(signed_id))
-    if s != 0.0:
-        # Authoritative — it carries its own sign. But a frame that LOST that sign is
-        # indistinguishable from a genuine one (#232), and this copy runs once, on a button: it
-        # cannot count polls the way the poller does, so it never overrules a hemisphere it
-        # already knows unless the car is at the line. The poller stays the only process that
-        # learns; when it does, the setting changes and this follows.
-        # One-directional, like the poller: a dropped sign can only ever arrive POSITIVE, since the
-        # signals it gets confused with are magnitudes and have no minus to lose. So the only
-        # reading worth doubting is a positive one, far from the line, on a car we remember as
-        # west/south — every other combination proves itself and passes straight through.
-        if known == -1.0 and s > _MERIDIAN_NEAR_DEG:
-            return -s
-        return s
-    u = next((v for v in (_f(signals.get(i)) for i in unsigned_ids) if v != 0.0), 0.0)
-    if u == 0.0:
-        return 0.0
-    return abs(u) * (known or 1.0)
+    return -1.0 if sign < 0 else (1.0 if sign > 0 else 0.0)
 
 
-def save_fresh_signals(signals: dict) -> None:
-    """Write a fresh position row from raw API signals (called after a command)."""
+def remembered_signs(vin: Optional[str]) -> dict:
+    """The sign per axis this car's positions are resolved with, as the diagnostics show it:
+    '-1.0', '1.0' or 'unknown'."""
+    return {axis: (str(s) if (s := _remembered_sign(axis, vin)) else "unknown") for axis in ("lat", "lon")}
+
+
+def position_from_signals(signals: dict, vin: Optional[str] = None) -> tuple[float, float]:
+    """(latitude, longitude) of a raw signal dict, by the poller's rule with the signs and the anchor
+    it persisted. This write runs once, on a button: it cannot count polls, so it never learns (#232)
+    — the poller stays the only process that does, and when it does the setting changes and this
+    follows."""
+    mem = gps_position.Memory(signs={axis: known for axis in ("lat", "lon")
+                                     if (known := _remembered_sign(axis, vin))})
+    gps_position.restore(mem, get_setting(f"gps_anchor_{vin.lower()}", "") if vin else "")
+    return gps_position.resolve(mem, signals, learn=False)
+
+
+def save_fresh_signals(signals: dict, vin: Optional[str] = None) -> None:
+    """Write a fresh position row from raw API signals (called after a command).
+
+    `vin` is the car the signals were read from: the row goes under that car, whatever the picker
+    says by now (#338). Without it, under the picker's car."""
+    # A frame without a charge level is no reading (capability_profile.has_soc_reading): the
+    # poller stores nothing from it, and neither does its second writer — which used to store a
+    # SoC the car did not send as 0 %.
+    if not capability_profile.has_soc_reading(signals):
+        logging.getLogger("db_reader").info(
+            "Fresh status not stored: no usable SoC (100003=%r, 1204=%r, 3260=%r)",
+            signals.get("100003"), signals.get("1204"), signals.get("3260"))
+        return
     db = _conn_rw()
     # See get_vehicle(): an unordered LIMIT 1 rides the UNIQUE(vin) covering index and can name
     # the wrong car. This one WRITES a position row, so the wrong id would file live telemetry
     # under the other vehicle.
-    vehicle_id = _current_vehicle_id()
+    if vin:
+        row = db.execute("SELECT id, vin FROM vehicles WHERE vin = ? COLLATE NOCASE",
+                         (vin,)).fetchone()
+        vehicle_id, vin = (row[0], row[1]) if row else (None, None)
+    else:
+        vehicle_id = _current_vehicle_id()
+        row = db.execute("SELECT vin FROM vehicles WHERE id = ?", (vehicle_id,)).fetchone()
+        vin = row[0] if row else None
     if vehicle_id is None:
         return
 
     def sig(key, default=0):  return int(signals.get(key) or default)
     def sigf(key, default=0.0): return float(signals.get(key) or default)
 
-    def _is_charging() -> bool:
-        """Charging only happens while PARKED, so the car must be stationary (gear P,
-        speed ~0); plus the cable plugged in (1149) AND a real charge current (1178). The
-        motion gate is essential: during regen the pack current is strongly negative (same
-        sign as charging) and 1149 reads 1 spuriously, so without it driving is mistaken
-        for charging. Signal 1939 (AC fan mode) is not used."""
-        if int(signals.get("1010") or 0) != 0:   # gear R/N/D → moving
-            return False
-        try:
-            if float(signals.get("1319") or 0) > 2.0:   # speed > 2 km/h → moving
-                return False
-        except (TypeError, ValueError):
-            pass
-        # 0 = unplugged, 5 = the drive-time cable code the REEVs emit while moving (never a
-        # connection). 4 (charge postponed to the programmed window) is deliberately NOT here: see
-        # the poller's _is_charging — excluding it would drop a scheduled charge whole if the car
-        # keeps reporting 4 once its window opens. Kept identical so both readers of 1149 agree.
-        if int(signals.get("1149") or 0) in (0, 5):
-            return False
-        cur = signals.get("1178"); volt = signals.get("1177"); rem = signals.get("1200")
-        try:    cur = float(cur) if cur is not None else None
-        except (TypeError, ValueError): cur = None
-        try:    volt = float(volt) if volt is not None else None
-        except (TypeError, ValueError): volt = None
-        power = abs(cur * volt) / 1000.0 if (cur is not None and volt is not None and abs(cur) >= 3.0) else None
-        if cur is not None:
-            if abs(cur) < 3.0:
-                return False
-            return rem is not None or (power is not None and power >= 1.0)
-        if power is not None:
-            return power >= 1.0 and rem is not None
-        return int(signals.get("1149") or 0) == 2
-
     gear_map = {0: "P", 1: "R", 2: "N", 3: "D"}
     # Windows: flag OR position % (the T03 reports only the %, the B10 only the flag) — same shared
     # logic as the Vehicle page so the Overview tile / Commands grid agree with it (#62). use_pct is
     # gated by the capability profile, exactly as _parse_vehicle_status does.
-    _wvin = (get_vehicle()[0] or {}).get("vin")
+    _wvin = vin or (get_vehicle()[0] or {}).get("vin")
     _wstates = capability_profile.window_open_states(
         signals, bool(_wvin) and capability_profile.is_shown(_wvin, "windows_pct"))
     windows_open = int(any(_wstates))
     windows_open_count = sum(1 for w in _wstates if w)
 
-    # Plug from signal 1149 (charge connection status), gated by motion. Signal 47
-    # (acInputSlowCharge) latches at 1 for ~5 min after an AC charge on the B10 and does
-    # NOT clear on unplug, so it cannot drive session-close; 1149 drops to 0 immediately.
-    # 1149 reads 1 spuriously during regen at speed → suppress while moving (mirrors
-    # _is_charging). 47 is only a fallback when 1149 is absent. See poller/client._is_plugged_in.
-    def _is_plugged() -> bool:
-        if int(signals.get("1010") or 0) != 0:          # gear R/N/D → moving
-            return False
-        try:
-            if float(signals.get("1319") or 0) > 2.0:   # speed > 2 km/h → moving
-                return False
-        except (TypeError, ValueError):
-            pass
-        conn = signals.get("1149")
-        if conn is None:
-            return int(signals.get("47") or 0) == 1     # legacy fallback when 1149 absent
-        try:
-            # 3 is the third connected state the REEVs cycle THROUGH mid-charge (1→2→3→2, parked,
-            # current ~0). The poller learned that in v2.8.4 — reading 3 as unplugged closed and
-            # reopened the session on every flicker and shredded one slow AC charge into empty
-            # fragments (beta #12/#13) — but this copy never got it and still disagreed with
-            # poller/client._is_plugged_in. 5 stays out: that one is the drive-time cable code.
-            # 4 is the cable connected with the charge DEFERRED to its programmed window — the
-            # state that blanked the cable on the Overview (#243), since it fell into "unplugged"
-            # by exclusion. Charging is judged separately, above: 4 is plugged and NOT charging.
-            return int(conn) in (1, 2, 3, 4)
-        except (TypeError, ValueError):
-            return False
-    plug_connected = _is_plugged()
+    # The poller's rules and floor, so the two writers of `positions` read a frame alike.
+    plug_connected = is_plugged_in(signals)
+    charging = is_charging(signals, charge_detect_min_a())
 
     db.execute(
         """INSERT INTO positions (
@@ -3263,50 +4181,70 @@ def save_fresh_signals(signals: dict) -> None:
             battery_min_temp, climate_target_temp, inside_temp,
             is_locked, climate_on, plug_connected,
             climate_cooling, climate_heating, climate_defrost,
-            trunk_open, windows_open, sunshade_open,
+            trunk_open, windows_open, sunshade_pct,
             remaining_charge_min, charge_voltage_v, charge_current_a, charge_completed, security_active,
-            windows_open_count,
+            ready, windows_open_count,
             door_driver_open, door_passenger_open, door_rear_left_open, door_rear_right_open,
             window_fl_open, window_rl_open, ac_port_mode,
             fan_level, recirculation, climate_mode,
-            fuel_level_pct, fuel_range_km, combined_range_km
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            fuel_level_pct, fuel_range_km, combined_range_km, frame_ts
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             vehicle_id,
             datetime.now(timezone.utc).isoformat(),
-            _coord_from_signals(signals, "lat"),   # signed pair first (#158) — never the bare
-            _coord_from_signals(signals, "lon"),   # unsigned magnitude, or west cars land at sea
-            sigf("1319"), sigf("1318"),
+            *position_from_signals(signals, vin),   # signed pair first (#158) — never the bare
+                                                    # unsigned magnitude, or west cars land at sea
+            _sf(signals, "1319"), _sf(signals, "1318"),   # _sf/_si: a signal the car did not send stays absent, not 0
             sigf("100003") or sigf("1204"),
-            sigf("3260"),
+            capability_profile.battery_range_km(signals),   # the poller's rule (#365)
             gear_map.get(sig("1010"), "P"),
-            int(_is_charging()),
-            sigf("1182"), sigf("2183"), sigf("1349"),
+            int(charging),
+            # Absent stays absent, as the poller's _temp_or_none (#144): `float(x or 0)` filed a
+            # temperature the car never sent as 0 °C, and on a T03, which sends no battery temperature,
+            # one fresh reading during a charge made the charge cold to the SoH page (#435).
+            _sf(signals, "1182"), _sf(signals, "2183"), _sf(signals, "1349"),
             sig("1298"), sig("1938"), int(plug_connected),
             int(sig("2669") == 2), int(sig("2681") == 2), int(sig("1945") == 2),
-            sig("1281"), windows_open, sig("1724"),
+            sig("1281"), windows_open,
+            _si(signals, "1724"),
             sig("1200") or None,
             sigf("1177") or None,
             sigf("1178") or None,
             int(int(signals.get("3736") or 0) != 0),
             # assente → NULL, come il poller: due scrittori sullo stesso campo, una sola regola
             (None if signals.get("1255") is None else int(int(signals.get("1255") or 0) != 0)),
+            None if (ready := _sf(signals, "1258")) is None else int(ready == 1),   # READY; absent → NULL
             windows_open_count,
             1 if sig("1277") else 0, 1 if sig("1278") else 0,
             1 if sig("1279") else 0, 1 if sig("1280") else 0,
             1 if _wstates[0] else 0, 1 if _wstates[2] else 0,
             int(signals.get("47") or 0),     # ac_port_mode — same as the poller; without it this
                                              # web-side write left NULL, fragmenting V2L sessions (#)
-            sig("1941") or None,             # fan_level (1941 acAirVolume 1-7; 0 → NULL = no data)
+            sig("1941") or None,             # fan_level (1941 acAirVolume; 0 → NULL = no data)
             int(sig("1943") == 1),           # recirculation (1=recirc/in, 0=fresh/out)
             int(signals["3713"]) if signals.get("3713") is not None else None,  # climate_mode (3713)
             # REEV dual-energy (mirror the poller's save_position): fuel level % (3235) MUST be None on a
             # BEV — sigf() would coerce absent → 0.0 and wrongly trip the "has fuel" guard at 0%.
             float(signals["3235"]) if signals.get("3235") is not None else None,
             sigf("3259") or None, sigf("3261") or None,   # fuel range (3259) + combined range (3261)
+            # The frame's own clock, read as the poller reads it: 0 or absent is no clock → NULL.
+            int(signals.get("sts") or signals.get("1") or 0) or None,
         ),
     )
     db.commit()
+
+
+# A poll that comes back without a GPS fix is stored as (0, 0): a missing coordinate parses to 0.0.
+# Only the PAIR means "no fix": a car on the equator or the prime meridian keeps the other coordinate,
+# and a real position. The bound is one unit of the sixth decimal the cloud reports coordinates in
+# (~11 cm): anything smaller is zero at the data's own resolution.
+_NO_FIX_DEG = 1e-6
+
+
+def has_gps_fix(lat, lon) -> bool:
+    """Whether a stored coordinate pair is a real position, not the (0, 0) of a poll without a fix."""
+    return (lat is not None and lon is not None
+            and not (abs(lat) < _NO_FIX_DEG and abs(lon) < _NO_FIX_DEG))
 
 
 def get_latest_status() -> Optional[dict]:
@@ -3318,30 +4256,48 @@ def get_latest_status() -> Optional[dict]:
     if not row:
         return None
     d = dict(row)
+    # The poller owns the frozen-drive guard. Do not infer a second timeout from frame age:
+    # a fresh frame may carry a backdated clock. Only the frame it actually gave up on is stale.
+    d["driving_stale"] = bool(d.get("frame_ts")) and str(d["frame_ts"]) == get_setting(
+        f"frozen_drive_frame_{d['vehicle_id']}", "")
     # Apply in-memory optimistic overrides if still within TTL
-    if time.time() < _opt_expiry and _opt_overrides:
-        d.update(_opt_overrides)
+    entry = _opt_by_vehicle.get(_current_vehicle_id())
+    if entry and entry[0] and time.time() < entry[1]:
+        d.update(entry[0])
     # GPS fallback: a poll can come back with no fix → (0,0). Don't let that blank the Overview
     # map (or reset Navigation's start point) — fall back to the last position that had a real
     # fix and flag it stale, so the last known location keeps showing. Only a true (0,0)/null is
     # treated as "no fix" (a car genuinely on the prime meridian at lon 0 is kept).
-    _lat, _lon = d.get("latitude"), d.get("longitude")
-    if _lat is None or _lon is None or (abs(_lat) < 1e-6 and abs(_lon) < 1e-6):
+    fix = d          # the row whose position is shown, and so the one its age is read from
+    if not has_gps_fix(d.get("latitude"), d.get("longitude")):
         last = db.execute(
-            "SELECT latitude, longitude FROM positions "
+            "SELECT * FROM positions "
             "WHERE vehicle_id = COALESCE(?, vehicle_id) "
             "AND latitude IS NOT NULL AND longitude IS NOT NULL "
-            "AND NOT (ABS(latitude) < 1e-6 AND ABS(longitude) < 1e-6) "
+            f"AND NOT (ABS(latitude) < {_NO_FIX_DEG} AND ABS(longitude) < {_NO_FIX_DEG}) "
             "ORDER BY id DESC LIMIT 1", (_current_vehicle_id(),)).fetchone()
         if last:
-            d["latitude"], d["longitude"] = last["latitude"], last["longitude"]
+            fix = dict(last)
+            d["latitude"], d["longitude"] = fix["latitude"], fix["longitude"]
             d["position_stale"] = True
-    # Charge power: positions stores current/voltage, not a power column. Compute it
-    # (|I×V|), only when the charge current is meaningful (>=3A). Signal 49 is NOT a
-    # power (it's the left-mirror-heating flag) and must never be used here.
+    # Range fallback, the same way as the GPS above (#365): a frame that reported no range (the
+    # C10's going-to-sleep frame sends 0 beside a full battery) must not blank the Overview — show
+    # the last range the car did report, and say it is stale.
+    if "range_km" in d and d["range_km"] is None:
+        last_range = db.execute(
+            "SELECT range_km FROM positions WHERE vehicle_id = COALESCE(?, vehicle_id) "
+            "AND range_km IS NOT NULL ORDER BY id DESC LIMIT 1", (_current_vehicle_id(),)).fetchone()
+        if last_range:
+            d["range_km"] = last_range["range_km"]
+            d["range_stale"] = True
+    # Charge power: positions stores current/voltage, not a power column. Compute it (|I×V|) with
+    # no current floor, as the poller does since #307 and the chart under a charge always did: at
+    # 718 V a 1.7 kW home charge carries 2.4 A, and the 3 A this copy kept printed 0.00 kW over it
+    # (#409). Zero current already reads zero. Signal 49 is NOT a power (it's the
+    # left-mirror-heating flag) and must never be used here.
     cur_a = d.get("charge_current_a")
     volt_v = d.get("charge_voltage_v")
-    if cur_a is not None and volt_v is not None and abs(cur_a) >= 3.0:
+    if cur_a is not None and volt_v is not None:
         d["charge_power_kw"] = round(abs(cur_a * volt_v) / 1000.0, 2)
     else:
         d["charge_power_kw"] = 0.0
@@ -3349,13 +4305,9 @@ def get_latest_status() -> Optional[dict]:
     # (modes persist when off). The old derive-by-absence wrongly lit up for plain A/C-on / AUTO
     # (mode 0 = A/C on but not yet cooling) — confirmed on-car 2026-06-21.
     d["climate_venting"] = bool(d.get("climate_on")) and d.get("climate_mode") == 4
-    # REEV only: drop the car's "charge complete" flag entirely — on a range-extender it marks a
-    # charge in PROGRESS, not a finished one (see the note beside this file's constants). The raw
-    # value is kept under another name so a diagnostics bundle still shows what the car said.
-    # Pure EVs are untouched.
-    if is_reev_car():
-        d["charge_completed_raw"] = 1 if d.get("charge_completed") else 0
-        d["charge_completed"] = 0
+    # Signal 3736 is no "charge complete" (see the note beside this file's constants): kept for the
+    # diagnostics bundle, and the completion is worked out below once the cable is known.
+    d["charge_completed_raw"] = 1 if d.get("charge_completed") else 0
     # How long ago
     try:
         ts = datetime.fromisoformat(d["recorded_at"])
@@ -3374,15 +4326,72 @@ def get_latest_status() -> Optional[dict]:
             d["last_seen"] = f"{delta // 3600}h ago"
     except Exception:
         d["last_seen"] = "unknown"
+    # The battery at the car's own limit (assumed 100 % if it reports none), and current going into it.
+    car = db.execute("SELECT vin FROM vehicles WHERE id=?", (d["vehicle_id"],)).fetchone()
+    limit = configured_charge_limit(car["vin"] if car else "") or 100
+    at_limit = d.get("soc") is not None and d["soc"] >= limit - _AT_THE_LIMIT_PCT
+    current_in = (d.get("charge_current_a") or 0) <= -_CHARGE_SAMPLE_MIN_A
+    current_out = (d.get("charge_current_a") or 0) >= _CHARGE_SAMPLE_MIN_A   # the pack supplying a load
+    # A charge already running does not vanish from the screen because the current dipped (#307).
+    # `charging` on a position row is the poll's own answer, and it comes from `_is_charging`, which
+    # refuses a pack current below `charge_detect_min_a`. That threshold exists to notice a charge
+    # has STARTED; asked whether an open one is still running it says no, and every charge block on
+    # the Overview reads this flag. @arzthilfe turns his wallbox from 11 A down to 8 A, the pack
+    # draws 1.6 A against his 2.0 A floor, and the screen empties while the battery keeps rising —
+    # on a frame two seconds old, with the session open and the state machine still in CHARGING.
+    # The same "one threshold, two jobs" as the 0.00 kW power reading (v3.18.3); this is its half.
+    # The cable is the guard: unplugged, the answer is the poll's again, so a session left open by
+    # any other defect cannot print "charging" for ever. At the car's limit with no current going in
+    # the charge is over, not dipping: the car ends its session some time after the energy stops.
+    # Current out of the pack is no dip either: the car is running a load from it.
+    if not d.get("charging") and d.get("plug_connected") and not current_out and (current_in or not at_limit):
+        open_charge = db.execute(
+            "SELECT 1 FROM charges WHERE vehicle_id = COALESCE(?, vehicle_id) "
+            "AND ended_at IS NULL LIMIT 1", (_current_vehicle_id(),)).fetchone()
+        if open_charge:
+            d["charging"] = 1
+    # The cable in the port, as the pages read it: the charge session (`plug_connected`), or the
+    # AC port reporting a cable while the charger withholds the current (a schedule on a wallbox).
+    parked = (d.get("gear") or "P") == "P" and (d.get("speed_kmh") or 0) <= 1
+    d["cable_connected"] = None if d.get("plug_connected") is None else bool(
+        d["plug_connected"] or (d.get("ac_port_mode") == 1 and parked))
+    # Complete: cable in, nothing flowing, the battery at the car's limit.
+    d["charge_completed"] = bool(d["cable_connected"] and not d.get("charging") and not current_in and at_limit)
     _data_age(d)
-    # OTA / software-update status (the poller scans the account message inbox for an update notice).
-    d["ota"] = get_ota_status()
+    # How old the POSITION is: the fix's own, when the map falls back to one — the poll without a
+    # fix is seconds old, the position it falls back to may be days old.
+    d["position_age_s"] = _position_age_s(fix.get("frame_ts"), fix.get("recorded_at"))
     return d
 
 
 # How far the data must fall BEHIND THE ROW before the Overview says so. Comfortably above every
 # poll cadence (10s driving, 60s charging), so a slow-but-genuine update is never called stale.
 DATA_AGE_STALE_S = 300
+
+
+def _frame_age_s(frame_ts) -> Optional[int]:
+    """Seconds since the car's own clock stamped a frame, or None when there is nothing honest to
+    say: no clock reported, or a car clock ahead of the host (not a staleness signal)."""
+    if not frame_ts:
+        return None
+    try:
+        stamped = datetime.fromtimestamp(int(frame_ts) / 1000, timezone.utc)
+        age = int((datetime.now(timezone.utc) - stamped).total_seconds())
+    except Exception:  # noqa: BLE001
+        return None
+    return age if age >= 0 else None
+
+
+def _position_age_s(frame_ts, recorded_at) -> Optional[int]:
+    """How old a position is: its frame's age (#232), else the time since Mate wrote its row — a
+    car that reports no clock has nothing better."""
+    age = _frame_age_s(frame_ts)
+    if age is not None:
+        return age
+    try:
+        return int((datetime.now(timezone.utc) - datetime.fromisoformat(recorded_at)).total_seconds())
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _data_age(d: dict) -> None:
@@ -3408,15 +4417,8 @@ def _data_age(d: dict) -> None:
     """
     d["data_age"] = None
     d["data_age_s"] = None
-    ts = d.get("frame_ts")
-    if not ts:
-        return                       # car doesn't report its own clock → nothing honest to say
-    try:
-        age = int((datetime.now(timezone.utc) - datetime.fromtimestamp(int(ts) / 1000, timezone.utc))
-                  .total_seconds())
-    except Exception:  # noqa: BLE001
-        return
-    if age < 0:                      # car clock ahead of the host — not a staleness signal
+    age = _frame_age_s(d.get("frame_ts"))
+    if age is None:
         return
     d["data_age_s"] = age
     moving = bool(d.get("charging")) or (d.get("gear") == "D") or float(d.get("speed_kmh") or 0) > 0
@@ -3428,21 +4430,282 @@ def _data_age(d: dict) -> None:
                      f"{age // 86400}d")
 
 
-def get_ota_status() -> dict:
-    """OTA / software-update status the poller stored (from scanning the account inbox). Returns
-    {available:bool, title:str|None, time:str|None (localized "dd/mm HH:MM")}. False until the
-    poller has run a check; only ever True when an update notice is actually present."""
-    available = get_setting("ota_available", "") == "1"
-    title = get_setting("ota_title", "") or None
-    when = None
-    raw = get_setting("ota_time", "")
-    if raw:
+LINK_FRESH_S = DATA_AGE_STALE_S      # one threshold for "current": the row and the card agree
+_LINK_RED = ("login_refused", "fetch_failed", "not_polling")
+
+
+def _heartbeat_grace_s() -> int:
+    """How long the heartbeat may be silent before the poller counts as missing: two parked
+    cadences and a minute, so an install polling every ten minutes is not told the poller is gone
+    between two polls. The heartbeat is written once per round and every five seconds while a
+    startup login waits."""
+    try:
+        parked = int(get_setting("poll_parked", str(POLL_PARKED_DEFAULT_S)) or POLL_PARKED_DEFAULT_S)
+    except (TypeError, ValueError):
+        parked = POLL_PARKED_DEFAULT_S
+    return 2 * parked + 60
+
+
+def _local_hhmm(epoch=None, iso=None) -> Optional[str]:
+    """dd/mm HH:MM in the reader's zone, from an epoch or a stored UTC ISO string."""
+    if epoch is not None:
+        iso = datetime.fromtimestamp(float(epoch), timezone.utc).isoformat()
+    dt = _local_dt(iso)
+    return dt.strftime("%d/%m %H:%M") if dt else None
+
+
+def _iso_epoch(iso) -> Optional[float]:
+    try:
+        return datetime.fromisoformat(str(iso)).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _iso_age_s(iso, now: float) -> Optional[int]:
+    epoch = _iso_epoch(iso)
+    return None if epoch is None else max(0, int(now - epoch))
+
+
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(\.[\w-]+)+")
+
+
+def _error_text(reason) -> Optional[str]:
+    """The error as the poller stored it, for the banner and the hover: the user asked why, so the
+    message itself — with any address the cloud echoed back masked, and cut to one screen line."""
+    if not reason:
+        return None
+    text = _EMAIL_RE.sub("…@…", str(reason)).strip()
+    return text if len(text) <= 200 else text[:199] + "…"
+
+
+def data_link(status) -> dict:
+    """Whether the data on the Overview can be trusted, for the link tile: a state, and the facts
+    each of its hovers shows (`_link_details`).
+
+    Judged in this order, and the first that applies wins:
+      1. the poller's heartbeat — silent past its grace, and nothing else can be trusted: the
+         session state below was written by a process that is not reporting any more;
+      2. the account's session, as the poller reports it in `poll_link` — refused;
+      3. THIS car's last fetch, in `poll_link_<vin>` — failed. Two cars are two requests, and
+         the page is about the car it shows, not about whichever car was polled last;
+      4. the age of the frame on the row, from the car's own clock — the same threshold and the
+         same "no clock, no age" as `_data_age`.
+    A car that has said nothing all night is `no_new_data` and grey — a quiet car is not a broken
+    link; the amber mark is the existing #178 rule (the frame froze while driving or charging).
+    """
+    now = time.time()
+    out = {"state": "fresh", "since_s": None, "since_local": None, "retry_min": None,
+           "reason": None, "bad_creds": False, "amber": False, "last_state": None,
+           "last_error": None, "red": False, "retry_local": None}
+    frame_age = _frame_age_s((status or {}).get("frame_ts"))
+    try:
+        beat = float(get_setting("last_loop_ts", "0") or 0)
+    except (TypeError, ValueError):
+        beat = 0.0
+    link = _link_setting("poll_link")
+    vid = _current_vehicle_id()          # the car the page shows — with a position row or without one
+    vin = _vin_of(vid)
+    fetch = _link_setting(f"poll_link_{vin.lower()}") if vin else {}
+    # the layer that failed, if one did: the session outranks the car's fetch, and a login the
+    # poller could not even put to the cloud (it timed out on the way) fails every car's fetch
+    broken = failure = None
+    if link.get("state") == "refused":
+        broken, failure = link, "login_refused"
+    elif link.get("state") == "failed":
+        broken, failure = link, "fetch_failed"
+    elif fetch.get("state") == "failed":
+        broken, failure = fetch, "fetch_failed"
+    if beat <= 0 or now - beat > _heartbeat_grace_s():
+        out["state"] = "not_polling"
+        out["since_s"] = int(now - beat) if beat > 0 else None
+        out["since_local"] = _local_hhmm(epoch=beat) if beat > 0 else None
+        if broken:
+            out["last_error"] = broken["state"]
+            out["reason"] = _error_text(broken.get("reason"))
+    elif broken:
+        out["state"] = failure
+        out["since_local"] = _local_hhmm(iso=broken.get("since"))
+        out["since_s"] = _iso_age_s(broken.get("since"), now)
+        out["reason"] = _error_text(broken.get("reason"))
+        out["bad_creds"] = bool(broken.get("bad_creds"))
+        nr = broken.get("next_retry_ts")
+        if nr:
+            out["retry_min"] = max(1, (max(0, int(nr - now)) + 59) // 60)
+            out["retry_local"] = _local_hhmm(epoch=nr)     # a future clock; "in N min" is retry_min
+    else:
+        age = frame_age
+        if age is None:
+            out["state"] = "age_unknown"
+        elif age >= LINK_FRESH_S:
+            out["state"] = "no_new_data"
+            out["since_s"] = age
+            out["since_local"] = _local_hhmm(epoch=now - age)
+            out["amber"] = bool(status.get("data_age"))     # the #178 rule: moving or charging
+            out["last_state"] = ("charging" if status.get("charging")
+                                 else "driving" if status.get("gear") == "D" or float(status.get("speed_kmh") or 0) > 0
+                                 else "parked")
+    out["red"] = out["state"] in _LINK_RED
+    out.update(_link_details(status, now, beat, link, vid))
+    return out
+
+
+def _link_setting(key) -> dict:
+    try:
+        return json.loads(get_setting(key, "") or "{}")
+    except ValueError:
+        return {}
+
+
+def _vin_of(vehicle_id) -> Optional[str]:
+    if vehicle_id is None:
+        return None
+    row = _get().execute("SELECT vin FROM vehicles WHERE id = ?", (vehicle_id,)).fetchone()
+    return row["vin"] if row and row["vin"] else None
+
+
+def _moment(epoch, now: float) -> Optional[dict]:
+    """A point in time for a tooltip: the local clock and how long ago — every one the same shape."""
+    if not epoch:
+        return None
+    return {"local": _local_hhmm(epoch=epoch), "age_s": max(0, int(now - float(epoch)))}
+
+
+def _link_details(status, now: float, beat: float, link: dict, vid) -> dict:
+    """What a hover on each dot says — facts, not help text: when the poller started and last
+    beat; when the cloud last answered and last failed, and the session as it stands; when the
+    car last spoke and what it was doing. Every moment is a `_moment`, so the tooltips read alike.
+    `vid` is the car shown: its polls; the session's refusals are everyone's."""
+    db = _get()
+    # Bounded by the retention window, which is also all there is: without a floor the healthy case
+    # — no failure to find — walks every row in the table, on a tile that refreshes every 30 s.
+    floor = (datetime.fromtimestamp(now, timezone.utc) - timedelta(days=8)).isoformat()
+    last_ok = db.execute("SELECT at FROM poll_log WHERE at >= ? AND kind='poll' "
+                         "AND outcome IN ('answer','empty') "
+                         "AND vehicle_id = COALESCE(?, vehicle_id) ORDER BY id DESC LIMIT 1",
+                         (floor, vid)).fetchone()
+    last_bad = db.execute("SELECT at, outcome, reason FROM poll_log WHERE at >= ? AND kind='poll' "
+                          "AND outcome IN ('failed','refused') "
+                          "AND (outcome = 'refused' OR vehicle_id = COALESCE(?, vehicle_id)) "
+                          "ORDER BY id DESC LIMIT 1", (floor, vid)).fetchone()
+    try:
+        started = float(get_setting("poller_started_ts", "0") or 0)
+    except (TypeError, ValueError):
+        started = 0.0
+    frame_age = _frame_age_s((status or {}).get("frame_ts"))
+    car_state = None
+    if status:
+        car_state = ("charging" if status.get("charging")
+                     else "driving" if status.get("gear") == "D" or float(status.get("speed_kmh") or 0) > 0
+                     else "parked")
+    return {
+        "mate": {"started": _moment(started, now), "beat": _moment(beat, now)},
+        "cloud": {"session": link.get("state") or "unknown",
+                  "since": _moment(_iso_epoch(link.get("since")), now),
+                  "last_ok": _moment(_iso_epoch(last_ok["at"]) if last_ok else None, now),
+                  "last_bad": _moment(_iso_epoch(last_bad["at"]) if last_bad else None, now),
+                  "last_bad_what": (f"{last_bad['outcome']}: {_error_text(last_bad['reason']) or ''}".rstrip(": ")
+                                    if last_bad else None)},
+        # the frame by the car's own clock; when it carries none, when the poller received it
+        "car": {"frame": _moment(now - frame_age if frame_age is not None else None, now),
+                "received": _moment(_iso_epoch((status or {}).get("recorded_at")), now), "state": car_state},
+    }
+
+
+POLL_WINDOW_S = 300
+# What wins a window: a failure anywhere in it (what stops the data matters more than what got
+# through beside it); otherwise the best frame that arrived — one current frame means the link
+# worked, however many re-served ones came with it.
+_POLL_RANK = {"gap": 0, "old": 1, "noclock": 2, "current": 3, "empty": 4, "failed": 5, "refused": 6}
+_POLL_COUNTED = ("current", "old", "noclock", "empty", "failed", "refused")
+
+
+def _poll_cell(outcome, frame_age_s) -> str:
+    """A poll row as one word for the strip: the request's outcome, and for an answer whether the
+    frame it carried was current (under LINK_FRESH_S), older, or without a clock."""
+    if outcome != "answer":
+        return outcome                       # empty | failed | refused
+    if frame_age_s is None:
+        return "noclock"
+    return "current" if int(frame_age_s) < LINK_FRESH_S else "old"
+
+
+def polling_summary(now: Optional[float] = None) -> dict:
+    """What the poller has been getting, for Diagnostics and the bundle.
+
+    `strip`: the last 24 h as 288 windows of five minutes of wall clock, each {cell, from, to}:
+    the outcome that wins the window ('gap' where no poll ran) and its local times for a hover.
+    Windows, not polls: the cadence is 10–30 s and user-set, so a count of polls says nothing on
+    its own. `days`: seven local days of counts,
+    today included. `no_poll_min` is five times the number of CLOSED windows with no poll —
+    from the first row kept, up to now — so it is a lower-resolution figure, never the length of
+    an outage, and it never counts the future part of today or the days before history began.
+    """
+    now = time.time() if now is None else now
+    db = _get()
+    rows = [dict(r) for r in db.execute(
+        "SELECT at, kind, outcome, frame_age_s, process FROM poll_log "
+        "WHERE at >= ? ORDER BY id",
+        ((datetime.fromtimestamp(now, timezone.utc) - timedelta(days=8)).isoformat(),)).fetchall()]
+    polls, logins = [], []
+    for r in rows:
         try:
-            dt = datetime.fromtimestamp(int(raw) / 1000, tz=timezone.utc)
-            when = (_local_dt(dt.isoformat()) or dt).strftime("%d/%m %H:%M")
-        except (TypeError, ValueError, OSError):
-            when = None
-    return {"available": available, "title": title, "time": when}
+            ts = datetime.fromisoformat(r["at"]).timestamp()
+        except (TypeError, ValueError):
+            continue
+        (polls if r["kind"] == "poll" else logins).append((ts, r))
+    first_at = polls[0][0] if polls else None
+
+    # the strip: 288 windows ending now
+    start = now - 288 * POLL_WINDOW_S
+    strip = ["gap"] * 288
+    for ts, r in polls:
+        if ts < start or ts >= now:
+            continue
+        i = int((ts - start) // POLL_WINDOW_S)
+        cell = _poll_cell(r["outcome"], r["frame_age_s"])
+        if _POLL_RANK[cell] > _POLL_RANK[strip[i]]:
+            strip[i] = cell
+
+    # seven local days of counts
+    tz = _local_tz()
+    today = datetime.fromtimestamp(now, tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    days = []
+    for back in range(6, -1, -1):
+        day_start = today - timedelta(days=back)
+        d0, d1 = day_start.timestamp(), (day_start + timedelta(days=1)).timestamp()
+        day = {"day": day_start.strftime("%Y-%m-%d"), "polls": 0, "no_poll_min": 0,
+               "login_ok_poller": 0, "login_ok_web": 0,
+               "login_refused_poller": 0, "login_refused_web": 0}
+        day.update({k: 0 for k in _POLL_COUNTED})
+        seen = set()
+        for ts, r in polls:
+            if d0 <= ts < d1:
+                day["polls"] += 1
+                day[_poll_cell(r["outcome"], r["frame_age_s"])] += 1
+                seen.add(int((ts - d0) // POLL_WINDOW_S))
+        for ts, r in logins:
+            if d0 <= ts < d1 and r["outcome"] in ("ok", "refused"):
+                proc = "web" if r["process"] == "web" else "poller"
+                day[f"login_{r['outcome']}_{proc}"] += 1
+        if first_at is not None:
+            lo = max(d0, first_at)
+            hi = min(d1, now)
+            w0 = int((lo - d0 + POLL_WINDOW_S - 1) // POLL_WINDOW_S)     # first window fully after lo
+            w1 = int((hi - d0) // POLL_WINDOW_S)                          # windows closed before hi
+            day["no_poll_min"] = 5 * sum(1 for w in range(w0, w1) if w not in seen)
+        days.append(day)
+    # each cell carries its own window in words, so a colour is never the only thing that says
+    # what it is (a hover shows "13:05–13:10 · session refused")
+    def _hhmm(epoch):
+        # `tz` is resolved once above: 288 windows with two ends each asked for it 576 times, and
+        # every one of those reads opened its own SQLite connection — 578 of the 579 queries this
+        # card costs. → tests/test_the_drain_card_reads_the_clock_once.py for the same defect
+        dt = _local_dt(datetime.fromtimestamp(epoch, timezone.utc).isoformat(), tz)
+        return dt.strftime("%H:%M") if dt else "?"
+    cells = [{"cell": c, "from": _hhmm(start + i * POLL_WINDOW_S),
+              "to": _hhmm(start + (i + 1) * POLL_WINDOW_S)} for i, c in enumerate(strip)]
+    return {"strip": cells, "window_s": POLL_WINDOW_S, "days": days,
+            "first_at": _local_hhmm(epoch=first_at) if first_at else None}
 
 
 def delete_trip(trip_id: int) -> bool:
@@ -3543,21 +4806,51 @@ _READY_BLIP_S = 60
 # (PARKED_CONFIRM = 6 polls). Lowering it with the other one would have left it exactly equal to
 # the lag it exists to cover.
 _READY_MATCH_SLACK_S = 90
-# How long a READY value may be carried forward over polls that didn't report one. The floor is
-# above the widest parked cadence the settings allow (10–600 s), so even the slowest poller keeps
-# a value across a missed reading; the 3× term keeps that margin at three polls when the user has
-# widened the interval. Beyond it the value expires — see ready_session for what that buys.
+# How long a stretch of polls that didn't report READY may last and still join the ready=1 runs on
+# either side of it. The floor is above the widest parked cadence the settings allow (10–600 s), so
+# even the slowest poller bridges a missed reading; the 3× term keeps that margin at three polls
+# when the user has widened the interval. Beyond it the stretch confirms nothing — see ready_session.
 _READY_CARRY_MIN_S = 900
 
 
-def _parked_poll_seconds() -> int:
-    """The user's parked poll interval, clamped to the same 10–600 s the settings form allows so a
-    hand-edited row can't stretch the carry window without limit."""
+# The poller's cadence as Settings ▸ Poll stores it: the default and the range the form accepts.
+# One definition for the form that writes it and every reader here; the poller keeps its own copy of
+# the defaults, because it cannot import the web.
+POLL_PARKED_DEFAULT_S, POLL_PARKED_RANGE_S = 30, (10, 600)
+POLL_DRIVING_DEFAULT_S, POLL_DRIVING_RANGE_S = 10, (10, 60)
+
+
+def poll_seconds(driving: bool) -> int:
+    """The user's poll interval for a parked or a driving car, clamped to the range the settings
+    form allows so a hand-edited row cannot stretch anything that depends on it without limit."""
+    key, default, (lo, hi) = (("poll_driving", POLL_DRIVING_DEFAULT_S, POLL_DRIVING_RANGE_S)
+                              if driving else
+                              ("poll_parked", POLL_PARKED_DEFAULT_S, POLL_PARKED_RANGE_S))
     try:
-        return max(10, min(int(float(get_setting("poll_parked", "30") or 30)), 600))
-    except (TypeError, ValueError):
-        return 30
+        return max(lo, min(int(float(get_setting(key, str(default)) or default)), hi))
+    except (TypeError, ValueError, OverflowError):          # OverflowError: "inf", "1e999"
+        return default
+
+
+def _parked_poll_seconds() -> int:
+    """The parked interval, which bounds the READY carry window below."""
+    return poll_seconds(driving=False)
 _READY_LOOKBACK_S = 6 * 3600  # how far around the trip to scan positions for the session bounds
+
+
+def _one_power_on(gap_s: float, zero: bool, unknown: bool, parked: bool, carry_max: float) -> bool:
+    """Whether two ready=1 runs `gap_s` apart are one power-on, given what the polls between them
+    held: an observed ready=0 (`zero`), a poll that didn't report READY (`unknown`), and one of
+    those in P (`parked`).
+
+    An observed zero is a blip only while it is short, and a poll without READY never says more
+    than a zero would. In P it joins the runs only as briefly: a confirmed park and a plug-in both
+    close a trip on a reading in P (the poller stores a missing gear as P), and past a blip nothing
+    tells such a stop from a switch-off. Out of P it joins them within `carry_max`; the frozen-frame
+    guard closes a trip in gear, but only after half an hour, beyond the window. Out of P is no
+    proof the car stayed on — it only leaves the window to decide."""
+    return (not zero or gap_s < _READY_BLIP_S) and not (
+        unknown and ((parked and gap_s >= _READY_BLIP_S) or gap_s > carry_max))
 
 
 def ready_session(trip: dict):
@@ -3568,7 +4861,10 @@ def ready_session(trip: dict):
 
     Returns {on, off, n_trips, trip_ids} (epoch seconds) or None when no ready data covers the trip
     (old trips before the signal existed → caller falls back to the T0−2min window). Brief ready=0
-    dips shorter than _READY_BLIP_S are treated as still-on (blips)."""
+    dips shorter than _READY_BLIP_S are treated as still-on (blips). Polls that didn't report READY
+    join the runs around them in P only as briefly as a blip, and out of P within the carry window;
+    a session split there could not be confirmed as one, which is not the same as the car having
+    been switched off."""
     t0, t1 = _trip_epoch(trip.get("started_at")), _trip_epoch(trip.get("ended_at"))
     if not t0 or not t1:
         return None
@@ -3576,71 +4872,55 @@ def ready_session(trip: dict):
     lo = datetime.fromtimestamp(t0 - _READY_LOOKBACK_S, timezone.utc).isoformat()
     hi = datetime.fromtimestamp(t1 + _READY_LOOKBACK_S, timezone.utc).isoformat()
     rows = db.execute(
-        "SELECT recorded_at, ready FROM positions WHERE vehicle_id = COALESCE(?, vehicle_id) "
+        "SELECT recorded_at, ready, gear FROM positions WHERE vehicle_id = COALESCE(?, vehicle_id) "
         "AND recorded_at >= ? AND recorded_at <= ? "
         "ORDER BY recorded_at", (_current_vehicle_id(), lo, hi)).fetchall()
-    # Carry a known value forward across polls that didn't report one — but only for a while. The
-    # carry-forward is meant to bridge a missed poll or two; on a car that reports READY rarely it
-    # was instead becoming the only source of truth, and one ready=1 kept meaning "still on" for
-    # hours, straight across a real power-off. Measured: on a BEV, 89.8% of position rows carry a
-    # READY value and 99.9% of consecutive samples are ONE poll apart, so expiry never fires there;
-    # on michapr's REEV (beta #19) the signal arrives in ~0.8% of frames and effectively never as a
-    # zero, so the carry ran for hours and two separate drives were reported as one power-on —
-    # which told him to MERGE trips that must stay apart.
-    #
-    # Past the window the sample becomes None, not 0: "we no longer know" is the truth, and claiming
-    # "off" would be the same overreach in the other direction. None ends the ready=1 run (anything
-    # that isn't 1 does) without being picked up as an observed zero by the on_lo bracket below.
-    carry_max = max(_READY_CARRY_MIN_S, 3 * _parked_poll_seconds())
-    samples, last, last_e = [], None, None
-    for r in rows:
-        e = _trip_epoch(r["recorded_at"])
-        if e is None:
-            continue
-        rd = r["ready"]
-        if rd is None:
-            rd = last if (last is not None and last_e is not None
-                          and e - last_e <= carry_max) else None
-        else:
-            last, last_e = rd, e
-        samples.append((e, rd))
-    if not any(rd for _, rd in samples):
+    samples = [(e, r["ready"], r["gear"]) for r in rows
+               if (e := _trip_epoch(r["recorded_at"])) is not None]
+    if not any(rd == 1 for _, rd, _ in samples):
         return None                          # no ready=1 anywhere → no session info
-    # Build ready=1 runs, then merge runs separated by a ready=0 gap shorter than the debounce.
-    runs, cur = [], None
-    for e, rd in samples:
-        if rd == 1:
-            cur = [e, e] if cur is None else [cur[0], e]
-        elif cur is not None:
-            runs.append(cur); cur = None
-    if cur is not None:
-        runs.append(cur)
-    merged = []
-    for run in runs:
-        if merged and run[0] - merged[-1][1] < _READY_BLIP_S:
-            merged[-1][1] = run[1]
+    # Build ready=1 runs, and join two runs when what lies between them doesn't break the power-on.
+    # A NULL is a poll that didn't report READY: neither on nor off. It is never carried forward (on
+    # a car that reports READY rarely, beta #19, a carried ready=1 outlasted a real power-off) and
+    # never stands for the observed off that on_lo below needs.
+    carry_max = max(_READY_CARRY_MIN_S, 3 * _parked_poll_seconds())
+    merged, zero, unknown, parked = [], False, False, False
+    for e, rd, gear in samples:
+        if rd != 1:
+            zero, unknown = zero or rd == 0, unknown or rd is None
+            parked = parked or (rd is None and gear == "P")
+            continue
+        if merged and _one_power_on(e - merged[-1][1], zero, unknown, parked, carry_max):
+            merged[-1][1] = e
         else:
-            merged.append(list(run))
+            merged.append([e, e])
+        zero, unknown, parked = False, False, False
     # The session = the run that brackets the trip (small slack: the gear-P trip-end lags ready-off
     # by ~1 min, and ready-on can sit a poll after T0).
-    sess = next(((s, e) for s, e in merged
-                 if s - _READY_MATCH_SLACK_S <= t0 and t1 <= e + _READY_MATCH_SLACK_S), None)
-    if sess is None:                         # fallback: any run overlapping the trip
-        sess = next(((s, e) for s, e in merged if not (e < t0 or s > t1)), None)
-    if sess is None:
+    at = next((i for i, (s, e) in enumerate(merged)
+               if s - _READY_MATCH_SLACK_S <= t0 and t1 <= e + _READY_MATCH_SLACK_S), None)
+    if at is None:                           # fallback: any run overlapping the trip
+        at = next((i for i, (s, e) in enumerate(merged) if not (e < t0 or s > t1)), None)
+    if at is None:
         return None
-    on, off = sess
-    # on_lo = last ready=0 sample BEFORE the run = lower bracket of the real Ready-on. The true
+    on, off = merged[at]
+    # on_lo = last OBSERVED ready=0 before the run = lower bracket of the real Ready-on. The true
     # power-on (= getEC anchor) sits between on_lo and `on` (≤ one poll interval), so on_lo is
-    # provably ≤ the anchor → the safe getEC begin (see trip_ec_window). None only if the run starts
-    # at the scan edge with no preceding off-sample (caller then uses its fallback).
-    on_lo = max((ts for ts, rd in samples if ts < on and rd == 0), default=None)
-    # Count finalized, non-merged trips whose span falls inside the session.
+    # provably ≤ the anchor → the safe getEC begin (see trip_ec_window). Only a zero after the run
+    # before this one counts: the car was on in that run, so an older zero brackets nothing here.
+    # None when no such zero was observed (caller then uses its fallback).
+    since = merged[at - 1][1] if at else float("-inf")
+    on_lo = max((ts for ts, rd, _ in samples if since < ts < on and rd == 0), default=None)
+    # Count finalized, non-merged trips whose span falls inside the session — the DRIVES. A row of
+    # no distance is not one: the Leapmotor history import writes a trip per cloud record, including
+    # the 0 km ones it keeps for a manoeuvre, with no positions and no SoC. Counting those made the
+    # conversion refuse a session the user then could not fix — merging the two real halves leaves
+    # the 0 km row outside the group, so the guard refused again (9 of Silvio's 74 shared sessions).
     olo = datetime.fromtimestamp(on - _READY_MATCH_SLACK_S, timezone.utc).isoformat()
     ohi = datetime.fromtimestamp(off + _READY_MATCH_SLACK_S, timezone.utc).isoformat()
     trs = db.execute(
         "SELECT id, started_at, ended_at FROM trips WHERE vehicle_id = COALESCE(?, vehicle_id) "
-        "AND merged_into_id IS NULL "
+        "AND merged_into_id IS NULL AND COALESCE(distance_km, 0) > 0 "
         "AND ended_at IS NOT NULL AND ended_at >= ? AND started_at <= ? ORDER BY started_at",
         (_current_vehicle_id(), olo, ohi)).fetchall()
     ids = []
@@ -3696,7 +4976,7 @@ def store_trip_ec(trip_id: int, ec: Optional[dict], distance_km, apply_energy: b
     # Override the trip's energy/efficiency only once the EC is STABLE — a fresh trip's cloud value
     # is written incrementally, so applying an early partial read would show a wrong figure. Back up
     # the SoC efficiency at the same moment so the override stays exactly reversible.
-    if apply_energy and stable and tot and distance_km and distance_km > 0:
+    if apply_energy and stable and tot is not None and distance_km and distance_km > 0:
         # REEV: never let getEC (electric energy spread over the FULL distance) become the trip's
         # efficiency when the range-extender ran — that's exactly the diluted ~0.5 figure we suppress
         # (beta #10). The AND-NOT self-gates to REEV engine-on trips; BEV/pure-EV trips override as before.
@@ -3894,6 +5174,21 @@ def _gap_minutes(end_iso, start_iso):
         return None
 
 
+def _whole_minutes(parts, total: int) -> list:
+    """`parts` (minutes) as whole minutes adding up to `total`, the printed duration they split: scaled
+    onto it, floored, and the minutes left over given to the parts that lost the most in the flooring.
+
+    Parts that are all zero carry no split to scale; they share the duration equally rather than
+    taking a minute each and leaving the rest of it unaccounted for."""
+    weight = sum(parts)
+    exact = ([p * total / weight for p in parts] if weight and parts
+             else [total / len(parts)] * len(parts) if parts else [])
+    whole = [math.floor(e) for e in exact]
+    for i in sorted(range(len(exact)), key=lambda i: whole[i] - exact[i])[:total - sum(whole)]:
+        whole[i] += 1
+    return whole
+
+
 def _haversine_km(lat1, lon1, lat2, lon2) -> float:
     lat1, lon1, lat2, lon2 = map(math.radians, (lat1, lon1, lat2, lon2))
     dlat, dlon = lat2 - lat1, lon2 - lon1
@@ -3962,6 +5257,17 @@ def _filter_frozen_telemetry(positions: list[dict]) -> list[dict]:
     return [p for p, d in zip(positions, drop) if not d]
 
 
+def _trip_points(db, seg_ids: list) -> list[dict]:
+    """The readings a trip is drawn from: every piece of its group in time order, the stretches the
+    cloud served frozen left out (_filter_frozen_telemetry)."""
+    ph = ",".join("?" * len(seg_ids))
+    rows = db.execute(
+        "SELECT recorded_at, latitude, longitude, speed_kmh, soc, elevation_m, power_kw, battery_temp_c, "
+        "range_km, outside_temp_c, trip_id FROM trip_positions "
+        f"WHERE trip_id IN ({ph}) ORDER BY recorded_at, id", seg_ids).fetchall()
+    return _filter_frozen_telemetry([dict(r) for r in rows])
+
+
 def _interpolate_elevation(positions: list[dict]) -> list[dict]:
     """Fill elevation_m gaps BETWEEN two known samples by linear interpolation over elapsed time.
     Legitimate because altitude changes physically continuously (unlike SoC/speed, which can have
@@ -4019,6 +5325,20 @@ def _charge_children_by_parent(db) -> dict:
     return out
 
 
+def _merged_into_column(db) -> str:
+    """`merged_into_id` for a SELECT, or a NULL in its place on a database not migrated yet."""
+    return "merged_into_id" if _charges_have_merge(db) else "NULL AS merged_into_id"
+
+
+def _charges_as_shown(rows) -> list:
+    """Stored charge rows folded into the charges the Charges page shows: each merged group's
+    pieces together, every other row on its own. Needs `id` and `merged_into_id` on each row."""
+    groups: dict = {}
+    for r in rows:
+        groups.setdefault(r["merged_into_id"] or r["id"], []).append(r)
+    return list(groups.values())
+
+
 def _charge_group_stats(parent: dict, children: list) -> dict:
     """Parent dict enriched with the combined figures of [parent + children] — one plug-in the car
     reported as several rows, read back as the single session it was.
@@ -4049,9 +5369,14 @@ def _charge_group_stats(parent: dict, children: list) -> dict:
     d["ended_at"], d["end_soc"] = last.get("ended_at"), last.get("end_soc")
     # A figure NOBODY reported stays missing: gross_kwh is typed by the owner, and summing None as 0
     # would turn "never entered" into a perfectly credible zero. → [[signal-absent-is-not-signal-zero]]
-    for f in ("energy_added_kwh", "cost", "ac_energy_kwh", "gross_kwh", "wb_stuck_kwh"):
+    for f in ("energy_added_kwh", "cost", "ac_energy_kwh", "wb_stuck_kwh"):
         vals = [c[f] for c in pieces if c.get(f) is not None]
         d[f] = sum(vals) if vals else None
+    # The typed figures IN EFFECT, not every figure a piece ever carried: one typed on the merged
+    # card covers the pieces, and a figure a piece was typed before that stays on its row (never
+    # rewritten, so an unmerge gives it back) without counting — see `_gross_figures`.
+    figures = _gross_figures(pieces)[0]
+    d["gross_kwh"] = sum(f["gross_kwh"] for f in figures.values()) if figures else None
     peaks = [c["max_power_kw"] for c in pieces if c.get("max_power_kw") is not None]
     d["max_power_kw"] = max(peaks) if peaks else None
     # The type follows the piece that carried the most energy: a DC stop inside an AC night must not
@@ -4059,6 +5384,10 @@ def _charge_group_stats(parent: dict, children: list) -> dict:
     d["charge_type"] = max(pieces, key=lambda c: c.get("energy_added_kwh") or 0).get("charge_type")
     d["duration_min"] = _minutes_between(d["started_at"], d["ended_at"])
     d["child_ids"] = [c["id"] for c in children]
+    # The pieces themselves, for `_billed_kwh`: the sums above lose which piece the meter measured,
+    # and the billed figure of a group is decided piece by piece. Private, and a list, so the CSV
+    # export drops it like `child_ids`.
+    d["_pieces"] = pieces
     return d
 
 
@@ -4074,6 +5403,26 @@ def _segment_ids(db, trip_id: int) -> list:
                        (_current_vehicle_id(), parent)).fetchall()]
 
 
+def trip_group(trip_id: int):
+    """The drive `trip_id` belongs to, as getEC has to see it: a merged group as one trip (the parent's
+    row with the combined span, distance and SoC) with every segment's id; a plain trip as itself.
+    A merge of close trips is one cloud driving session. None when the trip is gone, or belongs to a
+    car other than the selected one; a merge never crosses cars, so the parent is not asked again."""
+    db = _get()
+    row = db.execute("SELECT * FROM trips WHERE id=? AND vehicle_id = COALESCE(?, vehicle_id)",
+                     (trip_id, _current_vehicle_id())).fetchone()
+    if not row:
+        return None
+    t = dict(row)
+    if t.get("merged_into_id"):
+        parent = db.execute("SELECT * FROM trips WHERE id=?", (t["merged_into_id"],)).fetchone()
+        if parent:
+            t = dict(parent)
+    children = _children_by_parent(db).get(t["id"], [])
+    grp = _trip_group_stats(t, children) if children else t
+    return grp, {t["id"]} | {c["id"] for c in children}
+
+
 def _trip_group_stats(parent: dict, children: list) -> dict:
     """Parent dict enriched with the combined stats of [parent + children] (earliest start →
     latest end). Pure display math — stored rows are untouched. The merge guard guarantees no
@@ -4081,9 +5430,20 @@ def _trip_group_stats(parent: dict, children: list) -> dict:
     d = dict(parent)
     d["merged_count"] = 1
     d["is_merged"] = False
+    d["additional_segment_notes"] = []
     if not children:
         return d
     segs = sorted([parent, *children], key=lambda t: t.get("started_at") or "")
+    d["additional_segment_notes"] = [
+        {
+            "id": segment["id"],
+            "started_at": segment.get("started_at"),
+            "ended_at": segment.get("ended_at"),
+            "note": segment.get("note"),
+        }
+        for segment in segs[1:]
+        if (segment.get("note") or "").strip()
+    ]
     first, last = segs[0], segs[-1]
     d["started_at"], d["start_soc"] = first.get("started_at"), first.get("start_soc")
     d["start_odometer_km"] = first.get("start_odometer_km")
@@ -4136,7 +5496,7 @@ def _trip_group_stats(parent: dict, children: list) -> dict:
     # If the group was converted to the official cloud EC (stored on the parent over the COMBINED
     # distance, e.g. convert-on-merge), prefer it over the SoC estimate so the headline matches the
     # breakdown card. (Skipped for a REEV engine-on group — same reason as above.)
-    if not _reev_engine and d.get("ec_stable") and d.get("ec_kwh") and dist > 0:
+    if not _reev_engine and d.get("ec_stable") and d.get("ec_kwh") is not None and dist > 0:
         d["efficiency_kwh_100km"] = round(d["ec_kwh"] / dist * 100, 1)
     d["merged_count"] = len(segs)
     d["is_merged"] = True
@@ -4207,6 +5567,11 @@ def get_merge_candidates(gap_min: int = TRIP_MERGE_GAP_DEFAULT, day=None) -> lis
 _RESTING_CURRENT_A = 1.0
 
 
+def charge_detect_min_a() -> float:
+    """The charge-detection floor (A) the user set, which the poller applies each cycle."""
+    return float(get_setting("charge_detect_min_a", "2.0") or 2.0)
+
+
 def charge_threshold_too_high() -> "float | None":
     """The highest charging current this car has ever shown, when the charge-detection floor is set
     ABOVE it — i.e. when that setting has switched the detector off. None when it hasn't, or when
@@ -4223,7 +5588,7 @@ def charge_threshold_too_high() -> "float | None":
     charges. Which is the point — a check that used the charges would go quiet at the same moment
     the problem starts."""
     try:
-        floor = float(get_setting("charge_detect_min_a", "2.0") or 2.0)
+        floor = charge_detect_min_a()
     except (TypeError, ValueError):
         return None
     try:
@@ -4327,10 +5692,12 @@ def unmerge_trip(parent_id: int) -> dict:
     # The parent may hold the COMBINED cloud EC (from a convert-on-merge); once split it no longer
     # matches the standalone trip → drop it and restore the SoC efficiency (the user can re-convert
     # the standalone trip). Only touches a parent that actually carries an EC override.
-    db.execute(
-        "UPDATE trips SET efficiency_kwh_100km=COALESCE(efficiency_soc, efficiency_kwh_100km), "
-        "efficiency_soc=NULL, ec_kwh=NULL, ec_driving=NULL, ec_ac=NULL, ec_other=NULL, ec_stable=0 "
-        "WHERE id=? AND ec_kwh IS NOT NULL", (parent_id,))
+    # Imported cloud energy is original data, not a convert-on-merge override.
+    if parent_id not in _cloud_trip_ids(db):
+        db.execute(
+            "UPDATE trips SET efficiency_kwh_100km=COALESCE(efficiency_soc, efficiency_kwh_100km), "
+            "efficiency_soc=NULL, ec_kwh=NULL, ec_driving=NULL, ec_ac=NULL, ec_other=NULL, ec_stable=0 "
+            "WHERE id=? AND ec_kwh IS NOT NULL", (parent_id,))
     db.commit()
     return {"ok": True, "restored": cur.rowcount}
 
@@ -4379,6 +5746,10 @@ def merge_charges(parent_id: int, child_id: int, gap_min: int = CHARGE_MERGE_GAP
     if (a.get("started_at") or "") > (b.get("started_at") or ""):
         a, b = b, a                                   # parent = the earlier row
     kids = _charge_children_by_parent(db)
+    place_facts = {(r.get('charging_place_id'), r.get('charging_place_rate'))
+                   for r in [a, b, *kids.get(a['id'], []), *kids.get(b['id'], [])]}
+    if len(place_facts) > 1 and any(pid is not None for pid, _ in place_facts):
+        return {"ok": False, "error": "different_charging_place"}
     a_grp = _charge_group_stats(a, kids.get(a["id"], []))
     gap = _gap_minutes(a_grp.get("ended_at"), b.get("started_at"))
     if gap is None or gap < 0 or gap >= gap_min:
@@ -4406,6 +5777,80 @@ def merge_charges(parent_id: int, child_id: int, gap_min: int = CHARGE_MERGE_GAP
                (a["id"], b["id"], b["id"]))
     db.commit()
     return {"ok": True, "parent_id": a["id"]}
+
+
+# How long a pause may last and still be joined without asking (#374, @Andreexylus).
+#
+# The join itself is the manual one, with every one of its guards; this only decides when nobody
+# needs to be asked first. The car declares the cable GONE the instant the current stops — measured
+# on a B10 the night of 29→30 July, cable in at 19:30 and out the next morning, untouched in
+# between, recorded as SIX charges with pauses of 60, 70, 180 and 60 s. A load-balancing wallbox, a
+# solar-surplus charger or a utility pacing the load all look like that from inside the car.
+#
+# Every pause ever measured here sits inside six minutes: those four, then 61, 61, 91, 91, 182, 256
+# and 334 s across the 35 charges in the same database since, and 30 to 60 s on eleven pauses over
+# six nights in @Andreexylus's bundle. The next gap up in that history is 40 minutes and gives
+# itself away anyway by a SoC that FELL. So six minutes is the worst pause measured, rounded up —
+# deliberately NOT the half hour the manual join allows, because that window is where the call
+# belongs to the person who was there, and it stays theirs.
+#
+# Nothing is lost if this is ever wrong: the pieces are joined, never rewritten, and **Split** puts
+# them back exactly as the car reported them.
+CHARGE_PAUSE_JOIN_GAP = 6
+_CHARGE_JOIN_CURSOR = "charges_pause_join_cursor"
+_CHARGE_JOIN_BATCH = 200
+
+
+def join_charges_split_by_a_pause() -> int:
+    """Join the rows one plug-in was cut into, without waiting to be asked. Returns rows joined.
+
+    Each charge is examined ONCE, in id order, behind a cursor — the same device the events
+    derivation uses. That is what makes this safe to run on every render: a charge the owner later
+    splits is never looked at again, so the automatic join can never undo a human decision. On the
+    first run the cursor is at 0, so it walks the history once and the nights already in the
+    database are put back together too.
+
+    The decision is `merge_charges`, called with a tighter window and nothing else changed: same
+    car, both closed, neither already merged, no other charge in the gap, no trip overlapping it,
+    the SoC not fallen, the same charging place. A charge still running is left alone until it ends
+    — the cursor stops before it rather than stepping over it.
+
+    A render with nothing to do pays a settings read and one indexed SELECT on the read connection
+    and stops there; only a round that actually has charges to look at reaches `merge_charges`,
+    which opens the write connection itself."""
+    try:
+        db = _get()                       # the read connection: a render that has nothing to do
+        cursor = int(get_setting(_CHARGE_JOIN_CURSOR, "0") or 0)   # pays this and stops here
+        row = db.execute("SELECT MIN(id) FROM charges WHERE ended_at IS NULL").fetchone()
+        first_open = row[0] if row else None
+        rows = db.execute(
+            "SELECT id, vehicle_id, started_at FROM charges WHERE id > ? AND ended_at IS NOT NULL"
+            " AND (? IS NULL OR id < ?) ORDER BY id LIMIT ?",
+            (cursor, first_open, first_open, _CHARGE_JOIN_BATCH)).fetchall()
+        if not rows:
+            return 0
+        joined, seen = 0, cursor
+        for r in rows:
+            seen = r["id"]
+            prev = db.execute(
+                "SELECT COALESCE(merged_into_id, id) AS head FROM charges WHERE vehicle_id = ?"
+                " AND ended_at IS NOT NULL AND started_at < ? AND id != ?"
+                " ORDER BY started_at DESC LIMIT 1",
+                (r["vehicle_id"], r["started_at"], r["id"])).fetchone()
+            if prev is None or prev["head"] == r["id"]:
+                continue
+            out = merge_charges(prev["head"], r["id"], gap_min=CHARGE_PAUSE_JOIN_GAP)
+            if out.get("ok"):
+                joined += 1
+                logging.getLogger("db_reader").info(
+                    "Charge #%d joined to #%d — the cable read gone for less than %d min, which "
+                    "is a pause, not an unplug", r["id"], prev["head"], CHARGE_PAUSE_JOIN_GAP)
+        if seen != cursor:
+            set_setting(_CHARGE_JOIN_CURSOR, str(seen))
+        return joined
+    except Exception as e:  # noqa: BLE001 — a card must never take the page down
+        logging.getLogger("db_reader").debug("join_charges_split_by_a_pause skipped: %s", e)
+        return 0
 
 
 def unmerge_charges(parent_id: int) -> dict:
@@ -4457,23 +5902,154 @@ def get_merge_preview_route(a_id: int, b_id: int, max_points: int = 120) -> list
     return out
 
 
-def get_trips(limit: int = 500) -> list[dict]:
+def _cloud_trip_ids(db) -> set:
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='api_lab_cloud_trip_links'").fetchone():
+        return set()
+    return {r[0] for r in db.execute("SELECT trip_id FROM api_lab_cloud_trip_links")}
+
+
+def _trip_display_source(trip, segment_ids, cloud_ids, gps_ids):
+    trip["is_cloud"] = bool(segment_ids) and all(i in cloud_ids for i in segment_ids)
+    trip["cloud_zero_segment"] = (trip["is_cloud"] and not trip.get("is_merged")
+                                  and trip.get("distance_km") == 0)
+    trip["has_gps"] = any(i in gps_ids for i in segment_ids)
+
+
+_NUMBER_FIRST = {"fr", "gb", "ie", "lu"}     # countries that write the house number before the street
+
+
+def _address_label(a) -> str | None:
+    """A short name for an address: the place's own name, else "road number", else the suburb, then
+    the locality unless it repeats them; failing all, the first part of the provider's full text."""
+    head = a["name"]
+    if not head and a["road"]:
+        number_first = a["country_code"] in _NUMBER_FIRST
+        head = " ".join(p for p in ((a["house_number"], a["road"]) if number_first
+                                    else (a["road"], a["house_number"])) if p)
+    head = head or a["suburb"]
+    label = ", ".join(p for p in (head, a["locality"] if a["locality"] != head else None) if p)
+    return label or (a["display_name"] or "").split(",")[0].strip() or None
+
+
+def _place_sources() -> tuple[dict, dict]:
+    """What names a point: the addresses found, by geohash-8 cell, and the enabled charging places, by car."""
+    db = _get()
+    found = {r["geohash"]: r for r in db.execute(
+        "SELECT geohash, provider, name, house_number, road, suburb, locality, country_code, display_name"
+        " FROM addresses WHERE status = 'found'")}
+    places: dict = {}
+    for p in db.execute("SELECT id, vehicle_id, name, latitude, longitude, radius_m FROM charging_places"
+                        " WHERE enabled = 1"):
+        places.setdefault(p["vehicle_id"], []).append(dict(p))
+    return found, places
+
+
+def _point_place(sources: tuple[dict, dict], vehicle_id, lat, lon) -> tuple[dict | None, dict | None]:
+    """The car's charging place whose radius holds the point, and the address of the point's cell as
+    `label`, `street` (the same without the place's own name), `osm` (it comes from OpenStreetMap) and
+    `display_name`; either None, both without a GPS fix."""
+    import geohash
+    if not has_gps_fix(lat, lon):
+        return None, None
+    found, places = sources
+    a = found.get(geohash.encode(lat, lon, 8))
+    address = a and {"label": _address_label(a), "street": _address_label({**dict(a), "name": None, "display_name": None}),
+                     "osm": a["provider"] == "nominatim", "display_name": a["display_name"]}
+    return _nearest_place(places.get(vehicle_id, []), lat, lon), address
+
+
+def trip_places(trips: list[dict]) -> bool:
+    """Name each trip's start and end, `start_place` and `end_place` (None without a GPS fix or an
+    address), and set `search_text`, what a searched word is looked for in: the note, both names and
+    both full addresses. A charging place whose radius holds the point names it before any address,
+    and `start_place_charging`/`end_place_charging` say so. Returns places_credit(trips)."""
+    if not trips:
+        return False
+    sources = _place_sources()
+    for t in trips:
+        words = [t.get("note")]
+        for end in ("start", "end"):
+            near, address = _point_place(sources, t.get("vehicle_id"), t.get(f"{end}_lat"), t.get(f"{end}_lon"))
+            label = near["name"] if near else address and address["label"]
+            words += [label, address and address["display_name"]]
+            t[f"{end}_place"], t[f"{end}_place_osm"] = label, bool(not near and address and address["osm"])
+            t[f"{end}_place_charging"] = near is not None
+        t["search_text"] = " ".join(w for w in words if w)
+    return places_credit(trips)
+
+
+def charge_places(charges: list[dict]) -> None:
+    """Name each charge by where it happened, `place`: the charging place assigned to it, else the
+    station found or typed ('' is a lookup that found none), else the car's charging place whose radius
+    holds its point (`place_charging`), else the address of its cell (`place_osm` when from
+    OpenStreetMap). `address`/`address_osm`: that address without the place's own name, which beside a
+    station is often the station's, whatever names the charge. `gps_fix`, `address_found`: whether its
+    point is a real position and its cell has an address. `search_text`: the note, the station, both
+    places' names and the address as a card shows it, with and without its name, and in full."""
+    if not charges:
+        return
+    sources = _place_sources()
+    for c in charges:
+        near, address = _point_place(sources, c.get("vehicle_id"), c.get("latitude"), c.get("longitude"))
+        c["gps_fix"], c["address_found"] = has_gps_fix(c.get("latitude"), c.get("longitude")), address is not None
+        named = c.get("charging_place_name") or c.get("location_name")
+        c["place"] = named or (near and near["name"]) or (address and address["label"])
+        c["place_charging"] = not named and near is not None
+        c["place_osm"] = bool(not named and not near and address and address["osm"])
+        c["address"], c["address_osm"] = address and address["street"], bool(address and address["osm"])
+        words = (c.get("note"), c.get("location_name"), c.get("charging_place_name"), near and near["name"],
+                 address and address["label"], c["address"], address and address["display_name"])
+        c["search_text"] = " ".join(w for w in words if w)
+
+
+def places_credit(trips: list[dict]) -> bool:
+    """Whether a name trip_places gave these trips comes from OpenStreetMap, whose licence wants it
+    credited where it shows."""
+    return any(t.get("start_place_osm") or t.get("end_place_osm") for t in trips)
+
+
+def _groups_within(table: str, merged: bool, since: str | None, until: str | None) -> tuple[str, tuple]:
+    """The condition keeping the sessions of `table` that OVERLAP [since, until), each merged group
+    from its earliest time to its latest, start or end: a stepped-back host clock writes a rebuilt
+    session's end before its start. No window, no condition."""
+    if since is None and until is None:
+        return "", ()
+    group = "COALESCE(merged_into_id, id)" if merged else "id"
+    times = "julianday(started_at), julianday(COALESCE(ended_at, started_at))"
+    return (f" AND id IN (SELECT {group} FROM {table} WHERE vehicle_id = COALESCE(?, vehicle_id) GROUP BY 1"
+            f" HAVING (? IS NULL OR MAX(MAX({times})) >= julianday(?))"
+            f" AND (? IS NULL OR MIN(MIN({times})) < julianday(?)))",
+            (_current_vehicle_id(), since, since, until, until))
+
+
+def get_trips(limit: int = 500, since: str | None = None, until: str | None = None) -> list[dict]:
+    """`since`/`until` (UTC ISO) keep the trips that OVERLAP that window — a trip that began before
+    it and ended inside it is part of what happened in it. Composing a trip is not free (its group,
+    its source, its fuel), so a caller that wants a few days of them should say so rather than
+    compose the whole history and throw most of it away: that is what the Events page did, and its
+    cost followed the length of the history instead of the days asked for."""
     db = _get()
     kids = _children_by_parent(db)
+    within, args = _groups_within("trips", True, since, until)
     rows = db.execute(
-        """SELECT * FROM trips
-           WHERE vehicle_id = COALESCE(?, vehicle_id) AND ended_at IS NOT NULL AND merged_into_id IS NULL
+        f"""SELECT * FROM trips
+           WHERE vehicle_id = COALESCE(?, vehicle_id) AND ended_at IS NOT NULL AND merged_into_id IS NULL{within}
            ORDER BY started_at DESC
            LIMIT ?""",
-        (_current_vehicle_id(), limit),
+        (_current_vehicle_id(), *args, limit),
     ).fetchall()
     # Built ONCE for the whole list — the fuel twin of the electric rate timeline. Per trip it would
     # replay every refuel from the beginning, which is quadratic down a long list.
     _fuel_rate_at = _trip_fuel_rate_fn()
+    _cloud_fuel = _cloud_fuel_index()
+    cloud_ids = _cloud_trip_ids(db)
+    gps_ids = {r[0] for r in db.execute(
+        "SELECT DISTINCT trip_id FROM trip_positions WHERE latitude IS NOT NULL AND longitude IS NOT NULL")}
     out = []
     for r in rows:
         kids_r = kids.get(r["id"], [])
         td = _trip_group_stats(dict(r), kids_r)
+        _trip_display_source(td, [r["id"]] + [k["id"] for k in kids_r], cloud_ids, gps_ids)
         # REEV Phase C — per-trip fuel so the list can flag engine-on trips (⛽) at a glance. Same
         # generator-on basis as the detail page; the positions walk runs only for trips that actually
         # burned fuel (a REEV drives mostly electric), so the list stays cheap.
@@ -4486,7 +6062,8 @@ def get_trips(limit: int = 500) -> list[dict]:
                 _seg).fetchone()
             _eng = _reev_engine_on(db, r["vehicle_id"], _b["s"], _b["e"])
         td.update(_reev_trip_fuel(_fs, _fe, td.get("distance_km"), _eng,
-                                  td.get("fuel_start_l"), td.get("fuel_end_l")))
+                                  td.get("fuel_start_l"), td.get("fuel_end_l"),
+                                  cloud_l=_cloud_fuel.get(r["id"])))
         # …and what those litres COST, the same allocation the detail page makes: litres × the
         # tank's blended €/L at the trip's start. Without it the trips reached the day and month
         # totals carrying petrol nobody could price, and those totals showed the electric half of a
@@ -4504,7 +6081,7 @@ def get_trips(limit: int = 500) -> list[dict]:
         # costs a dict lookup, not a cloud call.
         td.update(_reev_trip_elec(td.get("ec_kwh"), td.get("distance_km"), td.get("engine_ran")))
         out.append(td)
-    return out
+    return _select_ev_energy(out)
 
 
 def get_efficiency_vs_temp(include_fuel: bool = False, limit: int = 500,
@@ -4581,9 +6158,15 @@ def get_efficiency_vs_temp(include_fuel: bool = False, limit: int = 500,
     fuel_pts = []
     if include_fuel:
         kids = _children_by_parent(db)
+        _cloud_fuel = _cloud_fuel_index()
         for r in rows:
             _fs, _fe = r["fuel_start_pct"], r["fuel_end_pct"]
-            if _fs is None or _fe is None or (_fs - _fe) <= _REEV_FUEL_MIN_DROP:
+            # 🔑 A pre-filter on the tank, widened for the third source. This is the trap named on
+            # `_REEV_FUEL_ANY_DROP_SQL`: v3.6.6 fixed the litres in the reader and left filters like
+            # this one in front of it, so a row was dropped before the better signal could be read.
+            # A drive the cloud has litres for qualifies whatever the tank did.
+            if r["id"] not in _cloud_fuel and (
+                    _fs is None or _fe is None or (_fs - _fe) <= _REEV_FUEL_MIN_DROP):
                 continue
             kids_r = kids.get(r["id"], [])
             td = _trip_group_stats(dict(r), kids_r)
@@ -4594,7 +6177,8 @@ def get_efficiency_vs_temp(include_fuel: bool = False, limit: int = 500,
             eng = _reev_engine_on(db, r["vehicle_id"], b["s"], b["e"])
             f = _reev_trip_fuel(td.get("fuel_start_pct"), td.get("fuel_end_pct"),
                                 td.get("distance_km"), eng,
-                                td.get("fuel_start_l"), td.get("fuel_end_l"))
+                                td.get("fuel_start_l"), td.get("fuel_end_l"),
+                                cloud_l=_cloud_fuel.get(r["id"]))
             l100 = f.get("fuel_l_100km")
             t = _temp(r)
             if not l100 or t is None:
@@ -4639,13 +6223,17 @@ def reev_fuel_summary() -> Optional[dict]:
     total_l, engine_km, engine_l, n = 0.0, 0.0, 0.0, 0
     total_cost = 0.0
     total_km = 0.0        # EVERY kilometre driven — the L/100 km denominator, as the car's own is
+    _cloud_fuel = _cloud_fuel_index()
     for r in rows:
         eng = _reev_engine_on(db, r["vehicle_id"], r["started_at"], r["ended_at"])
         # Through _reev_trip_fuel, like the trips list and the period card. It used to work the
         # litres out again right here — a third copy of a rule that had just been corrected in one
-        # place, which is how this total stayed on the old answer after v3.6.6.
+        # place, which is how this total stayed on the old answer after v3.6.6. Same reason the cloud
+        # index is passed rather than consulted here: a card reading 3.9 L over a list of drives
+        # adding up to 4.9 is that defect wearing a different hat.
         f = _reev_trip_fuel(r["fuel_start_pct"], r["fuel_end_pct"], r["distance_km"], eng,
-                            r["fuel_start_l"], r["fuel_end_l"])
+                            r["fuel_start_l"], r["fuel_end_l"],
+                            cloud_l=_cloud_fuel.get(r["id"]))
         drop_l = f["fuel_used_l"]
         # ⚠️ The distance is added FIRST and unconditionally: a trip driven on the battery burned no
         # petrol but was still driven, and it is exactly what the L/100 km has to be spread over.
@@ -5059,16 +6647,23 @@ def cost_per_100km(fuel_l_burned=None) -> Optional[dict]:
     priced_n = total_n = 0
     since_charge = None
     try:
-        for c in db.execute(
-                "SELECT cost, ended_at FROM charges "
+        # Counted the way the Charges page shows them (#366): a merged group is ONE charge, priced
+        # when any of its pieces carries a price — `_charge_group_stats`, the page's own rule. The
+        # euros are every piece's either way; counting stored rows announced the merged piece
+        # without a price of its own as a charge nobody priced ("missing 1 of 6" beside 5 shown).
+        for pieces in _charges_as_shown(db.execute(
+                "SELECT id, cost, ended_at, " + _merged_into_column(db) + " FROM charges "
                 "WHERE vehicle_id = COALESCE(?, vehicle_id) AND ended_at IS NOT NULL"
-                + basis["where"], (_current_vehicle_id(), *basis["params"])).fetchall():
+                + basis["where"], (_current_vehicle_id(), *basis["params"])).fetchall()):
             total_n += 1
-            if c["cost"] is None or c["cost"] < 0:   # negative is nonsense, not a discount
+            priced = [c for c in pieces
+                      if c["cost"] is not None and c["cost"] >= 0]   # negative is nonsense, not a discount
+            if not priced:
                 continue
-            priced_n, elec_cost = priced_n + 1, elec_cost + c["cost"]
-            if since_charge is None or c["ended_at"] < since_charge:
-                since_charge = c["ended_at"]
+            priced_n, elec_cost = priced_n + 1, elec_cost + sum(c["cost"] for c in priced)
+            first = min(c["ended_at"] for c in priced)
+            if since_charge is None or first < since_charge:
+                since_charge = first
     except sqlite3.Error:
         pass
 
@@ -5200,23 +6795,28 @@ def _energy_balance_kwh(db, km: float, basis: dict) -> tuple:
     # Entirely inside, on both edges. ISO strings compare correctly because the DB is UTC
     # throughout by construction — the same assumption `since` above already relies on.
     try:
-        row = db.execute(
-            "SELECT SUM(CASE WHEN energy_added_kwh IS NOT NULL THEN energy_added_kwh END) AS kwh, "
-            "       SUM(CASE WHEN energy_added_kwh IS NOT NULL THEN 1 ELSE 0 END) AS counted, "
-            "       SUM(CASE WHEN energy_added_kwh IS NULL THEN 1 ELSE 0 END) AS missing "
-            "  FROM charges "
+        rows = db.execute(
+            "SELECT id, energy_added_kwh, " + _merged_into_column(db) + " FROM charges "
             " WHERE vehicle_id = COALESCE(?, vehicle_id) AND ended_at IS NOT NULL "
             "   AND started_at >= ? AND ended_at <= ?",
-            (vid, from_ts, to_ts)).fetchone()
+            (vid, from_ts, to_ts)).fetchall()
     except sqlite3.Error:
         return None, 0, 0
 
-    counted, missing = int(row["counted"] or 0), int(row["missing"] or 0)
+    # Charges as the page shows them (#366): a merged group with a measured piece is counted, one
+    # with none is missing — never one more charge than the page lists. The kWh are every piece's.
+    kwh, counted, missing = 0.0, 0, 0
+    for pieces in _charges_as_shown(rows):
+        measured = [c["energy_added_kwh"] for c in pieces if c["energy_added_kwh"] is not None]
+        if measured:
+            kwh, counted = kwh + sum(measured), counted + 1
+        else:
+            missing += 1
     if not counted:
         return None, 0, missing
 
     net = (soc_to - soc_from) / 100.0 * get_battery_capacity_kwh()
-    consumed = (row["kwh"] or 0.0) - net
+    consumed = kwh - net
     if consumed <= 0:
         return None, counted, missing
     return round(consumed * 100.0 / km, 1), counted, missing
@@ -5248,33 +6848,47 @@ def _trip_blended_rate_fn():
     return _rate_at
 
 
-def _localized_trips(trips: list[dict]) -> list[dict]:
-    """Per-trip localization + derived cost shared by the Trips calendar, search, Statistics and the
-    Monthly Report: the ec_pending flag, local start/end times, and `cost` — the electric cost of the
-    trip, priced the SAME way the trip detail prices it so every page agrees. On a REEV that is the
-    depleting PAID STOCK (reev_trip_electric_cost, generator kWh free); on a BEV it is efficiency ×
-    distance × the blended €/kWh in effect AT the trip's time (_wac_blend), unchanged. Adds a private
-    `_dt` (aware, local-tz datetime) for the caller's OWN day/date bucketing or filtering."""
-    rate_at = _trip_blended_rate_fn()
-    reev_costs = _reev_electric_cost_by_trip()   # {} on a BEV → the BEV branch below runs unchanged
+def _prepared_trips(trips: list[dict]) -> list[dict]:
+    """A trip list made ready to show: a trip with no readable start is left out, and the rest get local
+    start/end times, the ec_pending flag (the car's own energy figure still to come, ⏳) and a private
+    `_dt` (aware, local-tz datetime) for the caller's OWN day/date bucketing or filtering. What they
+    cost is _localized_trips()'s to add: a list that shows none, as the Overview's, takes this alone,
+    since pricing replays the whole charge history."""
     ec_on = get_setting("ec_trip_energy_enabled", "1") == "1"
     ec_cutoff = get_setting("ec_trip_since", "")
     now_ts = datetime.now(timezone.utc).timestamp()
+    zone = _local_tz()          # once for the whole list, not once per trip
     out = []
     for t in trips:
         if not t.get("started_at"):
             continue
-        dt = _local_dt(t["started_at"])
+        dt = _local_dt(t["started_at"], zone)
         if dt is None:
             continue
-        raw_start = t["started_at"]
         ee = _trip_epoch(t.get("ended_at")) if t.get("ended_at") else None
         t["ec_pending"] = bool(
             ec_on and not t.get("ec_stable") and ec_cutoff
             and t["started_at"] >= ec_cutoff
             and ee and (now_ts - ee) < 6 * 3600)
         t["started_at"] = dt.isoformat()
-        t["ended_at"] = _local_iso(t.get("ended_at"))
+        t["ended_at"] = _local_iso(t.get("ended_at"), zone)
+        t["_dt"] = dt
+        out.append(t)
+    return _clear_cloud_pending(out)
+
+
+def _localized_trips(trips: list[dict]) -> list[dict]:
+    """_prepared_trips() plus `cost`, shared by the Trips calendar, search, Statistics and the Monthly
+    Report: the electric cost of the trip, priced the SAME way the trip detail prices it so every page
+    agrees. On a REEV that is the depleting PAID STOCK (reev_trip_electric_cost, generator kWh free); on
+    a BEV it is efficiency × distance × the blended €/kWh in effect AT the trip's time (_wac_blend),
+    unchanged."""
+    trips = list(trips)                                        # read twice: for its UTC starts, then prepared
+    utc_start = {id(t): t.get("started_at") for t in trips}   # the rate is looked up in UTC, as stored
+    out = _prepared_trips(trips)
+    rate_at = _trip_blended_rate_fn()
+    reev_costs = _reev_electric_cost_by_trip()   # {} on a BEV → the BEV branch below runs unchanged
+    for t in out:
         if reev_costs:
             # REEV: the electric cost from the depleting PAID STOCK the trip detail uses, so list,
             # calendar, Statistics and Report all agree — and generator kWh come out free (already
@@ -5284,25 +6898,27 @@ def _localized_trips(trips: list[dict]) -> list[dict]:
             # BEV: the blended €/kWh — every kWh in the pack has an invoice. UNCHANGED from before.
             km = t.get("distance_km") or 0
             eff = t.get("efficiency_kwh_100km")
-            energy = (eff * km / 100) if (eff and km) else 0
-            rate = rate_at(t.get("vehicle_id"), raw_start) if energy else None
+            energy = (t["energy_kwh"] if t.get("energy_source") else ((eff * km / 100) if (eff and km) else 0))
+            rate = rate_at(t.get("vehicle_id"), utc_start[id(t)]) if energy else None
             t["cost"] = (energy * rate) if (energy and rate) else 0
-        t["_dt"] = dt
-        out.append(t)
     return out
 
 
 def _totals_node() -> dict:
-    return {"count": 0, "km": 0.0, "regen": 0.0, "cost": 0.0, "fuel_l": 0.0,
-            "_eff_wsum": 0.0, "_eff_wdist": 0.0, "_ec_kwh": 0.0, "_ec_km": 0.0}
+    return {"count": 0, "cloud_zero_count": 0, "km": 0.0, "regen": 0.0, "cost": 0.0, "fuel_l": 0.0,
+            "_eff_wsum": 0.0, "_eff_wdist": 0.0, "_ec_kwh": 0.0, "_ec_km": 0.0, "_kwh": []}
 
 
 def _totals_add(node: dict, trip: dict) -> None:
     """Fold one trip into a totals node. Efficiency is a DISTANCE-WEIGHTED mean, never a plain
     average of the per-trip figures — a 2 km hop and a 200 km drive must not count the same."""
+    figured = not zero_unvouched(trip)
+    if trip.get("energy_source"):
+        trip = dict(trip, ec_kwh=trip["energy_kwh"])
     km = trip.get("distance_km") or 0
-    eff = trip.get("efficiency_kwh_100km")
+    eff = trip.get("efficiency_kwh_100km") if figured else None
     node["count"] += 1
+    node["cloud_zero_count"] = node.get("cloud_zero_count", 0) + int(bool(trip.get("cloud_zero_segment")))
     node["km"] = round(node["km"] + km, 2)
     node["regen"] = round(node["regen"] + (trip.get("regen_kwh") or 0), 3)
     # `cost_total`, not `cost`: the latter is the ELECTRIC line by design (see get_trip_detail — the
@@ -5336,18 +6952,21 @@ def _totals_add(node: dict, trip: dict) -> None:
     # here that is 123 trips of 323, 1016 km of 1824: dividing the kWh we do have by every kilometre
     # driven would have printed a consumption not far off HALF the truth, and printed it in confident
     # black and white. A missing signal is not a zero → [[signal-absent-is-not-signal-zero]].
-    _ec = trip.get("ec_kwh")
-    if _ec and km > 0:
+    _ec = trip.get("ec_kwh") if figured else None
+    if (_ec is not None) and km > 0:
         node["_ec_kwh"] += _ec
         node["_ec_km"] += km
-    if eff and km > 0:
+    if (eff is not None) and km > 0:
         node["_eff_wsum"] += km * eff
         node["_eff_wdist"] += km
+    node["_kwh"].append(trip_energy_used(trip))
 
 
 def _totals_seal(node: dict) -> dict:
     """Turn the running weights into avg_eff and drop them. Call once per node."""
     node["avg_eff"] = round(node["_eff_wsum"] / node["_eff_wdist"], 1) if node["_eff_wdist"] > 0 else None
+    # Energy Used's rule, trip by trip, so the months add up to what Statistics gives for all of them.
+    node["kwh_used"] = energy_used_total(node["_kwh"])
     # Over ALL the kilometres, like the car's own figure and every other L/100 km in Mate since
     # BetaTester #23 — not over the ones the generator ran.
     node["fuel_l_100km"] = (round(node["fuel_l"] / node["km"] * 100, 1)
@@ -5371,6 +6990,7 @@ def _totals_seal(node: dict) -> dict:
     del node["_eff_wdist"]
     del node["_ec_kwh"]
     del node["_ec_km"]
+    del node["_kwh"]
     return node
 
 
@@ -5384,6 +7004,70 @@ def trips_totals(trips: list[dict]) -> dict:
         _totals_add(node, t)
     return _totals_seal(node)
 
+
+def trips_day_totals(trips: list[dict]) -> dict:
+    """The day drawer's heading: `trips_totals` plus the battery the day's trips used. One function
+    for both routes that render the drawer, so the heading cannot differ between them."""
+    node = trips_totals(trips)
+    node.update(_day_battery(trips))
+    node.update(_day_drive_time(trips))
+    return node
+
+
+def _day_battery(trips: list[dict]) -> dict:
+    """Battery over a day of localized trips: first start → last end when nothing charged between
+    them, else the trips' change beside the charges'. Any reading missing → no figure."""
+    out = {"soc_from": None, "soc_to": None, "soc_trips": None, "soc_charges": None}
+    # A 0 km cloud segment drove nothing and has no state of charge, which would cost the day its figure.
+    trips = [t for t in trips if not t.get("cloud_zero_segment")]
+    if not trips:
+        return out
+    # By the instant: two local times in one zone compare by the wall clock, wrong in the hour the clocks go back.
+    first, last = min(trips, key=lambda t: t["_dt"].timestamp()), max(trips, key=lambda t: t["_dt"].timestamp())
+    # Up to the last trip's start: nothing charges while it drives, and its end may be on the car's clock.
+    # julianday, not text: trips arrive in local time with an offset, charges are stored in UTC.
+    charges = _get().execute(
+        "SELECT start_soc, end_soc FROM charges WHERE vehicle_id = COALESCE(?, vehicle_id) "
+        "AND ended_at IS NOT NULL AND julianday(started_at) BETWEEN julianday(?) AND julianday(?)",
+        (_current_vehicle_id(), first["started_at"], last["started_at"])).fetchall()
+    if not charges:
+        if first.get("start_soc") is not None and last.get("end_soc") is not None:
+            out.update(soc_from=first["start_soc"], soc_to=last["end_soc"])
+        return out
+    drives = [(t.get("start_soc"), t.get("end_soc")) for t in trips]
+    gains = [(c["start_soc"], c["end_soc"]) for c in charges]
+    if all(a is not None and b is not None for a, b in drives + gains):
+        # Each part to the tenth its row prints, so the heading is what the rows add up to.
+        out.update(soc_trips=round(sum(round(b, 1) - round(a, 1) for a, b in drives), 1),
+                   soc_charges=round(sum(round(b, 1) - round(a, 1) for a, b in gains), 1))
+    return out
+
+
+def _day_drive_time(trips: list[dict]) -> dict:
+    """Minutes driven over a day of trips, by the Statistics rule: a reconstructed segment's duration is
+    the offline gap it was found across, not driving. Counted per stored segment, as Statistics counts,
+    because a merged trip can hold both kinds. A driven segment without a duration → no figure."""
+    out = {"drive_min": None, "drive_time_excluded": 0}
+    ids = [t["id"] for t in trips]
+    if not ids:
+        return out
+    marks = ",".join("?" * len(ids))
+    # By the trips shown, not by date: a merged trip's later segment can fall on the next day.
+    segments = _get().execute(
+        "SELECT COALESCE(merged_into_id, id) AS trip, duration_min, COALESCE(reconstructed, 0) AS reconstructed "
+        f"FROM trips WHERE id IN ({marks}) OR merged_into_id IN ({marks})", ids + ids).fetchall()
+    driven: dict = {}
+    for seg in segments:
+        if not seg["reconstructed"]:
+            driven.setdefault(seg["trip"], []).append(seg["duration_min"])
+        elif seg["duration_min"] is not None:
+            out["drive_time_excluded"] += 1
+    mins = [m for group in driven.values() for m in group]
+    if mins and None not in mins:
+        # Whole minutes as a row prints them, a merged one summed to the tenth first: without
+        # reconstructed segments the heading is what the rows add up to.
+        out["drive_min"] = sum(round(round(sum(group), 1)) for group in driven.values())
+    return out
 
 def get_trips_calendar_month(year: int, month: int) -> dict:
     """Per-day totals for the Viaggi calendar's Month view: session count, distance, regen
@@ -5405,11 +7089,12 @@ def get_trips_calendar_month(year: int, month: int) -> dict:
     return {"year": year, "month": month, "days": days, "total": total}
 
 
-def get_trips_calendar_day(year: int, month: int, day: int) -> list[dict]:
-    """The trip_row.html-ready trips for ONE calendar day — backs the Month view's day
-    drawer, most-recent-first."""
+def get_trips_calendar_day(year: int, month: int, day: int, to_day: "int | None" = None) -> list[dict]:
+    """The trip_row.html-ready trips for ONE calendar day, or for `day`..`to_day` of the month —
+    backs the Month view's day drawer, most-recent-first."""
+    last = to_day or day
     trips = _localized_trips(get_trips(limit=1_000_000))
-    trips = [t for t in trips if t["_dt"].year == year and t["_dt"].month == month and t["_dt"].day == day]
+    trips = [t for t in trips if t["_dt"].year == year and t["_dt"].month == month and day <= t["_dt"].day <= last]
     trips.sort(key=lambda t: t["started_at"], reverse=True)
     return trips
 
@@ -5420,10 +7105,12 @@ def search_trips(text: str = "", date_from: str = "", date_to: str = "",
                   duration_min: "float | None" = None, duration_max: "float | None" = None,
                   drive_mode: str = "") -> list[dict]:
     """Flat, most-recent-first list of trips matching ALL given filters — the Viaggi search
-    bar. `text` matches the user note (substring, case-insensitive); `drive_mode` is
+    bar. `text` matches the note or a place the trip started or ended at, its name or its full
+    address (substring, case-insensitive; see trip_places); `drive_mode` is
     comfort/normal/sport (#107); the km/efficiency/duration filters are inclusive ranges;
     `date_from`/`date_to` are inclusive "YYYY-MM-DD" LOCAL calendar dates."""
     trips = _localized_trips(get_trips(limit=1_000_000))
+    trip_places(trips)
     q = (text or "").strip().lower()
     dm = (drive_mode or "").strip().lower()
     try:
@@ -5436,7 +7123,7 @@ def search_trips(text: str = "", date_from: str = "", date_to: str = "",
         d_to = None
     out = []
     for t in trips:
-        if q and q not in (t.get("note") or "").lower():
+        if q and q not in t["search_text"].lower():
             continue
         if dm and (t.get("drive_mode") or "").lower() != dm:
             continue
@@ -5468,9 +7155,21 @@ def search_trips(text: str = "", date_from: str = "", date_to: str = "",
 def get_trip_years() -> list[int]:
     """Distinct years (local time, most recent first) with at least one trip — populates
     the Viaggi calendar's year-jump pills with only years the user actually has data for."""
+    # The timestamps alone answer this. Asking `get_trips` for them ran the whole pipeline —
+    # cloud-energy matching, the getEC columns, the per-trip cost — for a set of years: 80.5 ms on
+    # a real database, four times that on an add-on, on every open of the Trips page.
+    # 🔴 Not `strftime('%Y')` in SQL: the column is UTC and these are LOCAL years, so a drive at
+    # 23:30 on 31 December belongs to the next one. → tests/test_the_year_pills_do_not_load_every_trip.py
+    zone = _local_tz()
     years = set()
-    for t in get_trips(limit=1_000_000):
-        dt = _local_dt(t.get("started_at"))
+    try:
+        rows = _get().execute(
+            "SELECT started_at FROM trips WHERE vehicle_id = COALESCE(?, vehicle_id) "
+            "AND started_at IS NOT NULL", (_current_vehicle_id(),)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    for row in rows:
+        dt = _local_dt(row["started_at"], zone)
         if dt:
             years.add(dt.year)
     return sorted(years, reverse=True)
@@ -5489,6 +7188,7 @@ def get_trip_local_date(trip_id: int) -> "date | None":
 def get_trips_grouped() -> list[dict]:
     """Return trips nested as year → month → day for the sidebar tree view."""
     trips = get_trips()
+    _zone = _local_tz()          # once for the tree, not once per trip
     from collections import OrderedDict
 
     def _node(label):
@@ -5542,7 +7242,7 @@ def get_trips_grouped() -> list[dict]:
     for t in trips:
         if not t.get("started_at"):
             continue
-        dt = _local_dt(t["started_at"])
+        dt = _local_dt(t["started_at"], _zone)
         if dt is None:
             continue
         # ec_pending + cost rate must use the RAW (UTC) started_at — capture before the local rewrite.
@@ -5554,7 +7254,7 @@ def get_trips_grouped() -> list[dict]:
             and _ee and (_now_ts - _ee) < 6 * 3600)
         # Rewrite to local-time ISO so the template (started_at[11:16]) shows local
         t["started_at"] = dt.isoformat()
-        t["ended_at"] = _local_iso(t.get("ended_at"))
+        t["ended_at"] = _local_iso(t.get("ended_at"), _zone)
 
         yr  = dt.strftime("%Y")
         mo  = i18n.fmt_month_year(lang, dt)
@@ -5602,12 +7302,17 @@ def get_trips_summary() -> dict:
            FROM trips WHERE vehicle_id = COALESCE(?, vehicle_id) AND ended_at IS NOT NULL""",
         (_current_vehicle_id(),)
     ).fetchone()
-    return {
+    return _ev_energy_summary({
+        "cloud_zero_count": sum(1 for row in db.execute(
+            "SELECT id FROM trips t WHERE vehicle_id = COALESCE(?, vehicle_id) "
+            "AND ended_at IS NOT NULL AND merged_into_id IS NULL AND distance_km=0 "
+            "AND NOT EXISTS (SELECT 1 FROM trips c WHERE c.merged_into_id=t.id)",
+            (_current_vehicle_id(),)) if row[0] in _cloud_trip_ids(db)),
         "count":    r["n"],
         "km":       r["km"] or 0,
         "regen":    r["regen"] or 0,
         "avg_eff":  (r["eff_wsum"] / r["eff_wdist"]) if r["eff_wdist"] else None,
-    }
+    })
 
 
 def get_first_trip_date() -> Optional[str]:
@@ -5684,19 +7389,61 @@ def _wac_blend(charges) -> Optional[float]:
     return p
 
 
+def _priced_charge_groups(vehicle_id: int, extra_sql: str = "", params: tuple = ()) -> list[dict]:
+    """Le ricariche PREZZATE di un'auto, con i pezzi di una sessione unita **già ricomposti**.
+
+    Chi accoppia il costo di una riga con l'energia della stessa riga non può leggere le righe
+    grezze. Quando un gruppo unito è prezzato da un totale a mano — o da un lordo digitato (#222) —
+    `update_charge_type` lascia tutti gli euro sul padre e scrive `cost=NULL` sui figli, di
+    proposito: quel prezzo appartiene al GRUPPO. Un lettore che filtrava `cost IS NOT NULL` buttava
+    via i figli e divideva il totale del gruppo per i soli kWh del padre. Misurato: 10 + 5 kWh
+    pagati 6,00 € davano **0,60 €/kWh invece di 0,40**, e da lì ogni viaggio successivo veniva
+    prezzato al 50% in più.
+
+    La ricomposizione è quella di `_charge_group_stats`, la stessa che disegna la pagina Ricariche:
+    UNA somma sola, letta da due parti. Sommarli una seconda volta qui sarebbe stato il difetto di
+    stanotte da capo. → [[feedback-gate-a-feature-find-every-copy]]
+
+    🔑 Il filtro sul prezzo si applica DOPO la ricomposizione: un figlio senza costo non è una
+    ricarica non prezzata, è mezzo gruppo.
+
+    ⚠️ Le colonne facoltative si chiedono PRIMA di nominarle: su un archivio non ancora migrato non
+    esistono, e una lettura che le nomina comunque fa cadere la pagina invece di mostrare un dato in
+    meno. Senza unione non c'è niente da ricomporre e si torna alle righe grezze."""
+    db = _get()
+    unite = _charges_have_merge(db)
+    campi = ["id", "started_at", "ended_at", "start_soc", "end_soc", "cost", "ac_energy_kwh",
+             "location_type", "energy_added_kwh", "max_power_kw", "charge_type"]
+    if _charges_have_gross(db):
+        campi.append("gross_kwh")
+    if unite:
+        campi.append("merged_into_id")
+    rows = [dict(r) for r in db.execute(
+        f"SELECT {', '.join(campi)} FROM charges WHERE vehicle_id = ? AND ended_at IS NOT NULL "
+        f"{extra_sql} ORDER BY ended_at", (vehicle_id, *params)).fetchall()]
+    if not unite:
+        return [r for r in rows
+                if r.get("cost") is not None and (r.get("energy_added_kwh") or 0) > 0]
+    figli: dict = {}
+    for r in rows:
+        if r.get("merged_into_id"):
+            figli.setdefault(r["merged_into_id"], []).append(r)
+    fuori = []
+    for r in rows:
+        if r.get("merged_into_id"):
+            continue                                  # arriva dentro il suo gruppo
+        g = _charge_group_stats(r, figli.get(r["id"], []))
+        if g.get("cost") is not None and (g.get("energy_added_kwh") or 0) > 0:
+            fuori.append(g)
+    return fuori
+
+
 def blended_price_at(vehicle_id: int, ts: str) -> Optional[float]:
     """Blended €/kWh of the battery (WAC, #53) for `vehicle_id` at instant `ts` — the price in
     effect for a trip starting then, set by every PRICED charge that ended at/before `ts`. None until
     the first priced charge (early trips stay uncosted, as today). Recomputed from history each call
     (no stored state) → self-corrects the moment a charge's cost is assigned/edited."""
-    db = _get()
-    rows = db.execute(
-        "SELECT start_soc, end_soc, cost, ac_energy_kwh, location_type, energy_added_kwh "
-        "FROM charges WHERE vehicle_id = ? AND ended_at IS NOT NULL AND ended_at <= ? "
-        "  AND cost IS NOT NULL AND energy_added_kwh > 0 ORDER BY ended_at",
-        (vehicle_id, ts),
-    ).fetchall()
-    return _wac_blend([dict(r) for r in rows])
+    return _wac_blend(_priced_charge_groups(vehicle_id, "AND ended_at <= ?", (ts,)))
 
 
 def current_blended_price() -> Optional[float]:
@@ -5771,10 +7518,14 @@ def _reev_stock_rows(vehicle_id) -> list[dict]:
     so the single-trip price and the list/Report price can never come from two different replays."""
     cap = get_battery_capacity_kwh()
     db = _get()
-    charges = db.execute(
-        "SELECT ended_at ts, energy_added_kwh kwh, cost, start_soc FROM charges "
-        "WHERE vehicle_id = COALESCE(?, vehicle_id) AND ended_at IS NOT NULL AND cost IS NOT NULL "
-        "AND energy_added_kwh > 0", (vehicle_id,)).fetchall()
+    # Gruppi ricomposti, non righe grezze: un gruppo unito prezzato da un totale a mano tiene tutti
+    # gli euro sul padre e `cost=NULL` sui figli, quindi filtrare le righe su `cost IS NOT NULL`
+    # faceva entrare nella scorta il costo INTERO con i kWh di UN pezzo solo. Gli euro tornavano
+    # comunque (la scorta li consuma tutti) ma i primi prelievi venivano pagati troppo e i kWh
+    # comprati dei pezzi scartati finivano contati come energia gratis del generatore.
+    charges = [{"ts": g["ended_at"], "kwh": g["energy_added_kwh"], "cost": g["cost"],
+                "start_soc": g["start_soc"]}
+               for g in _priced_charge_groups(vehicle_id)]
     trips = db.execute(
         "SELECT id, ended_at ts, ec_kwh, ec_stable, start_soc, end_soc FROM trips "
         "WHERE vehicle_id = COALESCE(?, vehicle_id) AND ended_at IS NOT NULL AND merged_into_id IS NULL",
@@ -6005,15 +7756,10 @@ def get_trip_detail(trip_id: int) -> Optional[dict]:
     children = _children_by_parent(db).get(parent_id, [])
     seg_ids = _segment_ids(db, parent_id)
     ph = ",".join("?" * len(seg_ids))
-    positions = db.execute(
-        "SELECT recorded_at, latitude, longitude, speed_kmh, soc, elevation_m FROM trip_positions "
-        f"WHERE trip_id IN ({ph}) ORDER BY recorded_at, id",
-        seg_ids,
-    ).fetchall()
-    # Drop cloud-cached/frozen stretches (see _filter_frozen_telemetry) BEFORE anything else reads
-    # `positions` — so the chart, the map track and the speed stats below all agree on what actually
-    # happened, instead of the chart alone showing a gap while the stats stay skewed.
-    positions = _filter_frozen_telemetry([dict(p) for p in positions])
+    # Frozen stretches are dropped (see _trip_points) BEFORE anything else reads `positions` — so the
+    # chart, the map track and the speed stats below all agree on what actually happened, instead of
+    # the chart alone showing a gap while the stats stay skewed.
+    positions = _trip_points(db, seg_ids)
     # Whether the chart has a real point to draw a Quota line from — checked BEFORE interpolation
     # (which needs one to fill from). A trip enriched before per-point storage existed has
     # elevation_gain_m/loss_m set but every trip_positions.elevation_m still NULL: the aggregate being
@@ -6029,6 +7775,9 @@ def get_trip_detail(trip_id: int) -> Optional[dict]:
     # would break that alignment.
     route_segments = _split_track_gaps(positions)
     trip_d = _trip_group_stats(dict(trip), children)
+    _trip_display_source(trip_d, seg_ids, _cloud_trip_ids(db),
+                         set(seg_ids) if any(p.get("latitude") is not None and p.get("longitude") is not None
+                                             for p in positions) else set())
     trip_d["route_segments"] = route_segments
     trip_d["elevation_profile_available"] = elevation_profile_available
     # The stops INSIDE a joined journey. The chart draws every segment's points in one row, so a
@@ -6058,6 +7807,12 @@ def get_trip_detail(trip_id: int) -> Optional[dict]:
     trip_d["charges"] = _trip_stop_charges(db, trip["vehicle_id"], trip_d.get("ended_at"))
     trip_d["started_at"] = _local_iso(trip_d.get("started_at"))
     trip_d["ended_at"] = _local_iso(trip_d.get("ended_at"))
+    # #279: the later pieces' notes print their times with the same [11:16] slice as the header, so
+    # they need the same conversion — left raw, they showed UTC under a local header (@pdifeo: 05:53
+    # on top, 04:04 → 04:28 below).
+    for _seg in trip_d["additional_segment_notes"]:
+        _seg["started_at"] = _local_iso(_seg["started_at"])
+        _seg["ended_at"] = _local_iso(_seg["ended_at"])
 
     # #107: per-trip user note + manual driving tags — read from the parent row (the detail page
     # always shows the parent, so the note/tags saved against it are the ones edited here).
@@ -6072,12 +7827,71 @@ def get_trip_detail(trip_id: int) -> Optional[dict]:
     # Average over moving points only (>1 km/h) so long idle stretches don't skew it.
     moving = [s for s in speeds if s > 1]
     trip_d["avg_speed_kmh"] = round(sum(moving) / len(moving)) if moving else None
+    trip_d["median_speed_kmh"] = round(statistics.median(moving)) if moving else None
+
+    # Driving and stopped are the spans after each reading, moving above walking pace or not. A span
+    # counts only inside one joined piece, cut to that piece's start and end (the end can be the car's
+    # clock, the readings carry ours), and when no longer than 3 usual steps (else it is a hole in the
+    # recording); what no span covers is reported as unknown, never given to either.
+    trip_d["driving_min"] = trip_d["stopped_min"] = trip_d["unknown_min"] = None
+    bounds = {}
+    for piece in _pieces:
+        try:
+            bounds[piece["id"]] = (datetime.fromisoformat(piece["started_at"]).timestamp(),
+                                   datetime.fromisoformat(piece["ended_at"]).timestamp())
+        except (TypeError, ValueError):
+            continue          # a piece without an end: its spans stay unknown
+    stamps = []
+    for p in positions:
+        try:
+            stamps.append((p.get("trip_id"), datetime.fromisoformat(p["recorded_at"]).timestamp(),
+                           p.get("speed_kmh")))
+        except (TypeError, ValueError):
+            continue
+    spans = [(a[0], a[1], b[1], a[2]) for a, b in pairwise(stamps) if a[0] == b[0] and b[1] > a[1]]
+    if spans and (trip_d.get("duration_min") or 0) > 0:
+        limit = 3 * sorted(end - start for _, start, end, _ in spans)[len(spans) // 2]
+        moving = still = 0.0
+        for piece_id, start, end, kmh in spans:
+            if end - start > limit or kmh is None or piece_id not in bounds:
+                continue
+            lo, hi = bounds[piece_id]
+            cut = max(min(end, hi) - max(start, lo), 0) / 60
+            if kmh > 1:
+                moving += cut
+            else:
+                still += cut
+        # Only the stored duration's rounding to a tenth of a minute can leave the cut spans above it.
+        unknown = max(trip_d["duration_min"] - moving - still, 0)
+        trip_d["driving_min"], trip_d["stopped_min"], trip_d["unknown_min"] = _whole_minutes(
+            (moving, still, unknown), int(round(trip_d["duration_min"])))
+
+    # Battery power at each poll: + out of the pack, − back into it (regeneration).
+    powers = [p["power_kw"] for p in positions if p.get("power_kw") is not None]
+    trip_d["max_power_kw"] = max(powers) if powers and max(powers) > 0 else None
+    trip_d["max_regen_kw"] = -min(powers) if powers and min(powers) < 0 else None
+    # The car reports only its coldest cell; its highest and lowest reading of the drive.
+    temps = [p["battery_temp_c"] for p in positions if p.get("battery_temp_c") is not None]
+    trip_d["battery_temp_max_c"] = max(temps) if temps else None
+    trip_d["battery_temp_min_c"] = min(temps) if temps else None
+    # Outside: the readings along the way (the outside-temperature switch), else the two lookups at the ends.
+    outside = ([p["outside_temp_c"] for p in positions if p.get("outside_temp_c") is not None]
+               or [v for v in (trip_d.get("outside_temp_start_c"), trip_d.get("outside_temp_end_c"))
+                   if v is not None])
+    trip_d["outside_temp_max_c"] = max(outside) if outside else None
+    trip_d["outside_temp_min_c"] = min(outside) if outside else None
 
     # ── #18: total energy consumed + trip cost ──────────────────────────────────
     # Energy consumed = efficiency × distance / 100 (consistent with the stored efficiency).
     eff = trip_d.get("efficiency_kwh_100km")
     dist = trip_d.get("distance_km") or 0
-    trip_d["energy_kwh"] = round(eff * dist / 100, 2) if (eff and dist) else None
+    _select_ev_energy([trip_d])
+    trip_d["energy_kwh"] = (trip_d["energy_kwh"] if trip_d.get("energy_source") else (round(eff * dist / 100, 2) if (eff and dist) else None))
+    # Samples several seconds apart miss short peaks; the car's own record of the drive does not.
+    if trip_d.get("cloud_max_speed_kmh") is not None:
+        trip_d["max_speed_kmh"] = round(trip_d["cloud_max_speed_kmh"])
+    trip_d["max_speed_sampled"] = (trip_d.get("cloud_max_speed_kmh") is None
+                                   and trip_d.get("max_speed_kmh") is not None)
 
     # NET change in the pack over the trip, signed — and only kept when the pack ended FULLER than it
     # started (beta #11, @michapr + @gm27271). On a range-extender the generator can put back more
@@ -6115,8 +7929,11 @@ def get_trip_detail(trip_id: int) -> Optional[dict]:
     _fbounds = db.execute(f"SELECT MIN(started_at) s, MAX(ended_at) e FROM trips WHERE id IN ({ph})",
                           seg_ids).fetchone()
     _feng = _reev_engine_on(db, trip["vehicle_id"], _fbounds["s"], _fbounds["e"])
+    # The cloud's litres for THIS drive, keyed on the group's parent — the same id the trips list
+    # looks up, so the two pages cannot answer differently (the defect the block above describes).
     trip_d.update(_reev_trip_fuel(_fs, _fe, dist, _feng,
-                                  trip_d.get("fuel_start_l"), trip_d.get("fuel_end_l")))
+                                  trip_d.get("fuel_start_l"), trip_d.get("fuel_end_l"),
+                                  cloud_l=_cloud_fuel_index().get(trip["id"])))
     # REEV Phase D — the electric counterpart, from the metered getEC (driverEC) not ΔSoC. Shown
     # research-only next to the fuel so REEV testers can validate it against the car's own dashboard
     # before we ever promote it to the headline efficiency (see _reev_trip_elec).
@@ -6145,7 +7962,7 @@ def get_trip_detail(trip_id: int) -> Optional[dict]:
     # say. Same defect as #218 seen from the other end: there free energy left the price too HIGH,
     # here it erases it. `is None` is the only "unknown" (no priced charge yet); negatives can't
     # reach here, `_wac_blend` drops them.
-    if trip_d["energy_kwh"]:
+    if trip_d["energy_kwh"] is not None:
         rate = blended_price_at(trip["vehicle_id"], trip["started_at"])
         if rate is not None and rate >= 0:
             trip_d["cost_per_kwh"] = round(rate, 4)
@@ -6186,10 +8003,10 @@ def get_trip_detail(trip_id: int) -> Optional[dict]:
     except Exception:  # noqa: BLE001
         pass
 
-    return {
+    return _finish_ev_detail({
         **trip_d,
         "positions": positions,
-    }
+    })
 
 
 def _downsample(pts: list[dict], max_points: int) -> list[dict]:
@@ -6436,19 +8253,25 @@ def store_trip_elevation(trip_id: int, gain, loss,
     db.commit()
 
 
-def get_charges(limit: int = 50) -> list[dict]:
+def get_charges(limit: int = 50, since: str | None = None, until: str | None = None) -> list[dict]:
     """The finished charges, most recent first — one row per CHARGE, not per stored row.
 
     A plug-in the car reported in pieces (it declares the cable gone the instant the current stops)
     comes back as one row once the user has merged them: the children drop out of the list and the
     parent carries the combined figures. `limit` therefore counts charges, which is what the page
-    asks for — the last 50 charges, not the last 50 fragments."""
+    asks for — the last 50 charges, not the last 50 fragments.
+
+    `since`/`until` (UTC ISO) keep the charges that OVERLAP that window, as `get_trips` does: a
+    charge that began the evening before and ended in the morning belongs to both days."""
     db = _get()
+    _zone = _local_tz()          # once for the list, not twice per charge
+    merged = _charges_have_merge(db)
+    within, args = _groups_within("charges", merged, since, until)
     rows = db.execute(
         "SELECT * FROM charges WHERE vehicle_id = COALESCE(?, vehicle_id) AND ended_at IS NOT NULL "
-        + ("AND merged_into_id IS NULL " if _charges_have_merge(db) else "")
-        + "ORDER BY started_at DESC LIMIT ?",
-        (_current_vehicle_id(), limit),
+        + ("AND merged_into_id IS NULL" if merged else "") + within
+        + " ORDER BY started_at DESC LIMIT ?",
+        (_current_vehicle_id(), *args, limit),
     ).fetchall()
     kids = _charge_children_by_parent(db)
     # Compose FIRST, localise after: the group maths works on the stored UTC ISO, and swapping the
@@ -6463,8 +8286,8 @@ def get_charges(limit: int = 50) -> list[dict]:
         d["prev_charge_id"] = earlier["id"] if earlier else None
         gap = _gap_minutes(earlier.get("ended_at"), d.get("started_at")) if earlier else None
         d["can_merge_prev"] = gap is not None and 0 <= gap < CHARGE_MERGE_GAP_DEFAULT
-        d["started_at"] = _local_iso(d.get("started_at"))
-        d["ended_at"] = _local_iso(d.get("ended_at"))
+        d["started_at"] = _local_iso(d.get("started_at"), _zone)
+        d["ended_at"] = _local_iso(d.get("ended_at"), _zone)
     return out
 
 
@@ -6529,20 +8352,29 @@ def get_fuel_totals_between(begin_ts: int, end_ts: int) -> dict:
     e = datetime.fromtimestamp(end_ts, tz=timezone.utc).isoformat()
     out = {"fuel_l": 0.0, "engine_km": 0.0, "trip_count": 0}
     db = _get()
+    _cloud_fuel = _cloud_fuel_index()
+    # The tank filter, widened by the drives the cloud has litres for — the trap named on
+    # `_REEV_FUEL_ANY_DROP_SQL`, which is about a filter dropping a row before the reader could
+    # judge it. Inlined ids rather than a join: they come from our own index, they are integers, and
+    # there are as many as the cloud's 28-day window holds.
+    _ids = ",".join(str(int(i)) for i in _cloud_fuel)
+    _drop = _REEV_FUEL_ANY_DROP_SQL if not _ids else (
+        "(" + _REEV_FUEL_ANY_DROP_SQL + " OR id IN (" + _ids + "))")
     try:
         rows = db.execute(
             "SELECT id, vehicle_id, started_at, ended_at, distance_km, fuel_start_pct, fuel_end_pct,"
             " fuel_start_l, fuel_end_l FROM trips"
             " WHERE vehicle_id = COALESCE(?, vehicle_id) AND ended_at IS NOT NULL"
             "   AND started_at >= ? AND started_at <= ?"
-            "   AND " + _REEV_FUEL_ANY_DROP_SQL,
+            "   AND " + _drop,
             (_current_vehicle_id(), b, e, _REEV_FUEL_MIN_DROP)).fetchall()
     except sqlite3.Error:
         return out                      # no fuel columns → a BEV, and nothing to add
     for r in rows:
         eng = _reev_engine_on(db, r["vehicle_id"], r["started_at"], r["ended_at"])
         f = _reev_trip_fuel(r["fuel_start_pct"], r["fuel_end_pct"], r["distance_km"], eng,
-                            r["fuel_start_l"], r["fuel_end_l"])
+                            r["fuel_start_l"], r["fuel_end_l"],
+                            cloud_l=_cloud_fuel.get(r["id"]))
         if f["fuel_used_l"]:
             out["fuel_l"] += f["fuel_used_l"]
             out["engine_km"] += f["engine_km"] or 0
@@ -6550,6 +8382,169 @@ def get_fuel_totals_between(begin_ts: int, end_ts: int) -> dict:
     out["fuel_l"] = round(out["fuel_l"], 2)
     out["engine_km"] = round(out["engine_km"], 1)
     return out
+
+
+def _trips_have_ec(db) -> bool:
+    """Whether the trips table carries `ec_kwh` yet. Same reasoning as `_charges_have_gross`: the
+    column is in the schema AND in a migration, so between an update and the poller's next start it
+    is simply absent, and naming it is a 500 on the page that asks. Asked per call — the poller can
+    add it while the web is running."""
+    try:
+        return any(r[1] == "ec_kwh" for r in db.execute("PRAGMA table_info(trips)"))
+    except sqlite3.Error:
+        return False
+
+
+def soc_held(t: dict) -> bool:
+    """The battery read the same at both ends of the drive: what lets a 0.0 kWh stand as the car's figure."""
+    ss, es = t.get("start_soc"), t.get("end_soc")
+    return ss is not None and es is not None and ss == es
+
+
+def zero_unvouched(t: dict) -> bool:
+    """A cloud 0.0 kWh the battery does not vouch for (a reading missing, or changed): the cloud having
+    nothing for the drive, so the trip counts in no average — neither the getEC pair nor the efficiency
+    the same 0.0 was turned into. The zero is the stored getEC figure, or the one the matcher picked
+    from the cloud's trip history (`energy_source` cloud). The sweep refuses such a zero before it is
+    stored; the history, imported or matched without SoC, does not."""
+    ec = t.get("energy_kwh") if t.get("energy_source") == "cloud" else t.get("ec_kwh")
+    return ec == 0 and not soc_held(t)
+
+
+# zero_unvouched() for a query, on the stored figure. Both comparisons are NULL with a value missing,
+# hence the COALESCEs: under NOT, a NULL would drop the trip instead of keeping it.
+ZERO_UNVOUCHED_SQL = "(COALESCE(ec_kwh = 0, 0) AND NOT COALESCE(start_soc = end_soc, 0))"
+
+
+def trip_energy_used(t: dict) -> Optional[float]:
+    """The energy a trip used, as Energy Used adds it up: the energy picked for the trip, else its
+    consumption over its distance, else the car's settled getEC figure (a range-extender's generator
+    trip has no consumption). None with none of them, or for a zero no reading vouches for."""
+    if zero_unvouched(t):
+        return None
+    if t.get("energy_source"):
+        return t["energy_kwh"]
+    km, eff = t.get("distance_km"), t.get("efficiency_kwh_100km")
+    if eff is not None:
+        return km * eff / 100.0 if km is not None else None
+    return t["ec_kwh"] if t.get("ec_kwh") is not None and t.get("ec_stable") == 1 else None
+
+
+# trip_energy_used() for a query, on the stored figures.
+TRIP_ENERGY_USED_SQL = (f"CASE WHEN {ZERO_UNVOUCHED_SQL} THEN NULL"
+                        " WHEN efficiency_kwh_100km IS NOT NULL THEN distance_km * efficiency_kwh_100km / 100.0"
+                        " WHEN ec_kwh IS NOT NULL AND ec_stable = 1 THEN ec_kwh END")
+
+
+def energy_used_total(values) -> Optional[float]:
+    """Energy Used over trips, from their trip_energy_used() figures: added exactly, so the order they
+    come in cannot tip the sum across a hundredth, and rounded half up on that exact sum, as SQLite's
+    ROUND does (in integers: the desktop shell carries no `decimal`). None with no figure at all."""
+    values = [v for v in values if v is not None]
+    if not values:
+        return None
+    n, d = math.fsum(values).as_integer_ratio()
+    cents, rest = divmod(abs(n) * 100, d)
+    cents += 2 * rest >= d
+    return (cents if n >= 0 else -cents) / 100
+
+
+def trip_kwh_used(t: dict) -> Optional[float]:
+    """trip_energy_used() as a trip's row prints it: rounded as energy_used_total() rounds a total, so a trip
+    alone in its day reads the day's figure."""
+    return energy_used_total([trip_energy_used(t)])
+
+
+def _merged_trip_statistics(db, begin=None, end=None):
+    """Overrides for beta #44: aggregate logical trips, not their stored segments.
+
+    None keeps the existing SQL path for old schemas and REEV without merges.
+    EV totals apply the same read-only source selection as the trip list. Groups
+    belong to the parent's start date, like the Trips list; children are loaded BEFORE
+    applying the window so a midnight boundary cannot split a group's energy/distance.
+    This is read-only: conversion and unmerge still own the original rows.
+    """
+    if not any(r[1] == "merged_into_id" for r in db.execute("PRAGMA table_info(trips)")):
+        return None
+    kids = _children_by_parent(db)
+    ev = not is_reev_car()
+    if not kids and not ev:
+        return None
+    sql = ("SELECT * FROM trips WHERE vehicle_id = COALESCE(?, vehicle_id) "
+           "AND ended_at IS NOT NULL AND merged_into_id IS NULL")
+    args = [_current_vehicle_id()]
+    if begin is not None:
+        sql += " AND started_at >= ? AND started_at <= ?"
+        args.extend((begin, end))
+    groups = [_trip_group_stats(dict(r), kids.get(r["id"], []))
+              for r in db.execute(sql, args).fetchall()]
+
+    if ev:
+        _select_ev_energy(groups)
+        groups = [dict(g, ec_kwh=g["energy_kwh"]) if g.get("energy_source") else g
+                  for g in groups]
+
+    def rounded(value, digits):
+        # Keep SQLite's rounding, not Python's ties-to-even, at the old SQL boundary.
+        return db.execute("SELECT ROUND(?, ?)", (value, digits)).fetchone()[0]
+
+    def total(values, digits=2):
+        # Preserve SQL SUM's distinction between no observations and observed zero.
+        values = [v for v in values if v is not None]
+        return rounded(sum(values), digits) if values else None
+
+    def energy(g):
+        if g.get("energy_source"):
+            return g["energy_kwh"]
+        km, eff = g.get("distance_km"), g.get("efficiency_kwh_100km")
+        return km * eff / 100.0 if km is not None and eff is not None else None
+
+    figured = [g for g in groups if not zero_unvouched(g)]
+    efficient = [g for g in figured if g.get("efficiency_kwh_100km") is not None]
+    has_ec = _trips_have_ec(db)
+    measured = [g for g in efficient if not has_ec or g.get("ec_kwh") is not None]
+    measured_ids = {g["id"] for g in measured}
+    period = {
+        "trip_count": len(groups),
+        "distance_km": total(g.get("distance_km") for g in groups),
+        "duration_min": total((g.get("duration_min") for g in groups), 0),
+        "energy_kwh": total((g["energy_kwh"] if g.get("energy_source") else g["distance_km"] * (g.get("efficiency_kwh_100km") or 0) / 100.0
+                             if g.get("distance_km") is not None else None) for g in groups),
+        "eff_km": total(g.get("distance_km") for g in efficient),
+        "measured_energy_kwh": total(energy(g) if g["id"] in measured_ids else 0 for g in groups),
+        "measured_eff_km": total(g.get("distance_km") for g in measured),
+        # Keep in step with `ec_km_expr`/`ec_kwh_expr` in get_trip_totals_between: the two paths
+        # answer the same question for different databases and must pick the same trips.
+        "ec_km": (total(g.get("distance_km") if g.get("ec_kwh") is not None else 0
+                         for g in figured) if has_ec else None),
+        # The energy behind those kilometres, for the average that divides them (#303). A merged
+        # group's `ec_kwh` already covers the whole group — convert-on-merge stores it on the
+        # parent over the combined distance — so it pairs with the `ec_km` above as it stands.
+        "ec_kwh_sum": (total(g.get("ec_kwh") or 0 for g in figured) if has_ec else None),
+    }
+    average_trips = measured if is_reev_car() else efficient
+    # Match the existing choice: trip efficiency first; stable cloud EC only as fallback
+    # (notably for REEV generator trips). Never override the owner's energy-source setting.
+    covered = [g for g in figured if g.get("energy_source") or g.get("efficiency_kwh_100km") is not None
+               or (g.get("ec_kwh") is not None and g.get("ec_stable") == 1)]
+    best = [g["efficiency_kwh_100km"] for g in efficient
+            if g["efficiency_kwh_100km"] > 0 and (g.get("distance_km") or 0) >= 15]
+    regen = [g["regen_kwh"] for g in groups if g.get("regen_kwh") is not None]
+    # Do not round numerator/denominator before division, as in the SQL weighted average.
+    km = sum(g.get("distance_km") or 0 for g in average_trips)
+    summary = {
+        "trip_count": len(groups),
+        "total_km": period["distance_km"],
+        "total_kwh_used": energy_used_total(trip_energy_used(g) for g in groups),
+        "energy_trips": len(covered) if groups else None,
+        "energy_km": total((g.get("distance_km") for g in covered), 1),
+        "avg_efficiency": (rounded(sum(energy(g) or 0 for g in average_trips) / km * 100, 1)
+                           if km else None),
+        "avg_efficiency_km": total((g.get("distance_km") for g in average_trips), 1),
+        "best_efficiency": rounded(min(best), 1) if best else None,
+        "avg_regen_kwh": rounded(sum(regen) / len(regen), 2) if regen else None,
+    }
+    return period, summary
 
 
 def get_trip_totals_between(begin_ts: int, end_ts: int) -> dict:
@@ -6562,15 +8557,69 @@ def get_trip_totals_between(begin_ts: int, end_ts: int) -> dict:
     up, cloud getEC where the cloud had a usable one and the SoC estimate where it didn't. The
     caller uses it as the reference the cloud's period total is checked against (#212). A trip with
     no efficiency counts as 0, which can only make the local total SMALLER — i.e. the check errs
-    toward leaving the cloud figure alone."""
+    toward leaving the cloud figure alone.
+
+    `ec_km` is the distance of the trips that HAVE a cloud figure, and it is what an average over
+    getEC energy must divide by (beta #40 @michapr). `distance_km` is what the car drove; the two
+    differ by every trip the cloud never saw, and dividing one by the other prints an average that
+    describes neither. The months already use this basis (`_totals_seal`'s `_ec_km`) and say so on
+    the page — "over 395 km of 416".
+
+    `eff_km` is the distance behind `energy_kwh` — the trips that carry an efficiency at all. On a
+    range-extender that is the BATTERY-ONLY distance, because Mate blanks the efficiency of every
+    trip the generator ran, and the pair is what the Statistics card already divides. It exists
+    because `ec_km` is NOT that distance: a mixed trip has a getEC figure, so it lands inside
+    `ec_km` while the generator was moving the car past the pack — measured on three owners'
+    bundles, the trips with the engine running read 4.8 and 6.5 kWh/100 km against 14.3 and 16.1
+    without it (@michapr, beta #41; getEC counts what LEAVES THE BATTERY, never the generator's
+    path to the wheels → [[reev-getec-is-battery-not-traction]])."""
     b = datetime.fromtimestamp(begin_ts, tz=timezone.utc).isoformat()
     e = datetime.fromtimestamp(end_ts, tz=timezone.utc).isoformat()
     db = _get()
+    merged = _merged_trip_statistics(db, b, e)
+    if merged is not None:
+        return merged[0]
+    # NULL, not 0, where the column is missing: the caller reads a falsy ec_km as "no covered
+    # distance known" and falls back to the whole distance — the behaviour before beta #40.
+    # Keep in step with `ec_km`/`ec_kwh_sum` in _merged_trip_statistics: the two paths answer the
+    # same question for different databases and must pick the same trips.
+    figured = f" AND NOT {ZERO_UNVOUCHED_SQL}" if _trips_have_ec(db) else ""
+    ec_km_expr = (f"ROUND(SUM(CASE WHEN ec_kwh IS NOT NULL{figured} THEN distance_km ELSE 0 END), 2)"
+                  if _trips_have_ec(db) else "NULL")
+    # …and the energy those same trips carry. The caller divides the two (#303): a cloud window
+    # total describes every kilometre the cloud saw, `ec_km` only the ones Mate attached a figure
+    # to, and pairing them inflates the average by exactly the coverage ratio. Same predicate as
+    # `ec_km_expr`, so the two can never describe different trips.
+    ec_kwh_expr = (f"ROUND(SUM(CASE WHEN ec_kwh IS NOT NULL{figured} THEN ec_kwh ELSE 0 END), 2)"
+                   if _trips_have_ec(db) else "NULL")
+    # `measured_*` is the same pair as `energy_kwh`/`eff_km` with the estimates taken out, and it
+    # is a SEPARATE pair on purpose (beta #43 @michapr). `efficiency_kwh_100km` is not a
+    # measurement by default: the poller writes it at trip end from ΔSoC × capacity
+    # (poller/db.py, `energy_used_kwh`) and ec_enrich overwrites it with the getEC figure only once
+    # the cloud answers, keeping the estimate in `efficiency_soc`. So the battery-only card, which
+    # calls its number measured, was averaging estimates for every trip the cloud never covered —
+    # on his bundle 4 trips and 5 km of 625, 14.30 against 14.26; small there only because 80 of
+    # his 88 trips reached the cloud, and the four it drops are 1-2 km hops reading 35.7 and 18.8
+    # kWh/100 km, which is what ΔSoC does over one kilometre.
+    # `energy_kwh` itself must NOT be narrowed: it is also the local reference that catches a cloud
+    # period total far below Mate's own trips (`flag_short_cloud_total`, #212 @riri19), and a
+    # reference that ignores every trip the cloud missed is exactly the wrong one for judging what
+    # the cloud reported. → tests/test_cloud_short_period.py
+    measured = " AND ec_kwh IS NOT NULL" if _trips_have_ec(db) else ""
     row = db.execute(
-        """SELECT COUNT(*) AS trip_count,
+        f"""SELECT COUNT(*) AS trip_count,
                   ROUND(SUM(distance_km), 2) AS distance_km,
                   ROUND(SUM(duration_min), 0) AS duration_min,
-                  ROUND(SUM(distance_km * COALESCE(efficiency_kwh_100km, 0) / 100.0), 2) AS energy_kwh
+                  ROUND(SUM(distance_km * COALESCE(efficiency_kwh_100km, 0) / 100.0), 2) AS energy_kwh,
+                  ROUND(SUM(CASE WHEN efficiency_kwh_100km IS NOT NULL{figured}
+                                 THEN distance_km END), 2) AS eff_km,
+                  ROUND(SUM(CASE WHEN efficiency_kwh_100km IS NOT NULL{measured}{figured}
+                                 THEN distance_km * efficiency_kwh_100km / 100.0
+                                 ELSE 0 END), 2) AS measured_energy_kwh,
+                  ROUND(SUM(CASE WHEN efficiency_kwh_100km IS NOT NULL{measured}{figured}
+                                 THEN distance_km END), 2) AS measured_eff_km,
+                  {ec_km_expr} AS ec_km,
+                  {ec_kwh_expr} AS ec_kwh_sum
            FROM trips WHERE vehicle_id = COALESCE(?, vehicle_id) AND ended_at IS NOT NULL
              AND started_at >= ? AND started_at <= ?""",
         (_current_vehicle_id(), b, e),
@@ -6614,7 +8663,13 @@ def flag_short_cloud_total(eb: dict, tot: dict, dist_km: float) -> dict:
 
 
 def get_charge_power_curve(charge_id: int) -> dict:
-    """Per-sample charging power for one session, for the expandable power chart.
+    """Per-sample readings of one session, for the chart under the charge: the charging power and
+    the SoC, and beside them what the car said at each poll — the coldest cell's temperature, the
+    minutes it thought were left — and the outside temperature of its spot from the weather, where
+    that is switched on. Not its range estimate: through a charge it climbs with the SoC (r >= 0.998
+    on 29 real charges of a B10), so a line of it would only repeat the SoC's. A reading the poll did not carry is None, a hole in the
+    line, never a 0; the car's countdown is stored only while it runs, so its line ends where the
+    car stopped counting.
     Power = |pack_voltage(1177) x pack_current(1178)| / 1000 — the same value as the
     HA `sensor.leapmotor_charging_power`. NOT rounded to 1 decimal (that flattens the
     curve); kept at 3 decimals so the real variation shows. Samples come from the
@@ -6623,8 +8678,11 @@ def get_charge_power_curve(charge_id: int) -> dict:
     ch = db.execute("SELECT started_at, ended_at FROM charges WHERE id = ? AND vehicle_id = COALESCE(?, vehicle_id)",
                     (charge_id, _current_vehicle_id())).fetchone()
     if not ch:
-        return {"labels": [], "power": [], "soc": []}
-    start, end = ch["started_at"], ch["ended_at"]
+        return {"power": [], "soc": [], "times": [], "battery_temp": [], "outside_temp": [],
+                "remaining_min": []}
+    cols = ("recorded_at, charge_voltage_v, charge_current_a, soc, battery_min_temp, outside_temp, "
+            "remaining_charge_min")
+    start, end, pieces = _charge_group_span(db, charge_id, ch["started_at"], ch["ended_at"])
     if end:
         # Cap the upper bound at the next charge's start so an orphan/overlapping charge
         # (whose ended_at bled past a later charge — see close_orphan_charges) cannot absorb
@@ -6632,29 +8690,97 @@ def get_charge_power_curve(charge_id: int) -> dict:
         # AC-vs-DC wallbox comparison AND the HOME cost (which bills the AC energy derived from
         # this curve) — GitHub #24. Mirrors _charge_active_window / compute_cost. For a normal
         # charge the next charge starts after ended_at → no cap, identical behaviour.
-        lo, hi, excl = _power_window_bounds(db, start, end)
+        lo, hi, excl = _power_window_bounds(db, start, end, pieces)
         rows = db.execute(
-            "SELECT recorded_at, charge_voltage_v, charge_current_a, soc FROM positions "
-            "WHERE vehicle_id = COALESCE(?, vehicle_id) AND charging = 1 AND recorded_at >= ? AND recorded_at "
+            f"SELECT {cols} FROM positions "
+            "WHERE vehicle_id = COALESCE(?, vehicle_id) AND " + _charging_sample() + " AND recorded_at >= ? AND recorded_at "
             + ("<" if excl else "<=")
             + " ? ORDER BY recorded_at",
             (_current_vehicle_id(), lo, hi),
         ).fetchall()
-    else:  # charge still in progress — open upper bound
+    else:
+        # Still in progress, open upper bound: every parked reading since the start, so a pause
+        # (the car stopped, the cable still in) is drawn as 0 kW and the chart goes on growing.
         rows = db.execute(
-            "SELECT recorded_at, charge_voltage_v, charge_current_a, soc FROM positions "
-            "WHERE vehicle_id = COALESCE(?, vehicle_id) AND charging = 1 AND recorded_at >= ? ORDER BY recorded_at",
+            f"SELECT {cols}, charging, charge_current_a <= -{_CHARGE_SAMPLE_MIN_A} AS charging_current FROM positions "
+            "WHERE vehicle_id = COALESCE(?, vehicle_id) AND recorded_at >= ? "
+            "AND COALESCE(speed_kmh, 0) <= 2 AND COALESCE(gear, 'P') = 'P' ORDER BY recorded_at",
             (_current_vehicle_id(), start),
         ).fetchall()
-    labels, power, soc, times = [], [], [], []
+    power, soc, times = [], [], []
     for r in rows:
         v = r["charge_voltage_v"] or 0
         a = r["charge_current_a"] or 0
-        labels.append((_local_iso(r["recorded_at"]) or "")[11:16])  # HH:MM local
-        power.append(round(abs(v * a) / 1000.0, 3))
+        paused = end is None and not (r["charging"] == 1 or r["charging_current"])
+        power.append(0.0 if paused else round(abs(v * a) / 1000.0, 3))
         soc.append(r["soc"])
-        times.append(r["recorded_at"])  # raw UTC ISO — used to align external (wallbox) history
-    return {"labels": labels, "power": power, "soc": soc, "times": times}
+        times.append(r["recorded_at"])  # raw UTC ISO — the chart's clock, and the wallbox history's alignment
+    return {"power": power, "soc": soc, "times": times,
+            "battery_temp": [r["battery_min_temp"] for r in rows],
+            "outside_temp": [r["outside_temp"] for r in rows],
+            "remaining_min": [r["remaining_charge_min"] for r in rows]}
+
+
+def _wallbox_sample_kinds() -> dict[str, str]:
+    """The roles of the wallbox mapping and the kinds `ha_samples` keeps their readings under. The names live
+    with the table, in the poller's dependency-free module; on the path for the length of one import, since
+    the two directories share module names."""
+    poller = str(Path(__file__).resolve().parent.parent / "poller")
+    sys.path.insert(0, poller)
+    try:
+        from schema import WALLBOX_ENERGY_KWH, WALLBOX_POWER_KW
+    finally:
+        sys.path.remove(poller)
+    return {"power": WALLBOX_POWER_KW, "energy": WALLBOX_ENERGY_KWH}
+
+
+# At import, not per read: the two directories share module names, and a path changed while another thread imports
+# would hand it the poller's module.
+WALLBOX_SAMPLE_KINDS = _wallbox_sample_kinds()
+
+
+def wallbox_power_samples(lo: str, hi: str) -> list[tuple[float, float]]:
+    """The wallbox's power as the poller read it from `lo` to `hi` (raw UTC ISO, as positions are stamped), as
+    sorted (epoch, value): the shape ha_client.get_history gives, so a line drawn from Home Assistant's history
+    draws from here unchanged. Empty for a charge none were kept for."""
+    import ha_client
+    kind = WALLBOX_SAMPLE_KINDS["power"]
+    rows = _get().execute(
+        "SELECT recorded_at, value FROM ha_samples WHERE vehicle_id = COALESCE(?, vehicle_id) AND kind = ? "
+        "AND recorded_at >= ? AND recorded_at <= ? ORDER BY recorded_at",
+        (_current_vehicle_id(), kind, lo, hi)).fetchall()
+    return [(ha_client.epoch(r["recorded_at"]), r["value"]) for r in rows]
+
+
+def home_or_unconfirmed_charges_without_wallbox_samples() -> list[sqlite3.Row]:
+    """Finished charges at home, or not typed yet (no type, or the old "MANUAL") and so maybe at home, a merged
+    group's parent and not its pieces, with no wallbox reading kept over their span: the ones from before Mate
+    kept them, newest first, which is where Home Assistant's history still reaches."""
+    return _get().execute(
+        "SELECT c.id, c.vehicle_id FROM charges c WHERE c.ended_at IS NOT NULL "
+        "AND (c.location_type IS NULL OR c.location_type IN ('HOME', 'MANUAL')) "
+        "AND c.merged_into_id IS NULL AND c.vehicle_id = COALESCE(?, c.vehicle_id) AND NOT EXISTS ("
+        "SELECT 1 FROM ha_samples s WHERE s.vehicle_id = c.vehicle_id AND s.kind = ? "
+        "AND s.recorded_at BETWEEN c.started_at AND c.ended_at) ORDER BY c.started_at DESC",
+        (_current_vehicle_id(), WALLBOX_SAMPLE_KINDS["power"])).fetchall()
+
+
+def save_wallbox_samples(vehicle_id: int, times: list[str], kept: dict[str, list]) -> int:
+    """Keep readings of the wallbox at the car's instants, {kind: values aligned to `times`}; a None is no
+    reading and leaves no row, nor does a reading already kept at that instant, so a charge read again is
+    kept once. Returns the rows written."""
+    rows = [(vehicle_id, t, kind, float(v), vehicle_id, kind, t) for kind, values in kept.items()
+            for t, v in zip(times, values) if v is not None]
+    if not rows:
+        return 0
+    db = _conn_rw()
+    before = db.total_changes
+    db.executemany("INSERT INTO ha_samples (vehicle_id, recorded_at, kind, value) SELECT ?, ?, ?, ? WHERE NOT EXISTS ("
+                   "SELECT 1 FROM ha_samples WHERE vehicle_id = ? AND kind = ? AND recorded_at = ?)", rows)
+    written = db.total_changes - before
+    db.commit()
+    db.close()
+    return written
 
 
 def latest_charge_id_with_power() -> int | None:
@@ -6662,7 +8788,7 @@ def latest_charge_id_with_power() -> int | None:
     db = _get()
     row = db.execute(
         "SELECT c.id FROM charges c WHERE c.vehicle_id = COALESCE(?, c.vehicle_id) AND EXISTS ("
-        "  SELECT 1 FROM positions p WHERE p.vehicle_id = c.vehicle_id AND p.charging = 1"
+        "  SELECT 1 FROM positions p WHERE p.vehicle_id = c.vehicle_id AND " + _charging_sample("p") + 
         "  AND p.recorded_at >= c.started_at"
         "  AND (c.ended_at IS NULL OR p.recorded_at <= c.ended_at)"
         ") ORDER BY c.started_at DESC LIMIT 1",
@@ -6675,14 +8801,20 @@ def charges_with_power(limit: int = 30) -> list[dict]:
     """Recent HOME charges (= the wallbox) that still have a power curve — raw
     {id, started_at, energy_added_kwh}. Only HOME charges are relevant to the
     wallbox comparison: public/away charges (and unconfirmed NULL ones) are excluded,
-    which also avoids attributing another car's wallbox session to this car."""
+    which also avoids attributing another car's wallbox session to this car.
+
+    Unlike _wallbox_home_charges_raw's own EXISTS, the `OR` in the upper bound here is NOT
+    dead — an open charge (`ended_at IS NULL`) is still a candidate, so the NULL branch can
+    fire for real. An OR still can't become an index constraint, so `COALESCE(c.ended_at,
+    '9999')` keeps the same "open charge always qualifies" meaning while giving SQLite a
+    single comparable upper bound to search on (#363)."""
     db = _get()
     rows = db.execute(
         "SELECT c.id, c.started_at, c.energy_added_kwh FROM charges c "
         "WHERE c.vehicle_id = COALESCE(?, c.vehicle_id) AND c.location_type = 'HOME' AND EXISTS ("
-        "  SELECT 1 FROM positions p WHERE p.vehicle_id = c.vehicle_id AND p.charging = 1"
+        "  SELECT 1 FROM positions p WHERE p.vehicle_id = c.vehicle_id AND " + _charging_sample("p") +
         "  AND p.recorded_at >= c.started_at"
-        "  AND (c.ended_at IS NULL OR p.recorded_at <= c.ended_at)"
+        "  AND p.recorded_at <= COALESCE(c.ended_at, '9999')"
         ") ORDER BY c.started_at DESC LIMIT ?",
         (_current_vehicle_id(), limit),
     ).fetchall()
@@ -6690,23 +8822,39 @@ def charges_with_power(limit: int = 30) -> list[dict]:
 
 
 def _wallbox_home_charges_raw() -> list[dict]:
-    """All-time HOME charges that still have a power curve (same EXISTS gate as
-    charges_with_power, but selecting BOTH energy columns and unbounded — the Wallbox
-    calendar's month totals and year-jump need the full history, not just the newest 30)."""
+    """All-time HOME charges that still have a power curve (same gate as charges_with_power,
+    but selecting BOTH energy columns and unbounded — the Wallbox calendar's month totals and
+    year-jump need the full history, not just the newest 30).
+
+    The "has a power curve" check is a correlated EXISTS subquery against `positions`. Its
+    upper bound used to read `(c.ended_at IS NULL OR p.recorded_at <= c.ended_at)` — an OR that
+    is DEAD in this query (`c.ended_at IS NOT NULL` is already required three lines up), but an
+    OR can never become an index constraint, so SQLite used only the lower bound and walked
+    forward through however much of `positions` came after a charge with no matching sample.
+    Dropping the dead branch lets it use BOTH bounds (`recorded_at>? AND recorded_at<?`).
+
+    ProtossBlaster found this reading the diagnosis on #363 — an earlier version of this fix
+    scanned every qualifying sample in `positions` into a Python list once per page load and
+    checked each charge against it, which measured WORSE on his real bench (381k positions, 32
+    HOME charges, none missing a sample): the `EXISTS` costs 0.0ms there either way, since it
+    stops at the first match, while the Python scan paid ~41ms unconditionally, twice per page
+    load. This one-line fix costs the same 0.0ms on that install and turns the pathological case
+    (a charge with NO sample) from an 18.4ms table walk into another 0.0ms index search — so it
+    wins on both shapes of database, with neither a Python-side list nor a hand-rolled binary
+    search to keep in step with the schema."""
     db = _get()
+    # ⚠️ COMPLETED charges only (Silvio, 06/08/26). While the energy is still flowing the meter
+    # lags the car — @Wartopia's live 6 August charge read 2.74 kWh from the wall against 4.03
+    # into the battery — so a running session drags every comparison on this page for as long as
+    # the cable is in. Measured: 89.3 % became 93.6 % the moment one joined. Its own guards have
+    # not run yet either: the ceiling and stuck-counter backstops fire at finalize_charge.
     rows = db.execute(
-        # ⚠️ COMPLETED charges only (Silvio, 06/08/26). While the energy is still flowing the meter
-        # lags the car — @Wartopia's live 6 August charge read 2.74 kWh from the wall against 4.03
-        # into the battery — so a running session drags every comparison on this page for as long as
-        # the cable is in. Measured: 89.3 % became 93.6 % the moment one joined. Its own guards have
-        # not run yet either: the ceiling and stuck-counter backstops fire at finalize_charge.
         "SELECT c.id, c.started_at, c.ended_at, c.energy_added_kwh, c.ac_energy_kwh FROM charges c "
         "WHERE c.vehicle_id = COALESCE(?, c.vehicle_id) AND c.location_type = 'HOME' "
         + ("AND c.merged_into_id IS NULL " if _charges_have_merge(db) else "")
         + "AND c.ended_at IS NOT NULL AND EXISTS ("
-        "  SELECT 1 FROM positions p WHERE p.vehicle_id = c.vehicle_id AND p.charging = 1"
-        "  AND p.recorded_at >= c.started_at"
-        "  AND (c.ended_at IS NULL OR p.recorded_at <= c.ended_at)"
+        "  SELECT 1 FROM positions p WHERE p.vehicle_id = c.vehicle_id AND " + _charging_sample("p") +
+        "  AND p.recorded_at >= c.started_at AND p.recorded_at <= c.ended_at"
         ") ORDER BY c.started_at DESC",
         (_current_vehicle_id(),)).fetchall()
     # One entry per SESSION: two rows here are two Home Assistant history fetches and two
@@ -6734,7 +8882,99 @@ def wallbox_session_energy(charge) -> dict:
     dc = dc if (dc and dc > 0) else None
     return {"ac_kwh": round(ac, 2) if ac else None,
             "dc_kwh": round(dc, 2) if dc else None,
-            "eff": round(100 * dc / ac, 1) if (ac and dc) else None}
+            "eff": _round1(charge_efficiency(ac, dc))}
+
+
+def _round1(x):
+    """A tenth, for the pages whose contract is a tenth — None passes through."""
+    return None if x is None else round(x, 1)
+
+
+def charge_efficiency(ac, dc):
+    """DC into the battery over AC from the wall, as a percentage — or None when that ratio would
+    be a claim nobody can make (#295 @gm27271).
+
+    The one definition, because there were two: the charge card hid a ratio above 100 % from the
+    day it was written, the Wallbox page printed his 130.4 % and — the macro asking only whether
+    the number is ≥ 88 — coloured it GREEN. A charge cannot put into the battery more than the wall
+    gave it, so above 100 % the two figures are not comparable and the honest output is nothing.
+    100 % itself stays: a coarse meter and a small charge land there legitimately.
+
+    ⚠️ This withholds a RATIO. It never decides which of the two figures is wrong and never
+    discards one — `poller/db.py` is deliberate that a DC figure resting on a battery capacity the
+    owner types in must not be allowed to discredit a measured one. Both kWh stay on screen.
+
+    ⚠️ Returned UNROUNDED, and the threshold reads the unrounded number. Rounding first made the
+    function wrong twice over (@arekm, found on the v3.17.4 code while rebasing #297): 25.01 kWh
+    into the battery for 25.00 from the wall is 100.04 %, impossible, but rounds to exactly 100.0
+    and slipped through its own test; and the card, which rounds again for display, turned 85.48 %
+    into 85.5 and then into 86 — a point higher than the same charge read in v3.17.3. Callers that
+    publish a tenth round it themselves.
+    """
+    if not ac or not dc or ac <= 0 or dc <= 0:
+        return None
+    eff = 100 * dc / ac
+    return eff if eff <= 100 else None
+
+
+def charge_energy_view(c) -> dict:
+    """Which kWh ONE charge leads with, and what stands under it — the charge card's rule, in the
+    one place the card and the Overview's Last-charge tile both read it from.
+
+        headline_kwh    the wallbox counter on a HOME charge that has one (`show_wb` on the card),
+                        else the battery figure — or, on a merged charge whose pieces bill on
+                        different figures, what they bill (`_billed_kwh`)
+        headline        'wallbox' | 'battery' | 'delivered'
+        has_home_meter  a stored home-meter reading, even if it covers only part of a group;
+                        keeps the solar/gross editors independent of the headline variant
+        battery_kwh     the battery figure, shown under the headline in the other two variants
+        wallbox_eff     `charge_efficiency(counter, battery)` in the wallbox variant — the one
+                        definition the Wallbox page reads too (#295) — or None
+        gross_kwh       the charger's own kWh (#222) where the owner typed one — whichever figure
+                        leads: the field that holds it keeps showing what was typed even on a home
+                        charge the meter measured (re-tagged after typing), it is the CARD that
+                        decides not to offer the field there
+        gross_eff       100 × battery ÷ typed figure, unrounded, only when the typed figures
+                        cover the whole charge, or None
+        gross_lost_kwh  typed figure − battery, when `gross_eff` is shown
+
+    A merged charge leads with the counter only when the counter measured EVERY piece: on 12 kWh
+    metered for the first piece and nothing for the second, the group's summed columns read as
+    "HOME with a counter" and the card said "12.0 kWh wallbox (billed)" over a cost computed on 17.
+    Such a charge — a meter or a typed figure covering some pieces and not others — leads with the
+    figure it bills, under the word the totals use for the same sum, and the battery figure under
+    it; the gross line stays what it is on any card, the typed figure and the way to type one.
+    A single charge never takes that variant: its billed figure IS the counter, the typed figure
+    or the battery one.
+
+    An efficiency is hidden when it would be nonsense: `wallbox_eff` above 100 % (charge_efficiency
+    decides that) and `gross_eff` when the typed figure is not above the battery one. The two thresholds differ at
+    exactly 100 % (the wallbox shows it, the gross hides it): that is how the two partials behaved
+    before the rule moved here, kept as found; levelling them is a separate change.
+
+    Not `wallbox_session_energy`: that one rounds, returns None on a zero battery figure and serves
+    the Wallbox page's own colour thresholds."""
+    ac = c.get("ac_energy_kwh")
+    dc = c.get("energy_added_kwh") or 0
+    g = c.get("gross_kwh")
+    out = {"headline_kwh": dc, "headline": "battery", "battery_kwh": dc, "wallbox_eff": None,
+           "gross_kwh": None, "gross_eff": None, "gross_lost_kwh": None,
+           "has_home_meter": _metered_at_home(c)}
+    if all(_metered_at_home(p) for p in c.get("_pieces") or [c]):
+        out["headline_kwh"], out["headline"] = ac, "wallbox"
+        out["wallbox_eff"] = charge_efficiency(ac, dc)
+    else:
+        billed = _billed_kwh(c)
+        if abs(billed - (g if g and g > 0 else dc)) > 1e-9:
+            out["headline_kwh"], out["headline"] = billed, "delivered"
+    if g and g > 0:
+        out["gross_kwh"] = g
+        pieces = c.get("_pieces")
+        # The battery sum covers the whole charge; a partial gross cannot measure its losses.
+        covers_charge = not pieces or None not in _gross_figures(pieces)[1]
+        if covers_charge and dc and g - dc > 0:
+            out["gross_eff"], out["gross_lost_kwh"] = 100 * dc / g, g - dc
+    return out
 
 
 def wallbox_ac_dc_totals(charges) -> dict:
@@ -6769,7 +9009,7 @@ def wallbox_ac_dc_totals(charges) -> dict:
     if not counted:
         return {"ac": None, "dc": None, "eff": None, "counted": 0, "skipped": skipped}
     return {"ac": round(ac, 2), "dc": round(dc, 2),
-            "eff": round(100 * dc / ac, 1) if ac else None,
+            "eff": _round1(charge_efficiency(ac, dc)),
             "counted": counted, "skipped": skipped}
 
 
@@ -6831,19 +9071,36 @@ def is_home_charge(charge_id: int) -> bool:
 
 
 def unconfirmed_charges_count() -> int:
-    """How many FINISHED charges still have no type set (location_type NULL) → need
-    confirming. In-progress charges (ended_at NULL) are excluded: they can't be
-    confirmed until they end, otherwise the banner would never clear while charging."""
+    """How many FINISHED charges still have no REAL type set → need confirming. In-progress
+    charges (ended_at NULL) are excluded: they can't be confirmed until they end, otherwise the
+    banner would never clear while charging.
+
+    "No real type" is `location_type IS NULL` OR the literal leftover `'MANUAL'` — a charge stuck
+    there (from before cost_manual existed) shows the same "❓ Da confermare" badge as a NULL one
+    (CHARGE_TYPES has no 'MANUAL' key either), so the banner counting only NULL silently missed it:
+    the badge said unconfirmed, the banner didn't count it. Same fix in newest_unconfirmed_charge_id
+    below.
+
+    Minus the charges priced by hand (`is_manual_charge`): those read "✎ Manual", and the owner
+    already answered for them — asking again was the regression of add-on #2."""
     db = _get()
     row = db.execute(
         # Only whole charges: a merged child is not a charge the user can confirm — the group
         # carries the parent's type, and counting the pieces would ask twice for one answer.
         "SELECT COUNT(*) n FROM charges WHERE vehicle_id = COALESCE(?, vehicle_id) "
-        "AND location_type IS NULL AND ended_at IS NOT NULL"
+        "AND (location_type IS NULL OR location_type = 'MANUAL') AND ended_at IS NOT NULL"
+        + _and_not_priced_by_hand(db)
         + (" AND merged_into_id IS NULL" if _charges_have_merge(db) else ""),
         (_current_vehicle_id(),)
     ).fetchone()
     return row["n"] if row else 0
+
+
+def _and_not_priced_by_hand(db) -> str:
+    """The SQL half of `is_manual_charge`, for the two queries that count what is left to confirm.
+    Empty before the poller's migration, when there is no cost_manual to read and no Manual charge
+    can be told apart from an untyped one."""
+    return " AND COALESCE(cost_manual, 0) = 0" if _charges_have_cost_manual(db) else ""
 
 
 def newest_unconfirmed_charge_id() -> int:
@@ -6860,11 +9117,41 @@ def newest_unconfirmed_charge_id() -> int:
     db = _get()
     row = db.execute(
         "SELECT id FROM charges WHERE vehicle_id = COALESCE(?, vehicle_id) "
-        "AND location_type IS NULL AND ended_at IS NOT NULL "
-        "ORDER BY started_at DESC LIMIT 1",
+        "AND (location_type IS NULL OR location_type = 'MANUAL') AND ended_at IS NOT NULL"
+        + _and_not_priced_by_hand(db)
+        + " ORDER BY started_at DESC LIMIT 1",
         (_current_vehicle_id(),)
     ).fetchone()
     return row["id"] if row else 0
+
+
+def open_charge() -> dict | None:
+    """The charge in progress (ended_at IS NULL): its id, local start, start SoC and type, or None."""
+    row = _get().execute(
+        "SELECT id, started_at, start_soc, location_type FROM charges WHERE ended_at IS NULL "
+        "AND vehicle_id = COALESCE(?, vehicle_id) ORDER BY id DESC LIMIT 1",
+        (_current_vehicle_id(),)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    d["started_at"] = _local_iso(d["started_at"])
+    return d
+
+
+def open_trip() -> dict | None:
+    """The trip in progress (ended_at IS NULL): its id, local start, start SoC and odometer, and the readings
+    so far as its trip page draws them (_trip_points), or None."""
+    db = _get()
+    row = db.execute(
+        "SELECT id, started_at, start_soc, start_odometer_km FROM trips WHERE ended_at IS NULL "
+        "AND merged_into_id IS NULL AND vehicle_id = COALESCE(?, vehicle_id) ORDER BY id DESC LIMIT 1",
+        (_current_vehicle_id(),)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    d["started_at"] = _local_iso(d["started_at"])
+    d["points"] = _trip_points(db, _segment_ids(db, d["id"]))
+    return d
 
 
 def open_charge_session_energy() -> Optional[float]:
@@ -6901,7 +9188,7 @@ def get_stats_grouped() -> list[dict]:
     it read the consumption from `efficiency_kwh_100km` over the km THAT has (→ 12.2), grouped by the
     car's UTC clock, and counted merged children — while the Trips page read getEC over the km getEC
     covers (→ 10.1), local, non-merged. `avg_efficiency` here IS that getEC figure (kwh_100km);
-    `total_kwh` the getEC energy behind it. Newest year/month/day first, trips kept chronological."""
+    `total_kwh` its share of Energy Used. Newest year/month/day first, trips kept chronological."""
     from collections import OrderedDict
     lang = get_language()
     years: "OrderedDict[str, dict]" = OrderedDict()
@@ -6936,8 +9223,7 @@ def get_stats_grouped() -> list[dict]:
         # figure uses. Two denominators, so they stay under two different words.
         node["total_fuel_l"] = round(s["fuel_l"], 2)
         node["fuel_l_100km"] = s["fuel_l_100km"]
-        node["total_kwh"] = (round(s["kwh_100km"] * s["kwh_100km_km"] / 100, 2)
-                             if s["kwh_100km"] is not None else 0.0)   # the getEC energy behind it
+        node["total_kwh"] = s["kwh_used"] or 0.0
         return node
 
     out = []
@@ -6993,12 +9279,9 @@ def _iso_to_utc(x):
 
 def get_position_near(ts: "str | None", tolerance_min: int = 20) -> "dict | None":
     """The single positions row closest to timestamp `ts` (within tolerance_min minutes
-    either side) — for reading outside_temp/battery_min_temp at an arbitrary INSTANT (a
-    trip's or charge's own start/end), which nothing needed before: every existing
-    telemetry query is either "latest" (status cards) or a min/max aggregate over a whole
-    charging window (_charge_temp_odo), never "nearest to one point in time." None when
-    `ts` is missing/unparseable, or nothing falls within the tolerance window (e.g. the
-    sample was already pruned by the positions_retention_days setting)."""
+    either side): where the car was at one instant, a refuel's. None when `ts` is
+    missing/unparseable, or nothing falls within the tolerance window (e.g. the sample was
+    already pruned by the positions_retention_days setting)."""
     utc = _iso_to_utc(ts)
     if not utc:
         return None
@@ -7021,91 +9304,17 @@ def get_position_near(ts: "str | None", tolerance_min: int = 20) -> "dict | None
     return dict(best)
 
 
-def generate_trip_auto_note(trip_id: int, provider: str = "", api_key: "str | None" = None,
-                             only_if_note_empty: bool = False) -> "str | None":
-    """Builds the start/end address+time+temperature summary and writes it straight into
-    the trip's `note` field (the ONE note field — no separate read-only line to keep in
-    sync). Reverse-geocoding is a live network call (web/geocode.py, no caching, and
-    Nominatim's usage policy forbids bulk lookups) — safe for the 🧭 button (one trip) and
-    for the automatic call at trip-close (poller/recorder.py, one NEW trip at a time), but
-    never a historical backfill sweep. `only_if_note_empty` is the automatic-at-close
-    guard: a manual note the user already typed is never clobbered by this running just
-    after; the manual button always overwrites (the UI confirms with the user first when
-    there's something to lose — see trip_detail.html's hx-confirm). Temperature reuses the
-    trip's own outside_temp_start_c/end_c (Open-Meteo, already collected by
-    elevation_enrich) — None when that enrichment hasn't run yet (may still be the case
-    right at trip-close; regenerating later via the button picks it up once it has)."""
-    import geocode
-    import units
-    _db = _get()
-    row = _db.execute("SELECT * FROM trips WHERE id=? AND vehicle_id = COALESCE(?, vehicle_id)",
-                      (trip_id, _current_vehicle_id())).fetchone()
-    if not row:
-        return None
-    # A merged journey is ONE journey to whoever is looking at it: get_trip_detail resolves a child
-    # to its parent and composes the group, so the page says A→C while this used to read the parent
-    # segment's own row and write A→B — the trip's own summary contradicting the trip (#247,
-    # @Ng-EY). Same for the arrival time and the end temperature, which came from B. Resolve the
-    # group here exactly as the page does; the stored rows stay untouched (a merge is display math
-    # and must stay reversible), and the note is written to the PARENT, which is the row the page
-    # reads it back from.
-    parent_id = row["merged_into_id"] or row["id"]
-    parent = row if parent_id == row["id"] else _db.execute(
-        "SELECT * FROM trips WHERE id=? AND vehicle_id = COALESCE(?, vehicle_id)",
-        (parent_id, _current_vehicle_id())).fetchone()
-    if parent is None:          # child pointing at a parent this vehicle cannot see
-        parent, parent_id = row, row["id"]
-    row = _trip_group_stats(dict(parent), _children_by_parent(_db).get(parent_id, []))
-    if only_if_note_empty and (row.get("note") or "").strip():
-        return row.get("note")
-
-    def _addr(lat, lon):
-        # geocode.reverse_geocode's own keyed-provider path swallows failures and falls back to
-        # Nominatim, but that final call (urllib underneath) can still raise on a timeout/DNS
-        # blip — one endpoint's network hiccup must not blank the other endpoint's time+temp.
-        if lat is None or lon is None:
-            return None
-        try:
-            return geocode.reverse_geocode(lat, lon, provider, api_key)
-        except Exception:  # noqa: BLE001
-            return None
-
-    start_addr = _addr(row.get("start_lat"), row.get("start_lon"))
-    end_addr = _addr(row.get("end_lat"), row.get("end_lon"))
-    start_dt = _local_dt(row.get("started_at"))
-    end_dt = _local_dt(row.get("ended_at"))
-
-    def _line(marker: str, addr, dt, temp_c) -> "str | None":
-        if not dt:
-            return None
-        bits = ([addr] if addr else []) + [dt.strftime("%H:%M")]
-        if temp_c is not None:
-            bits.append(f"🌡️ {units.temp(temp_c)}")
-        text = " · ".join(bits)
-        return f"{marker} {text}" if marker else text
-
-    lines = [_line("", start_addr, start_dt, row.get("outside_temp_start_c")),
-             _line("→", end_addr, end_dt, row.get("outside_temp_end_c"))]
-    text = (" ".join(l for l in lines if l) or None)
-    if text:
-        text = text.strip()[:1000]
-    db = _conn_rw()
-    db.execute("UPDATE trips SET note=? WHERE id=?", (text, parent_id))
-    db.commit()
-    return text
-
-
 _FUEL_NOTE_TOLERANCE_MIN = 20     # how far from the refuel a position may sit and still be "there"
 
 
 def generate_fuel_auto_note(purchase_id: int, provider: str = "", api_key: "str | None" = None,
                             only_if_note_empty: bool = False) -> "str | None":
-    """Write where you filled up into the refuel's own note — the 🧭 that trips and charges have.
+    """Write where you filled up into the refuel's own note.
 
     Asked for by **@gm27271** (beta discussion #14): *"add GPS coordinates of the gas station
     registered during the refueling timestamp… then users do not need to enter any notes"*. The
     cloud reports no station, so the place has to come from where the CAR was: the position nearest
-    the refuel's timestamp, reverse-geocoded through the same provider the trip note uses.
+    the refuel's timestamp, reverse-geocoded through the provider chosen for address lookups.
 
     The tolerance is the honest part. A refuel's timestamp is not always the moment fuel went in —
     on a detected one it is when the NEW level was first seen, which for someone who fills up and
@@ -7113,9 +9322,8 @@ def generate_fuel_auto_note(purchase_id: int, provider: str = "", api_key: "str 
     _FUEL_NOTE_TOLERANCE_MIN of it; beyond that the car was demonstrably somewhere else and the
     note is left alone rather than naming the wrong forecourt. Returns the note it wrote, or None.
 
-    `only_if_note_empty` mirrors the charge path: something you typed is never overwritten by an
-    automatic call. The button always overwrites — the page asks first when there is something to
-    lose."""
+    `only_if_note_empty`: something you typed is never overwritten by an automatic call. The button
+    always overwrites — the page asks first when there is something to lose."""
     import geocode
     row = _get().execute(
         "SELECT * FROM fuel_purchases WHERE id=? AND (vehicle_id = COALESCE(?, vehicle_id) "
@@ -7145,100 +9353,6 @@ def generate_fuel_auto_note(purchase_id: int, provider: str = "", api_key: "str 
     return address
 
 
-def generate_charge_auto_note(charge_id: int, provider: str = "", api_key: "str | None" = None,
-                               only_if_note_empty: bool = False) -> "str | None":
-    """Builds the station-address+start/end time+temperature summary and writes it
-    straight into the charge's `note` field (the ONE note field — no separate read-only
-    line to keep in sync). The address reuses find_station_candidates — the SAME OSM/OCM
-    lookup the 📍 label/🔗 link already run — matched to the charge's own resolved name
-    when possible; skipped for HOME charges (no station to address, and the user already
-    knows their own home). Both temperatures come from the car's own telemetry
-    (positions.outside_temp / battery_min_temp) nearest each endpoint's timestamp
-    (get_position_near) — charges have no Open-Meteo weather enrichment like trips do
-    (elevation_enrich), so 🌡️ here can be blank on cars that don't report an
-    ambient-temperature signal at all. Live network calls (geocoding, station lookup) —
-    safe for the 🧭 button (one charge) and for the automatic call at charge-close
-    (poller/recorder.py, one NEW charge at a time), never a historical backfill sweep.
-    `only_if_note_empty` is the automatic-at-close guard: a manual note the user already
-    typed is never clobbered by this running just after; the manual button always
-    overwrites (the UI confirms with the user first when there's something to lose — see
-    charge_card.html's hx-confirm)."""
-    import charger_locator
-    import units
-    _db = _get()
-    row = _db.execute("SELECT * FROM charges WHERE id=? AND vehicle_id = COALESCE(?, vehicle_id)",
-                      (charge_id, _current_vehicle_id())).fetchone()
-    if not row:
-        return None
-    # A joined plug-in is ONE session to whoever is looking at it — the card composes the group —
-    # and this was the one reader that did not: it took the piece's own row, so the note ended at
-    # the first pause while the card above it showed the whole session. The twin of the trip note
-    # fixed in v3.11.2, reported by the same person on the same issue three days later (#247,
-    # @Ng-EY). Resolve the group exactly as the card does, and write to the PARENT — the row the
-    # page reads the note back from. The stored rows stay untouched: a merge is display math and
-    # has to stay reversible.
-    parent_id = row["merged_into_id"] or row["id"]
-    parent = row if parent_id == row["id"] else _db.execute(
-        "SELECT * FROM charges WHERE id=? AND vehicle_id = COALESCE(?, vehicle_id)",
-        (parent_id, _current_vehicle_id())).fetchone()
-    if parent is None:          # child pointing at a parent this vehicle cannot see
-        parent, parent_id = row, row["id"]
-    charge_id = parent_id
-    row = _charge_group_stats(dict(parent), _charge_children_by_parent(_db).get(parent_id, []))
-    if only_if_note_empty and (row.get("note") or "").strip():
-        return row.get("note")
-    address = None
-    if (row.get("location_type") != "HOME"
-            and row.get("latitude") is not None and row.get("longitude") is not None):
-        options, _ok = charger_locator.find_station_candidates(row["latitude"], row["longitude"])
-        match = next((o for o in options if o.get("name") == row.get("location_name")), None)
-        address = (match or {}).get("address")
-        if not address:
-            # The name-matched option (or none, if the saved name came from a source no
-            # longer offered) can still lack a street address even though a DIFFERENT
-            # source at the very same physical site has one — charger_locator keeps
-            # differently-named sources as separate options on purpose (its own docstring:
-            # lets the manual relocate button offer a real choice), so an address one
-            # network reports isn't automatically inherited by another's option. Borrow the
-            # nearest option that has one — options are already distance-sorted, and it's
-            # the same charging site either way.
-            address = next((o["address"] for o in options if o.get("address")), None)
-    start_dt = _local_dt(row.get("started_at"))
-    end_dt = _local_dt(row.get("ended_at"))
-    p_start = get_position_near(row.get("started_at"))
-    p_end = get_position_near(row.get("ended_at"))
-
-    def _temps(pos) -> str:
-        if not pos:
-            return ""
-        bits = []
-        if pos.get("outside_temp") is not None:
-            bits.append(f"🌡️ {units.temp(pos['outside_temp'])}")
-        if pos.get("battery_min_temp") is not None:
-            bits.append(f"🔋 {units.temp(pos['battery_min_temp'])}")
-        return " · ".join(bits)
-
-    def _line(marker: str, addr, dt, pos) -> "str | None":
-        if not dt:
-            return None
-        bits = ([addr] if addr else []) + [dt.strftime("%H:%M")]
-        t = _temps(pos)
-        if t:
-            bits.append(t)
-        text = " · ".join(bits)
-        return f"{marker} {text}" if marker else text
-
-    lines = [_line("", address, start_dt, p_start),
-             _line("→", None, end_dt, p_end)]
-    text = (" ".join(l for l in lines if l) or None)
-    if text:
-        text = text.strip()[:1000]
-    db = _conn_rw()
-    db.execute("UPDATE charges SET note=? WHERE id=?", (text, charge_id))
-    db.commit()
-    return text
-
-
 def _charge_active_window(db, started_at, ended_at):
     """First & last sample with REAL charging power (positions.charging=1, which is set only when power
     flows — NOT on plug-in) inside the session window. Returns (start_utc_iso, end_utc_iso), or
@@ -7252,7 +9366,7 @@ def _charge_active_window(db, started_at, ended_at):
     lo, hi, excl = _power_window_bounds(db, started_at, ended_at)
     row = db.execute(
         "SELECT MIN(recorded_at) AS s, MAX(recorded_at) AS e FROM positions "
-        "WHERE vehicle_id = COALESCE(?, vehicle_id) AND charging = 1 AND recorded_at >= ? AND recorded_at "
+        "WHERE vehicle_id = COALESCE(?, vehicle_id) AND " + _charging_sample() + " AND recorded_at >= ? AND recorded_at "
         + ("<" if excl else "<=") + " ?",
         (_current_vehicle_id(), lo, hi),
     ).fetchone()
@@ -7302,6 +9416,35 @@ def _charges_have_gross(db) -> bool:
         return False
 
 
+def _charges_have_gross_from(db) -> bool:
+    """Whether the charges table says which rows a typed gross_kwh covers (see `_gross_figures`).
+    Same per-call reasoning as `_charges_have_gross`."""
+    try:
+        return any(r[1] == "gross_kwh_from" for r in db.execute("PRAGMA table_info(charges)"))
+    except sqlite3.Error:
+        return False
+
+
+def _charges_have_cost_manual(db) -> bool:
+    """Whether the charges table carries the cost_manual column yet (see poller/schema.py's
+    migration comment for what it splits apart). Same per-call reasoning as `_charges_have_gross` —
+    guarded rather than left bare like `is_free`, because this one gates money."""
+    try:
+        return any(r[1] == "cost_manual" for r in db.execute("PRAGMA table_info(charges)"))
+    except sqlite3.Error:
+        return False
+
+
+def _charges_have_solar(db) -> bool:
+    """Whether the charges table carries the #272 column yet. Same reasoning as
+    `_charges_have_gross`: the migration lives in the poller, the web only reads, so between an
+    update and the poller's next start the column is absent and any query naming it is a 500."""
+    try:
+        return any(r[1] == "solar_kwh" for r in db.execute("PRAGMA table_info(charges)"))
+    except sqlite3.Error:
+        return False
+
+
 def charges_have_odometer() -> bool:
     """The same question, asked by a route so a template can hide a field it cannot store."""
     return _charges_have_odometer(_get())
@@ -7319,14 +9462,45 @@ def _charges_have_odometer(db) -> bool:
         return False
 
 
+def _metered_at_home(c) -> bool:
+    """The home wallbox measured this row: the figure a HOME charge is billed on, and the one the
+    card leads with. One test, because the billing rule and the card must agree on it."""
+    return c.get("location_type") == "HOME" and (c.get("ac_energy_kwh") or 0) > 0
+
+
+def _gross_figures(pieces) -> tuple[dict, dict]:
+    """Which typed figure (#222) covers which piece of a merged charge.
+
+    A figure typed on the merged card is the whole plug-in's; one typed on a row's own card before
+    the merge is that row's, and a piece merged in afterwards is covered by neither. The rows cannot
+    tell these apart by themselves, so `set_charge_gross_kwh` writes it down at the only moment it
+    is known: `gross_kwh_from` on every row a figure covers names the row that holds it. Merging
+    and unmerging rewrite nothing, so the scope survives both, in either direction.
+
+    Returns ({holder id: holder row}, {holder id or None: [pieces it covers]}). A row whose
+    `gross_kwh_from` names a row that is here and holds a figure is covered by that figure — even
+    when it holds a figure of its own (typed before the merge, then superseded by one typed on the
+    merged card: the older figure stays on its row, so an unmerge gives it back, and counts for
+    nothing while it is covered). Otherwise a row holding a figure is covered by its own, and a row
+    holding none is covered by none — it bills on its own rule, like before it was merged."""
+    holders = {p.get("id"): p for p in pieces if (p.get("gross_kwh") or 0) > 0}
+    covered: dict = {}
+    for p in pieces:
+        src = p.get("gross_kwh_from")
+        if src not in holders:
+            src = p.get("id") if p.get("id") in holders else None
+        covered.setdefault(src, []).append(p)
+    return {src: holders[src] for src in covered if src is not None}, covered
+
+
 def _billed_kwh(c) -> float:
     """The energy figure SHOWN (and billed) for a charge — what came OUT of the charger:
 
         wallbox counter (measured)  →  the charger's own kWh (#222, typed)  →  battery kWh
 
     Single source of truth so the per-charge card, the period totals, get_charge_stats and the
-    Ricariche calendar all agree. Mirrors the SQL CASE in get_charge_stats and the card's `show_wb`
-    condition (charges.html). Same order as update_charge_type prices a charge, deliberately: the
+    Ricariche calendar all agree. The card leads with the same figure (charge_energy_view), and the
+    €/kWh on it divides by this. Same order as update_charge_type prices a charge, deliberately: the
     thing that billed you is the thing that delivered.
 
     ⚠️ The third branch is not a gross figure at all; it is the only number that exists for a charge
@@ -7338,14 +9512,53 @@ def _billed_kwh(c) -> float:
     Ricariche calendar had started saying "delivered" with the typed figure in it while this one
     still ignored it, and two totals under two words that mean the same thing is worse than one
     total that can be mistyped. It stays out of `_wac_blend`, which divides by the energy that
-    actually reached the battery — a trip consumes that, not what the meter saw."""
-    ac = c.get("ac_energy_kwh")
-    if c.get("location_type") == "HOME" and ac and ac > 0:
-        return ac
+    actually reached the battery — a trip consumes that, not what the meter saw.
+
+    ⚠️ A plug-in the car reported in PIECES (merged, `_charge_group_stats`) is the sum of the rule
+    over its pieces, NOT the rule over the group's summed columns: the meter may have measured one
+    piece and dropped the next as implausible (the poller does that), or the pieces may carry
+    different types (merging never changes them), and on the summed columns "HOME with a counter"
+    billed the metered piece alone — 12 kWh for 12 + 5, the same charge that read 17 before it was
+    merged. A typed figure counts once for the pieces it covers (`_gross_figures` says which) —
+    unless a home meter measured every one of them, which beats a typed figure exactly as on a
+    single charge — and every piece no figure covers counts on its own rule beside it."""
+    pieces = c.get("_pieces")
+    if pieces:
+        holders, covered = _gross_figures(pieces)
+        total = 0.0
+        for src, ps in covered.items():
+            if src is None or all(_metered_at_home(p) for p in ps):
+                total += sum(_billed_kwh(p) for p in ps)
+            else:
+                total += holders[src]["gross_kwh"]
+        return total
+    if _metered_at_home(c):
+        return c["ac_energy_kwh"]
     g = c.get("gross_kwh")
     if g and g > 0:
         return g
     return c.get("energy_added_kwh") or 0
+
+
+def billed_basis(c) -> str:
+    """'delivered' or 'battery' — WHICH kilowatt-hours `_billed_kwh` just divided by.
+
+    #346: the €/kWh on a charge card divides by `_billed_kwh`, and the card above it leads with
+    `charge_energy_view`'s headline. On a public charge with the column's own figure typed in the two
+    differ — headline 'battery' (41,2 kWh in the pack) while the rate divides by the typed 47,28 —
+    so labelling the rate from the headline would have put the wrong word under a right number,
+    which is the defect it was meant to fix, mirrored.
+
+    Read from the same three branches as the figure, immediately above, so the word and the number
+    cannot drift. A merged plug-in says 'battery' only when every piece contributed its battery
+    figure."""
+    pieces = c.get("_pieces")
+    if pieces:
+        return "battery" if all(billed_basis(p) == "battery" for p in pieces) else "delivered"
+    if _metered_at_home(c):
+        return "delivered"
+    g = c.get("gross_kwh")
+    return "delivered" if (g and g > 0) else "battery"
 
 
 def price_coverage(cost_total, kwh_priced, priced_n, total_n) -> dict:
@@ -7481,12 +9694,21 @@ def get_charges_grouped(station: str | None = None) -> list[dict]:
     return list(years.values())
 
 
-def _localized_charges(charges: list[dict]) -> list[dict]:
+def _localized_charges(charges: list[dict], with_window: bool = True) -> list[dict]:
     """Per-charge localization shared by the Charges calendar and search: local start/end
     times + the real-charging-window display, same convention get_charges_grouped applies
     inline — so charge_card.html renders identically wherever it's included. Adds a private
     `_dt` (aware, local-tz datetime) for the caller's OWN day/date bucketing or filtering;
     never rendered, so its presence in the dict is harmless to charge_card.html.
+
+    `with_window=False` skips `active_window` — one query against `positions` per charge,
+    the whole cost of this function on an install with any real history — for a caller that
+    only needs the cheap fields (`_dt`, localized start/end, `km_since_prev`). Filter or
+    bucket the FULL history with that first, and only re-run this WITH the window on the
+    handful of charges actually going to the page (see get_charges_calendar_day,
+    search_charges) — computing it for every charge just to draw a month's day-counts, or to
+    throw away everything but one day or one search's worth, was the whole reason opening
+    Charges or a calendar day went from milliseconds to tens of seconds as the history grew.
 
     🔴 This is where the kilometres-since-the-last-charge land, and finding that out cost a
     round trip through a running container: the figure was first attached in
@@ -7503,7 +9725,8 @@ def _localized_charges(charges: list[dict]) -> list[dict]:
         dt = _local_dt(c["started_at"])
         if dt is None:
             continue
-        c["active_window"] = _charge_window_display(db, c.get("started_at"), c.get("ended_at"))
+        if with_window:
+            c["active_window"] = _charge_window_display(db, c.get("started_at"), c.get("ended_at"))
         c["started_at"] = dt.isoformat()
         c["ended_at"] = _local_iso(c.get("ended_at"))
         c["_dt"] = dt
@@ -7513,12 +9736,15 @@ def _localized_charges(charges: list[dict]) -> list[dict]:
     return out
 
 
-def search_results_total_charges(charges: list) -> dict:
-    """Totals for a list of SEARCHED charges — the same figures the calendar's month strip shows,
-    over whatever the filters selected (disc #263, @joeyoong: his electricity is billed 22nd→21st,
-    and the date filters could already pick that period while the results totalled nothing).
+def charges_totals(charges: list) -> dict:
+    """Totals for an arbitrary set of charges: the calendar's month strip, each day of the month and
+    the searched period (disc #263, @joeyoong: his electricity is billed 22nd→21st, and the date
+    filters could already pick that period while the results totalled nothing). One function, as
+    `trips_totals` is for trips, so two lines centimetres apart cannot disagree about the same charges.
 
-    Uses `_billed_kwh` so the delivered side matches the month strip and the per-charge card exactly;
+    `kwh` is the DELIVERED side (`_billed_kwh`: the wallbox counter, the charger's own kWh where the
+    owner typed it, the battery figure where neither exists) and `battery_kwh` what reached the
+    battery; the strip prints both whenever they differ, because the gap IS the conversion loss.
     `has_cost` keeps a period where nothing is priced from printing a confident 0.00."""
     total = {"count": 0, "kwh": 0.0, "battery_kwh": 0.0, "cost": 0.0, "has_cost": False}
     for c in charges:
@@ -7546,43 +9772,40 @@ def get_charges_calendar_month(year: int, month: int, station: str | None = None
     cost landed on each day of `year`/`month` (local time, same billed-kWh convention as
     get_charges_grouped) plus the month's own total — the grid only needs counts, the
     day's actual charges are fetched lazily (see get_charges_calendar_day) when a cell is
-    clicked, so a month never ships more than ~31 small numbers to the template."""
-    charges = _localized_charges(get_charges(limit=1_000_000))
+    clicked, so a month never ships more than ~31 small numbers to the template. Never reads
+    `active_window` — with_window=False skips computing it for the whole history just to sum
+    counts/kWh/cost per day."""
+    charges = _localized_charges(get_charges(limit=1_000_000), with_window=False)
     if station:
         charges = _filter_by_station(charges, station)
-    days: dict[int, dict] = {}
-    total = {"count": 0, "kwh": 0.0, "battery_kwh": 0.0, "cost": 0.0, "has_cost": False}
-    for c in charges:
-        dt = c["_dt"]
-        if dt.year != year or dt.month != month:
-            continue
-        d = days.setdefault(dt.day, {"count": 0, "kwh": 0.0, "battery_kwh": 0.0,
-                                     "cost": 0.0, "has_cost": False})
-        # `kwh` is the DELIVERED side — the wallbox counter, the charger's own kWh where the owner
-        # typed it, the battery figure where neither exists. The month strip says so in words and
-        # puts the battery total beside it, because the gap between the two IS the conversion loss:
-        # a bare "154.93 kWh" with no label was neither one thing nor the other.
-        kwh = _billed_kwh(c)
-        batt = c.get("energy_added_kwh") or 0
-        for node in (d, total):
-            node["kwh"] = round(node["kwh"] + kwh, 2)
-            node["battery_kwh"] = round(node["battery_kwh"] + batt, 2)
-            node["count"] += 1
-            if c.get("cost") is not None:
-                node["cost"] = round(node["cost"] + (c["cost"] or 0), 2)
-                node["has_cost"] = True
-    return {"year": year, "month": month, "days": days, "total": total}
+    charges = [c for c in charges if c["_dt"].year == year and c["_dt"].month == month]
+    by_day = sorted(charges, key=lambda c: c["_dt"].day)     # stable: a day's charges keep their order
+    days = {d: charges_totals(list(cs)) for d, cs in groupby(by_day, key=lambda c: c["_dt"].day)}
+    return {"year": year, "month": month, "days": days, "total": charges_totals(charges)}
 
 
-def get_charges_calendar_day(year: int, month: int, day: int, station: str | None = None) -> list[dict]:
-    """The charge_card.html-ready charges for ONE calendar day — backs the Month view's
-    day drawer, most-recent-first."""
-    charges = _localized_charges(get_charges(limit=1_000_000))
+def get_charges_calendar_day(year: int, month: int, day: int, station: str | None = None,
+                             to_day: "int | None" = None) -> list[dict]:
+    """The charge_card.html-ready charges for ONE calendar day, or for `day`..`to_day` of the month —
+    backs the Month view's day drawer, most-recent-first.
+
+    Two passes on purpose: with_window=False picks out WHICH charges belong to this one day
+    from the cheap fields alone, and only THOSE few go through _localized_charges again to add
+    `active_window` — the expensive half, one query per charge. Running it on the whole history
+    just to keep one day's worth was the difference between this taking milliseconds and tens of
+    seconds on a real install (see _localized_charges)."""
+    cheap = _localized_charges(get_charges(limit=1_000_000), with_window=False)
     if station:
-        charges = _filter_by_station(charges, station)
-    charges = [c for c in charges
-               if c["_dt"].year == year and c["_dt"].month == month and c["_dt"].day == day]
+        cheap = _filter_by_station(cheap, station)
+    last = to_day or day
+    ids = {c["id"] for c in cheap
+           if c["_dt"].year == year and c["_dt"].month == month and day <= c["_dt"].day <= last}
+    if not ids:
+        return []
+    raw = [c for c in get_charges(limit=1_000_000) if c["id"] in ids]
+    charges = _localized_charges(raw)
     charges.sort(key=lambda c: c["started_at"], reverse=True)
+    charge_places(charges)
     return charges
 
 
@@ -7592,14 +9815,19 @@ def search_charges(text: str = "", charge_type: str = "",
                     date_from: str = "", date_to: str = "",
                     station: str | None = None) -> list[dict]:
     """Flat, most-recent-first list of charges matching ALL given filters — the Ricariche
-    search bar. `text` matches the station name OR the user note (substring, case-
-    insensitive); `charge_type` is a location_type key (AC/FAST/HPC/HOME/FREE/MANUAL);
-    the kWh/cost filters compare against the SAME billed figure the card shows
-    (_billed_kwh); `date_from`/`date_to` are inclusive "YYYY-MM-DD" LOCAL calendar dates.
+    search bar. `text` matches the note, the station, a charging place's name or the address
+    (substring, case-insensitive; see charge_places); `charge_type` is a location_type key
+    (AC/FAST/HPC/HOME/FREE), or MANUAL; the kWh/cost filters compare against the SAME billed figure
+    the card shows (_billed_kwh); `date_from`/`date_to` are inclusive "YYYY-MM-DD" LOCAL calendar dates.
     Loads the full history like get_charges_grouped (#67 — no default limit may hide
     older charges) and filters in Python — same convention as the calendar/accordion,
-    no SQL date-math needed since _local_dt already localizes the timezone."""
-    charges = _localized_charges(get_charges(limit=1_000_000))
+    no SQL date-math needed since _local_dt already localizes the timezone.
+
+    Filters on the cheap pass first (with_window=False — none of the filters below read
+    `active_window`) and only re-localizes WITH it for whatever survives, same reasoning as
+    get_charges_calendar_day: the alternative pays for every charge in the whole history on
+    every search, most of which the filters are about to throw away."""
+    charges = _localized_charges(get_charges(limit=1_000_000), with_window=False)
     if station:
         charges = _filter_by_station(charges, station)
     q = (text or "").strip().lower()
@@ -7612,12 +9840,16 @@ def search_charges(text: str = "", charge_type: str = "",
         d_to = date.fromisoformat(date_to) if date_to else None
     except ValueError:
         d_to = None
+    if q:
+        charge_places(charges)
     out = []
     for c in charges:
-        if q and q not in (c.get("location_name") or "").lower() \
-             and q not in (c.get("note") or "").lower():
+        if q and q not in c["search_text"].lower():
             continue
-        if ctype and (c.get("location_type") or "") != ctype:
+        # MANUAL is not a type any more but it is still a filter: the charges priced by hand with
+        # no type, the ones the badge calls "✎ Manual" (add-on #2) — old placeholder and new alike.
+        if ctype and not (is_manual_charge(c) if ctype == "MANUAL"
+                          else (c.get("location_type") or "") == ctype):
             continue
         kwh = _billed_kwh(c)
         if kwh_min is not None and kwh < kwh_min:
@@ -7635,12 +9867,31 @@ def search_charges(text: str = "", charge_type: str = "",
         if d_to and day > d_to:
             continue
         out.append(c)
+    ids = {c["id"] for c in out}
+    if not ids:
+        return []
+    raw = [c for c in get_charges(limit=1_000_000) if c["id"] in ids]
+    out = _localized_charges(raw)
     out.sort(key=lambda c: c["started_at"], reverse=True)
+    charge_places(out)
     return out
 
 
 def get_stats_summary() -> dict:
     db = _get()
+    # The average and the kilometres under it count a trip only where the CLOUD measured its
+    # energy — on a RANGE-EXTENDER, where this pair is the one the page calls battery-only and
+    # measured (beta #43 @michapr). `efficiency_kwh_100km` starts life as ΔSoC × capacity written
+    # by the poller at trip end and is overwritten by the getEC figure only when the cloud answers,
+    # so without this the "measured" average quietly averaged estimates too: on his bundle 4 trips,
+    # 5 km of 625, 14.30 against 14.26.
+    # NOT applied to a full-electric car: there the label promises nothing about the source, every
+    # trip carries an efficiency, and dropping the ones the cloud never covered would shrink the
+    # average's reach for no claim it has to keep.
+    measured = (" AND ec_kwh IS NOT NULL"
+                if (is_reev_car() and _trips_have_ec(db)) else "")
+    # A 0.0 the battery does not vouch for is no figure here either, as the group path has it.
+    measured += f" AND NOT {ZERO_UNVOUCHED_SQL}"
     trips = db.execute(
         """SELECT
                COUNT(*)                                                       AS trip_count,
@@ -7657,19 +9908,18 @@ def get_stats_summary() -> dict:
                -- SUM(ec_kwh) said 41.6, and could not trace the difference to anything on screen.
                -- With ec as the fallback those trips contribute what the CAR measured, and a BEV,
                -- whose trips all carry an efficiency, sees no change at all.
-               ROUND(SUM(CASE WHEN efficiency_kwh_100km IS NOT NULL
-                                   THEN distance_km * efficiency_kwh_100km / 100.0
-                              WHEN ec_kwh IS NOT NULL AND ec_stable = 1 THEN ec_kwh END), 2)
-                                                                             AS total_kwh_used,
+               ROUND(SUM({ENERGY_USED}), 2)                                AS total_kwh_used,
                -- …and how much of the driving that figure could speak for, so the page can say so
                -- rather than leave the reader to wonder.
-               SUM(CASE WHEN efficiency_kwh_100km IS NOT NULL
+               SUM(CASE WHEN {UNVOUCHED} THEN 0
+                        WHEN efficiency_kwh_100km IS NOT NULL
                           OR (ec_kwh IS NOT NULL AND ec_stable = 1) THEN 1 ELSE 0 END) AS energy_trips,
                -- The DISTANCE behind that count, because the count alone makes a bad gate: two
                -- stray zero-kilometre trips would put "338 of 340" on every BEV for ever, about
                -- driving that never happened. The note is worth showing when real kilometres are
                -- missing from the total, and the count is what it then says.
-               ROUND(SUM(CASE WHEN efficiency_kwh_100km IS NOT NULL
+               ROUND(SUM(CASE WHEN {UNVOUCHED} THEN NULL
+                              WHEN efficiency_kwh_100km IS NOT NULL
                           OR (ec_kwh IS NOT NULL AND ec_stable = 1) THEN distance_km END), 1)
                                                                              AS energy_km,
                -- Reconstructed trips are left OUT of the clock and stay in everything else. Their
@@ -7684,14 +9934,15 @@ def get_stats_summary() -> dict:
                -- distance-weighted = total energy / total distance (#42): a simple AVG
                -- over-weights short trips and disagreed with both the Trips-page header
                -- and this page's own "energy used ÷ distance". Matches get_trips_summary.
-               ROUND(SUM(distance_km * efficiency_kwh_100km) /
-                     NULLIF(SUM(CASE WHEN efficiency_kwh_100km IS NOT NULL
+               ROUND(SUM(CASE WHEN efficiency_kwh_100km IS NOT NULL{MEASURED}
+                                   THEN distance_km * efficiency_kwh_100km END) /
+                     NULLIF(SUM(CASE WHEN efficiency_kwh_100km IS NOT NULL{MEASURED}
                                      THEN distance_km END), 0), 1)           AS avg_efficiency,
                -- The kilometres that average actually covers. Not the same as the total on a
                -- range-extender, where a generator trip has no efficiency to average: 13.9 kWh/100km
                -- over 272 of 434 km is a different statement from 13.9 over all of them, and the
                -- card used to make the second one.
-               ROUND(SUM(CASE WHEN efficiency_kwh_100km IS NOT NULL
+               ROUND(SUM(CASE WHEN efficiency_kwh_100km IS NOT NULL{MEASURED}
                               THEN distance_km END), 1)                      AS avg_efficiency_km,
                -- "Best" must come from a real trip, not a 3 km downhill coast or a glitch frame
                -- (#86): a min-distance floor keeps this metric representative of the car.
@@ -7700,20 +9951,33 @@ def get_stats_summary() -> dict:
                ROUND(SUM(regen_kwh), 2)                                      AS total_regen_kwh,
                ROUND(AVG(regen_kwh), 2)                                      AS avg_regen_kwh,
                MIN(started_at)                                               AS _since_trip
-           FROM trips WHERE vehicle_id = COALESCE(?, vehicle_id) AND ended_at IS NOT NULL""",
+           FROM trips WHERE vehicle_id = COALESCE(?, vehicle_id) AND ended_at IS NOT NULL"""
+        .replace("{MEASURED}", measured).replace("{ENERGY_USED}", TRIP_ENERGY_USED_SQL)
+        .replace("{UNVOUCHED}", ZERO_UNVOUCHED_SQL),
         (_current_vehicle_id(),)
     ).fetchone()
     charges = db.execute(
         """SELECT
                COUNT(*)                         AS charge_count,
-               ROUND(SUM(energy_added_kwh), 2)  AS total_kwh_charged,
+               ROUND(SUM(energy_added_kwh), 2)  AS total_kwh_battery,
                ROUND(SUM(cost), 2)              AS total_cost,
                MIN(ended_at)                    AS _since_charge
            FROM charges WHERE vehicle_id = COALESCE(?, vehicle_id) AND ended_at IS NOT NULL""",
         (_current_vehicle_id(),)
     ).fetchone()
     t = dict(trips) if trips else {}
+    merged = _merged_trip_statistics(db)
+    if merged is not None:
+        t.update(merged[1])
+    # Driving time/excluded reconstructed durations and total regen stay per-segment:
+    # merging must not turn a reconstructed segment's blackout into measured driving.
     c = dict(charges) if charges else {}
+    # The energy charged is the BILLED one — `_billed_kwh`, the rule every other total on every
+    # other page sums by — with what reached the battery beside it. It was the battery sum alone
+    # here, the one total in Mate computed by a rule of its own. Over the merged sessions, not the
+    # stored rows, for the reason get_charge_stats gives: a typed figure covers the whole plug-in.
+    groups = get_charges(limit=1_000_000)
+    c["total_kwh_charged"] = round(sum(_billed_kwh(g) for g in groups), 2) if groups else None
     total_kwh = t.get("total_kwh_used") or 0
     total_regen = t.get("total_regen_kwh") or 0
     t["regen_pct"] = round(total_regen / total_kwh * 100, 1) if total_kwh > 0 else None
@@ -7729,28 +9993,14 @@ def get_stats_summary() -> dict:
 
 def get_charge_stats() -> dict:
     db = _get()
-    # The middle branch only exists where the column does — see _charges_have_gross.
-    _g = ("WHEN gross_kwh IS NOT NULL AND gross_kwh > 0 THEN gross_kwh "
-          if _charges_have_gross(db) else "")
     row = db.execute(
-        f"""SELECT
+        """SELECT
                COUNT(*)                            AS session_count,
-               -- billed energy, in _billed_kwh's own order: the wallbox counter, then the
-               -- charger's own kWh where the owner typed it (#222), then the battery
-               ROUND(SUM(CASE WHEN location_type='HOME' AND ac_energy_kwh IS NOT NULL AND ac_energy_kwh > 0
-                              THEN ac_energy_kwh
-                              {_g}
-                              ELSE energy_added_kwh END), 2)  AS total_kwh,
+               -- what reached the battery, said beside the billed total (the month strip's pair)
+               ROUND(SUM(energy_added_kwh), 2)    AS battery_kwh,
                ROUND(AVG(duration_min / 60.0), 1) AS avg_duration_h,
                ROUND(SUM(cost), 2)                AS total_cost,
-               -- the SAME billed energy, but only over the charges that HAVE a cost: the €/kWh
-               -- divides by this, never by total_kwh (see price_coverage)
                COUNT(cost)                        AS priced_count,
-               ROUND(SUM(CASE WHEN cost IS NOT NULL THEN
-                              CASE WHEN location_type='HOME' AND ac_energy_kwh IS NOT NULL AND ac_energy_kwh > 0
-                                   THEN ac_energy_kwh
-                                   {_g}
-                                   ELSE energy_added_kwh END END), 2) AS priced_kwh,
                ROUND(AVG(end_soc - start_soc), 1) AS avg_soc_delta,
                ROUND(MAX(max_power_kw), 2)        AS peak_power_kw
            FROM charges
@@ -7760,13 +10010,29 @@ def get_charge_stats() -> dict:
     if not row:
         return {}
     d = dict(row)
-    # Four of those figures COUNT or AVERAGE charges, and a plug-in the car split into several rows
-    # would count several times: the session tally, the €/kWh denominator, and the two averages.
-    # They are recomputed over the composed groups. The SUMs above are left alone — a group's
-    # pieces sum to the group, so including the children is not just harmless, it is required.
+    # Several of those figures are wrong over the stored rows once a plug-in the car split into
+    # several rows has been merged, so they are computed over the composed groups instead: the
+    # session tally and the two averages would count the pieces several times, and the two billed
+    # sums are not plain sums at all. The plain SUMs above are the ones a group's pieces really add
+    # up to (the battery kWh, the money), so there the children are not just harmless, they are
+    # required.
+    #
+    # ⚠️ `total_kwh`: the charger's own kWh (#222) is typed for the WHOLE plug-in and stored on the
+    # parent alone, so applying `_billed_kwh` row by row adds the children's battery kWh to a figure
+    # that already covers them — 10 + 5 kWh in the battery and 30 typed came out as 35, while the
+    # card, the calendar and the AC/DC split (all over the groups) said 30. Same rule, over the
+    # same groups.
+    # ⚠️ `priced_kwh` is conditional on `cost IS NOT NULL`, and that condition does not survive the
+    # split either. A group priced by a MANUAL total (or a typed #222 gross) keeps the whole cost on
+    # the parent and writes cost=NULL on the children by design — so the children's kWh were dropped
+    # from the denominator while all their euros stayed in the numerator, and the "€/kWh actually
+    # paid" card read 0,60 for 15 kWh bought at 0,40.
     groups = get_charges(limit=1_000_000)
     d["session_count"] = len(groups)
+    d["total_kwh"] = round(sum(_billed_kwh(g) for g in groups), 2) if groups else None
     d["priced_count"] = sum(1 for g in groups if g.get("cost") is not None)
+    prezzati = [_billed_kwh(g) for g in groups if g.get("cost") is not None]
+    d["priced_kwh"] = round(sum(prezzati), 2) if prezzati else None
     # A reconstructed charge has no duration to average: `duration_min` there is the length of the
     # BLACKOUT the SoC jump was found across, not of any charging. On the real database 27 observed
     # charges average 193 min, and the single reconstructed #55 (1091.5 min) pushed the card to
@@ -7787,6 +10053,34 @@ def get_charge_stats() -> dict:
 
 
 _OFFLINE_GAPS_SHOWN = 20
+
+
+def _recovered_in_window(started_at: str, ended_at: str) -> float:
+    """Kilometres of this silence that Leapmotor's own trip history has since given back (#298,
+    @arzthilfe). He asked the right question: eight of his eleven missing kilometres came back as
+    imported trips, and the figure above them did not move.
+
+    It still should not move — those kilometres WERE covered out of contact, which is what the
+    figure counts, and the silence they sit in is still not divisible into drive, stop and drive.
+    What was missing is the other half of the sentence: how much of it is no longer a mystery. So
+    this is reported beside the measurement, never subtracted from it.
+
+    Only trips wholly inside the window, and only ones the cloud gave a distance: a record the
+    cloud itself returns with 0 km accounts for nothing. A partial overlap is left out — the window
+    bounds the silence, not the drive, so a trip crossing its edge cannot say how much of itself
+    belongs inside."""
+    db = _get()
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                      "AND name='api_lab_cloud_trip_links'").fetchone():
+        return 0.0
+    row = db.execute(
+        "SELECT COALESCE(SUM(t.distance_km), 0) FROM trips t"
+        "  JOIN api_lab_cloud_trip_links l ON l.trip_id = t.id"
+        " WHERE t.vehicle_id = COALESCE(?, t.vehicle_id) AND t.merged_into_id IS NULL"
+        "   AND COALESCE(t.distance_km, 0) > 0"
+        "   AND t.started_at >= ? AND COALESCE(t.ended_at, t.started_at) <= ?",
+        (_current_vehicle_id(), started_at, ended_at)).fetchone()
+    return round(row[0] or 0.0, 1)
 
 
 def offline_gaps_summary(year: Optional[int] = None, month: Optional[int] = None) -> dict:
@@ -7811,7 +10105,7 @@ def offline_gaps_summary(year: Optional[int] = None, month: Optional[int] = None
     The window list is capped and the cap is REPORTED: a silent truncation reads as "these are all
     of them" when it is not."""
     empty = {"count": 0, "total_km": 0.0, "total_soc": 0.0, "total_kwh": 0.0,
-             "cost": None, "avg_price": None, "windows": [], "shown": 0}
+             "cost": None, "avg_price": None, "windows": [], "shown": 0, "recovered_km": 0.0}
     try:
         rows = _get().execute(
             "SELECT started_at, ended_at, distance_km, soc_start, soc_end, energy_kwh"
@@ -7843,21 +10137,70 @@ def offline_gaps_summary(year: Optional[int] = None, month: Optional[int] = None
     windows = [{"start": r["started_at"], "end": r["ended_at"],
                 "km": r["distance_km"], "soc": round(max((r["soc_start"] or 0)
                                                          - (r["soc_end"] or 0), 0.0), 1),
-                "kwh": r["energy_kwh"]} for r in rows][-_OFFLINE_GAPS_SHOWN:]
+                "kwh": r["energy_kwh"],
+                "recovered_km": _recovered_in_window(r["started_at"], r["ended_at"])}
+               for r in rows][-_OFFLINE_GAPS_SHOWN:]
     return {"count": len(rows), "total_km": total_km, "total_soc": total_soc,
             "total_kwh": total_kwh, "cost": cost, "avg_price": avg_price,
-            "windows": windows, "shown": len(windows)}
+            "windows": windows, "shown": len(windows),
+            "recovered_km": round(sum(_recovered_in_window(r["started_at"], r["ended_at"])
+                                      for r in rows), 1)}
 
 
 def get_ac_dc_stats() -> dict:
     """Count + energy of AC vs DC charge sessions. DC = charge_type 'DC', or (when not
-    set) a measured peak power above 11 kW (AC tops out at ~11 kW; DC is faster)."""
+    set) a measured peak power above 11 kW (AC tops out at ~11 kW; DC is faster). `total`
+    counts every finished charge regardless of confirmation — AC vs DC is a measured,
+    objective fact the poller already records for all of them, confirmed or not.
+
+    `home_count`/`home_kwh`, `public_count`/`public_kwh` and `unconfirmed_count`/`unconfirmed_kwh`
+    are the OTHER, independent axis this feeds (the "Home vs Public" card) — `location_type`, not
+    `charge_type`. `home_count + public_count + free_count + manual_count + unconfirmed_count`
+    always equals `total`, by construction: every charge lands in exactly one.
+
+    `free_count`/`free_kwh` are the charges typed FREE (a public charger that costs nothing): carved
+    OUT of public rather than counted twice, so the card can show them as their own slice — only
+    when there are any. A HOME charge flagged free (#120, solar) stays under Home, as the badge
+    itself keeps it there.
+
+    ⚠️ NOT nested under `ac` any more, and NOT gated on `is_dc`. It used to be — "every home
+    wallbox charges on AC" — which is true almost always, but the type badge itself offers every
+    type on every charge regardless of its OWN measured current: pick "Casa" on a DC-measured
+    session (a fast home charger, a noisy reading, whatever the real reason) and it was HOME by
+    every other measure in Mate, yet vanished from this card entirely — not home, not public, not
+    unconfirmed, and the card's own total fell a charge short of the page header's (found in
+    review, PR #284: "Ricariche 5" here, "Ricariche 6" on the header, on real test data). Home vs
+    Public is answered purely by `location_type`; whether that same charge also happens to be AC or
+    DC-measured is a completely separate question, answered by `ac`/`dc` above.
+
+    `public_count`/`public_kwh` are NOT `total - home_count`: unlike AC/DC, "was this at home" is
+    unknown for anything not yet confirmed — a charge still `location_type IS NULL`, or stuck on
+    the legacy 'MANUAL' placeholder (see the MANUAL/cost_manual split), is neither known-home nor
+    known-public, so counting it as public by subtraction silently mislabelled it (found in review:
+    a MANUAL charge made at home showed up as "Pubblica"). Only a charge with a real, confirmed,
+    non-HOME type counts as public.
+
+    `manual_count`/`manual_kwh` are the charges priced by hand with no type (`is_manual_charge`):
+    not public — a Manual charge made at home is not — and not waiting either, because the owner
+    already answered with the price (add-on #2).
+
+    `unconfirmed_count`/`unconfirmed_kwh` are that same not-yet-known remainder, made explicit.
+    Without it the Home vs Public card's OWN donut (fed only `[home_count, public_count]`) silently
+    normalised its percentages against just those two numbers instead of `total`, so on real data
+    (1 confirmed public charge, 3 still unconfirmed) the ring showed "100% Pubblica" while the text
+    beside it, dividing by `total`, correctly said 25% — two disagreeing numbers on one card, and
+    the 3 unconfirmed charges nowhere in it at all (found in review, PR #284)."""
     # Read the composed charges, not the stored rows. Excluding merged children from a query here
     # would have counted right and lost their kilowatt-hours — the split pieces would simply stop
     # being AC or DC energy at all. The group carries both: one session, all the energy.
     rows = get_charges(limit=1_000_000)
     ac = {"count": 0, "kwh": 0.0}
     dc = {"count": 0, "kwh": 0.0}
+    home_count, home_kwh = 0, 0.0
+    public_count, public_kwh = 0, 0.0
+    free_count, free_kwh = 0, 0.0
+    manual_count, manual_kwh = 0, 0.0
+    unconfirmed_count, unconfirmed_kwh = 0, 0.0
     for r in rows:
         ct = r["charge_type"]
         is_dc = ct == "DC" or (ct is None and (r["max_power_kw"] or 0) > 11)
@@ -7867,10 +10210,32 @@ def get_ac_dc_stats() -> dict:
         # ENERGIA TOTALE right below summed the billed one — two totals on ONE screen that did not
         # add up, off by the whole conversion loss (19.4 kWh on the test data). Older than today's
         # change; it just became impossible to miss once the totals beside it agreed.
-        b["kwh"] += _billed_kwh(dict(r))
+        kwh = _billed_kwh(dict(r))
+        b["kwh"] += kwh
+        lt = r["location_type"]
+        if lt == "HOME":            # regardless of is_dc — a real, confirmed type either way
+            home_count += 1
+            home_kwh += kwh
+        elif lt == "FREE":          # public and costless: its own slice, not folded into "public"
+            free_count += 1
+            free_kwh += kwh
+        elif lt in CHARGE_TYPES:    # a real, confirmed type other than HOME — genuinely public
+            public_count += 1
+            public_kwh += kwh
+        elif is_manual_charge(r):   # priced by hand, no type: answered, but not where (add-on #2)
+            manual_count += 1
+            manual_kwh += kwh
+        else:                       # NULL, or the legacy 'MANUAL' placeholder unpriced — not yet known
+            unconfirmed_count += 1
+            unconfirmed_kwh += kwh
     ac["kwh"] = round(ac["kwh"], 2)
     dc["kwh"] = round(dc["kwh"], 2)
-    return {"ac": ac, "dc": dc, "total": ac["count"] + dc["count"]}
+    return {"ac": ac, "dc": dc, "total": ac["count"] + dc["count"],
+            "home_count": home_count, "home_kwh": round(home_kwh, 2),
+            "public_count": public_count, "public_kwh": round(public_kwh, 2),
+            "free_count": free_count, "free_kwh": round(free_kwh, 2),
+            "manual_count": manual_count, "manual_kwh": round(manual_kwh, 2),
+            "unconfirmed_count": unconfirmed_count, "unconfirmed_kwh": round(unconfirmed_kwh, 2)}
 
 
 # ── Monthly report (driving + charging + cost, one month) ──────────────────────
@@ -7884,7 +10249,7 @@ def _month_shift(month_key: str, delta: int) -> str:
 
 def _report_bucket() -> dict:
     return {
-        "trip_count": 0, "total_km": 0.0, "total_kwh_used": 0.0,
+        "trip_count": 0, "total_km": 0.0, "total_kwh_used": 0.0, "_kwh": [],
         "regen_kwh": 0.0, "drive_min": 0.0,
         "_eff_wsum": 0.0, "_eff_wdist": 0.0, "avg_efficiency": None,
         "charge_count": 0, "charge_kwh": 0.0, "charge_cost": 0.0, "has_cost": False,
@@ -7910,6 +10275,10 @@ def _report_bucket() -> dict:
         "refuel_count": 0, "refuel_l": 0.0, "refuel_cost": 0.0,
         "home":   {"count": 0, "kwh": 0.0, "cost": 0.0},
         "public": {"count": 0, "kwh": 0.0, "cost": 0.0},
+        # Priced by hand with no type (`is_manual_charge`) — the same fourth count as the Home vs
+        # Public card. It used to split in two here: the old Manual type fell into "public" (any
+        # truthy location_type did) and a price typed with the pencil into "unconfirmed" (add-on #2).
+        "manual": {"count": 0, "kwh": 0.0, "cost": 0.0},
         "_days": {},   # day-of-month -> {"km": float, "cost": float}
     }
 
@@ -7931,10 +10300,11 @@ def _collect_monthly_buckets() -> dict:
             continue
         b = buckets.setdefault(dt.strftime("%Y-%m"), _report_bucket())
         km  = tr.get("distance_km") or 0
-        eff = tr.get("efficiency_kwh_100km")
+        figured = not zero_unvouched(tr)
+        eff = tr.get("efficiency_kwh_100km") if figured else None
         b["trip_count"]     += 1
         b["total_km"]       += km
-        b["total_kwh_used"] += km * (eff or 0) / 100.0
+        b["_kwh"].append(trip_energy_used(tr))
         b["regen_kwh"]      += tr.get("regen_kwh") or 0
         # Same rule as the Statistics card: a reconstructed trip's "duration" is the blackout it
         # was found across, so it never becomes driving time — here too, or the monthly report and
@@ -7960,16 +10330,17 @@ def _collect_monthly_buckets() -> dict:
         # Statistics pages divide by, so the three cannot print three different kWh/100km for one
         # month (beta #35, @michapr: the Report read 8.8 from ec_driving while the others read 10.1
         # from ec_kwh). Silvio's rule (05/08): always the total battery energy, never the driving
-        # slice. Only trips the cloud has answered for — a NULL/zero is "not measured yet", and
-        # counting its kilometres for free would drag the average down. Same truthy guard as _totals_add.
-        _ec = tr.get("ec_kwh")
-        if _ec and km > 0:
+        # slice. Only trips the cloud has answered for — a NULL is "not measured yet", and
+        # counting its kilometres for free would drag the average down. Same guard as _totals_add.
+        _ec = tr.get("ec_kwh") if figured else None
+        if _ec is not None and km > 0:
             b["_ec_kwh"] += _ec
             b["_ec_km"]  += km
         b["fuel_engine_km"] += tr.get("engine_km") or 0
 
+    charges_zone = _local_tz()          # once for the month's charges
     for c in get_charges(limit=1_000_000):
-        dt = _local_dt(c.get("started_at"))
+        dt = _local_dt(c.get("started_at"), charges_zone)
         if dt is None:
             continue
         b = buckets.setdefault(dt.strftime("%Y-%m"), _report_bucket())
@@ -7983,7 +10354,10 @@ def _collect_monthly_buckets() -> dict:
             b["has_cost"]     = True
             b["charge_count_priced"] += 1
             b["charge_kwh_priced"]   += kwh
-        grp = b["home"] if lt == "HOME" else (b["public"] if lt else None)
+        # Only the Manual charges move; everything else splits exactly as it always has, any
+        # non-empty type other than HOME on the public side.
+        grp = (b["home"] if lt == "HOME" else b["manual"] if is_manual_charge(c)
+               else b["public"] if lt else None)
         if grp is not None:
             grp["count"] += 1
             grp["kwh"]   += kwh
@@ -8017,6 +10391,7 @@ def _collect_monthly_buckets() -> dict:
         pass
 
     for b in buckets.values():
+        b["total_kwh_used"] = energy_used_total(b.pop("_kwh")) or 0.0
         if b["_eff_wdist"] > 0:
             b["avg_efficiency"] = round(b["_eff_wsum"] / b["_eff_wdist"], 1)
         # The measured twin, over EVERY trip the cloud answered for — generator ones included.
@@ -8026,11 +10401,11 @@ def _collect_monthly_buckets() -> dict:
         # the litres beside it are the other half of that answer.
         if b["_ec_km"] > 0:
             b["avg_efficiency_measured"] = round(b["_ec_kwh"] / b["_ec_km"] * 100, 1)
-        for k in ("total_km", "total_kwh_used", "regen_kwh", "charge_kwh", "charge_cost",
+        for k in ("total_km", "regen_kwh", "charge_kwh", "charge_cost",
                   "charge_kwh_priced", "fuel_cost_burned", "elec_cost_driven"):
             b[k] = round(b[k], 2)
         b["drive_min"] = int(round(b["drive_min"]))
-        for g in ("home", "public"):
+        for g in ("home", "public", "manual"):
             b[g]["kwh"]  = round(b[g]["kwh"], 2)
             b[g]["cost"] = round(b[g]["cost"], 2)
     return buckets
@@ -8152,7 +10527,92 @@ def get_battery_capacity_kwh() -> float:
         return 65.0
 
 
+def selected_is_first_vehicle() -> bool:
+    """Whether the car on screen is the install's first car, the one the install-wide settings that
+    predate the per-car columns belong to. True before any car is registered."""
+    vid = _current_vehicle_id()
+    if vid is None:
+        return True
+    try:
+        row = _get().execute("SELECT MIN(id) AS first FROM vehicles").fetchone()
+    except sqlite3.Error:
+        return True
+    return not row or row["first"] is None or row["first"] == vid
+
+
+def get_soh_reference_kwh() -> "float | None":
+    """The SELECTED car's SoH reference, the as-new capacity battery health is measured against, or
+    None when nobody has set one (the health page then uses the car's capacity).
+
+    🔴 #472 (@moon-phoenix4, a B10 and a B03X): the health page and the settings form read the one
+    install-wide `battery_capacity_nominal_kwh`, so setting the B03X's reference to its 53 kWh moved
+    the B10's too, while `vehicles.capacity_nominal_kwh` sat there per car. The install-wide value
+    predates that column and, like the install-wide capacity, belongs to the first car only."""
+    vid = _current_vehicle_id()
+    if vid is not None:
+        try:
+            row = _get().execute("SELECT capacity_nominal_kwh FROM vehicles WHERE id = ?", (vid,)).fetchone()
+            if row and row["capacity_nominal_kwh"]:
+                return float(row["capacity_nominal_kwh"])
+        except sqlite3.Error:
+            pass
+    if not selected_is_first_vehicle():
+        return None
+    try:
+        value = get_setting("battery_capacity_nominal_kwh", "")
+        return float(value) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
 _SCAN_MAX_KW = 250.0  # implied charge rate above this → spurious-SoC glitch, not a real charge
+# The moving-endpoint exception needs much stronger evidence than a parked SoC rise. An hour
+# without a new frame plus >=10 points is well outside ordinary polling gaps / BMS jitter.
+_SCAN_OFFLINE_MIN_GAP_S = 3600
+_SCAN_OFFLINE_MIN_RISE_PCT = 10.0
+_SCAN_OFFLINE_MAX_KM = 3.0       # only the short exit from a garage, never an unobserved long drive
+# Deliberately generous regen budget: 3 kWh/km exceeds even a lossless 3-tonne descent on a
+# 30% slope (~2.5 kWh/km). Add a whole kilometre for odometer quantisation / braking energy.
+# The net battery gain must EXCEED this budget; a distance allowance alone would admit regen.
+_SCAN_REGEN_KWH_PER_KM = 3.0
+_SCAN_ODOMETER_SLACK_KM = 1.0
+
+
+def _scan_offline_charge(a, b, capacity_kwh: float) -> bool:
+    """Conservative evidence of charging between two distinct frames, possibly still in D.
+
+    Rows between them must have been repeats (collapsed by the caller). Require both clocks
+    to show a long gap: a backdated frame or a recently replayed return cannot invent hours of
+    charging. No clocks / invalid telemetry means no exception to the parked-only scan.
+    """
+    try:
+        values = [a[k] for k in ("soc", "odometer_km", "frame_ts")]
+        values += [b[k] for k in ("soc", "odometer_km", "frame_ts")]
+        # The speed is only a sanity check: a missing one says nothing about a charge.
+        values += [r["speed_kmh"] for r in (a, b) if r["speed_kmh"] is not None]
+        if not all(v is not None and math.isfinite(v) for v in values):
+            return False
+        if not (0 < a["soc"] < b["soc"] <= 100 and a["odometer_km"] > 0
+                and a["frame_ts"] > 0 and b["frame_ts"] > a["frame_ts"]):
+            return False
+        if any(r["charging"] or r["gear"] not in ("P", "D", "R", "N")
+               or (r["speed_kmh"] or 0) < 0 for r in (a, b)):
+            return False
+        distance = b["odometer_km"] - a["odometer_km"]
+        rise = b["soc"] - a["soc"]
+        if not (0 <= distance <= _SCAN_OFFLINE_MAX_KM and rise >= _SCAN_OFFLINE_MIN_RISE_PCT):
+            return False
+        elapsed = (datetime.fromisoformat(b["recorded_at"])
+                   - datetime.fromisoformat(a["recorded_at"])).total_seconds()
+        frame_elapsed = (b["frame_ts"] - a["frame_ts"]) / 1000.0
+        gap_s = min(elapsed, frame_elapsed)
+        if gap_s < _SCAN_OFFLINE_MIN_GAP_S:
+            return False
+        energy = rise / 100.0 * capacity_kwh
+        regen_budget = (distance + _SCAN_ODOMETER_SLACK_KM) * _SCAN_REGEN_KWH_PER_KM
+        return regen_budget < energy <= _SCAN_MAX_KW * gap_s / 3600.0
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def scan_missed_charges(threshold: float = 2.0, apply: bool = False) -> list[dict]:
@@ -8168,8 +10628,12 @@ def scan_missed_charges(threshold: float = 2.0, apply: bool = False) -> list[dic
 
     Guards against false positives (which a one-shot silent migration could not afford,
     hence this is preview-then-confirm): parked at both ends (charging=0, speed<=1), the
-    odometer UNCHANGED across the whole run (so regen while driving offline can't look
-    like a charge), and no overlap with any existing charge window."""
+    odometer UNCHANGED across the whole run, and no overlap with any existing charge window.
+    A BEV may also qualify across a long gap between distinct frames with a short odometer
+    advance, but only when its net energy gain exceeds a generous regen budget. REEVs cannot
+    use that exception: their generator can explain a battery gain while out of contact.
+    As with offline_gaps, the interval bounds the silence, not the exact charging time, and
+    the net SoC gain cannot recover energy spent driving inside it."""
     db = _conn_rw() if apply else _get()
     # See get_vehicle(): an unordered LIMIT 1 rides the UNIQUE(vin) covering index and can name
     # the wrong car — and with apply=True this INSERTS charges, so it would file reconstructed
@@ -8178,19 +10642,35 @@ def scan_missed_charges(threshold: float = 2.0, apply: bool = False) -> list[dic
     if vehicle_id is None:
         return []
     rows = db.execute(
-        "SELECT recorded_at, soc, charging, speed_kmh, odometer_km, latitude, longitude "
-        "FROM positions WHERE vehicle_id=? AND soc IS NOT NULL ORDER BY recorded_at, id",
+        "SELECT recorded_at, soc, charging, speed_kmh, gear, frame_ts, odometer_km, latitude, longitude "
+        "FROM positions WHERE vehicle_id=? ORDER BY recorded_at, id",
         (vehicle_id,)).fetchall()
+    # A re-served frame is not a new observation. Keep when it FIRST arrived, like the recorder's
+    # last-fresh baseline for offline kilometres. Never bridge a fresh intermediate frame (even
+    # one lacking SoC), or collapse inconsistent payloads merely because their clock is stuck.
+    observations = []
+    frame_fields = ("frame_ts", "soc", "odometer_km", "speed_kmh", "gear", "charging")
+    for row in rows:
+        if (observations and row["frame_ts"]
+                and all(row[k] == observations[-1][k] for k in frame_fields)):
+            continue
+        observations.append(row)
+    rows = observations
     charges = db.execute(
         "SELECT started_at, ended_at FROM charges WHERE vehicle_id=?", (vehicle_id,)).fetchall()
     cap = get_battery_capacity_kwh()
+    allow_offline = not is_reev_car()
 
     def _parked(r):
         return (r["charging"] or 0) == 0 and (r["speed_kmh"] or 0) <= 1
 
     def _odo_same(a, b):
+        # A missing odometer proves nothing about the car standing still.
         oa, ob = a["odometer_km"], b["odometer_km"]
-        return oa is None or ob is None or abs(ob - oa) < 0.5
+        return oa is not None and ob is not None and abs(ob - oa) < 0.5
+
+    def _rising(a, b):
+        return a["soc"] is not None and b["soc"] is not None and b["soc"] > a["soc"]
 
     def _overlaps(start, end):
         for c in charges:
@@ -8200,18 +10680,37 @@ def scan_missed_charges(threshold: float = 2.0, apply: bool = False) -> list[dic
         return False
 
     candidates, i, n = [], 0, len(rows)
+
+    def _next_soc(k):
+        """The next frame the parked scan may compare against.
+
+        Frames the cloud gave no SoC for used to be excluded by the query itself. They are kept
+        now because the offline exception must SEE them — a fresh frame without SoC still proves
+        the car was in contact — but a parked rise observed across one must stay ONE charge.
+        """
+        while k < n and rows[k]["soc"] is None:
+            k += 1
+        return k
+
     while i < n - 1:
         a, b = rows[i], rows[i + 1]
-        if not (b["soc"] - a["soc"] > 0 and _parked(a) and _parked(b) and _odo_same(a, b)):
+        k = _next_soc(i + 1)
+        rise_to = rows[k] if k < n else None
+        parked_rise = (rise_to is not None and _rising(a, rise_to) and _parked(a)
+                       and _parked(rise_to) and _odo_same(a, rise_to))
+        if not (parked_rise or (allow_offline and _scan_offline_charge(a, b, cap))):
             i += 1
             continue
         # Extend the run while SoC keeps rising, parked, and the odometer never moves —
         # so one charge seen across several stale polls becomes ONE candidate, not many.
-        run_start, run_end, j = a, b, i + 1
-        while j < n - 1:
-            c, d = rows[j], rows[j + 1]
-            if d["soc"] - c["soc"] > 0 and _parked(c) and _parked(d) and _odo_same(run_start, d):
-                run_end, j = d, j + 1
+        run_start, run_end, j = (a, rise_to, k) if parked_rise else (a, b, i + 1)
+        while parked_rise and j < n - 1:
+            c, m = rows[j], _next_soc(j + 1)
+            if m >= n:
+                break
+            d = rows[m]
+            if _rising(c, d) and _parked(c) and _parked(d) and _odo_same(run_start, d):
+                run_end, j = d, m
             else:
                 break
         rise = run_end["soc"] - run_start["soc"]
@@ -8254,7 +10753,8 @@ _SOH_TOP_CUTOFF_SOC = 95.0    # above this the BMS re-anchors an LFP's counted S
 _SOH_SOC_BUDGET = 200.0       # how many SoC points the headline pools over (see get_battery_health)
 
 
-def _charge_energy_below_soc(db, start: str, end: str | None, cap_soc: float):
+def _charge_energy_below_soc(db, start: str, end: str | None, cap_soc: float,
+                             exclude_ids: tuple = ()):
     """(energy, SoC reached) for the part of a charge BELOW `cap_soc`, or None when there is none.
 
     ∫|V·I|dt over the logged samples (trapezoidal, signals 1177/1178 — the same source as the
@@ -8269,16 +10769,16 @@ def _charge_energy_below_soc(db, start: str, end: str | None, cap_soc: float):
     Truncating rather than discarding is the point. A charge to 100 % is the one that re-calibrates
     the pack and belongs in the history; only its last few points are excluded from the arithmetic."""
     if end:
-        lo, hi, excl = _power_window_bounds(db, start, end)
+        lo, hi, excl = _power_window_bounds(db, start, end, exclude_ids)
         rows = db.execute(
             "SELECT recorded_at, soc, charge_voltage_v, charge_current_a FROM positions "
-            "WHERE vehicle_id = COALESCE(?, vehicle_id) AND charging = 1 AND recorded_at >= ? "
+            "WHERE vehicle_id = COALESCE(?, vehicle_id) AND " + _charging_sample() + " AND recorded_at >= ? "
             "AND recorded_at " + ("<" if excl else "<=") + " ? ORDER BY recorded_at",
             (_current_vehicle_id(), lo, hi)).fetchall()
     else:
         rows = db.execute(
             "SELECT recorded_at, soc, charge_voltage_v, charge_current_a FROM positions "
-            "WHERE vehicle_id = COALESCE(?, vehicle_id) AND charging = 1 AND recorded_at >= ? "
+            "WHERE vehicle_id = COALESCE(?, vehicle_id) AND " + _charging_sample() + " AND recorded_at >= ? "
             "ORDER BY recorded_at", (_current_vehicle_id(), start)).fetchall()
     energy, prev_t, prev_p, prev_soc, reached, covered = 0.0, None, 0.0, None, None, 0.0
     for r in rows:
@@ -8321,15 +10821,24 @@ def _charge_has_soc_jump(db, start: str, end: str | None,
     faster than max_rate_per_min %/min — a BMS recalibration snap, not real energy.
     At AC rates (≤ 22 kW on 67 kWh), the physical max is ~0.55%/min; a threshold of 0.8
     leaves margin for fast 3-phase AC while still catching BMS jumps (e.g. +2.5%/min).
-    Only call this for AC charge types — DC fast-charging can legitimately reach 3-4%/min."""
+    Only call this for AC charge types — DC fast-charging can legitimately reach 3-4%/min.
+
+    A rise of ONE step of the SoC's own resolution is a tick, never a jump. The T03 reports its SoC
+    in whole points (no precise SoC, signal 100003), so each tick is a full point between two polls
+    30 s apart, about 2 %/min: every AC charge of a T03 was left out of the SoH, and the page had no
+    figure after four charges (#435, @matttiaromano: 123 of 831 charging pairs). The step is read
+    from the charge itself — whole points when no sample carries a fraction, a tenth otherwise — so
+    a precise SoC that leaps a whole point between two samples still counts as a jump.
+    → tests/test_a_charge_whose_soc_counts_in_whole_points_is_not_a_jump.py"""
     clause = "recorded_at >= ? AND recorded_at <= ?" if end else "recorded_at >= ?"
     params = (start, end) if end else (start,)
     rows = db.execute(
         f"SELECT recorded_at, soc FROM positions WHERE vehicle_id = COALESCE(?, vehicle_id) AND {clause} "
-        "AND charging = 1 "
+        "AND " + _charging_sample() + " "
         "AND soc IS NOT NULL ORDER BY recorded_at",
         (_current_vehicle_id(), *params),
     ).fetchall()
+    step = 1.0 if all(float(r["soc"]).is_integer() for r in rows) else SOC_QUANTUM
     prev_soc, prev_t = None, None
     for r in rows:
         soc = r["soc"]
@@ -8340,7 +10849,8 @@ def _charge_has_soc_jump(db, start: str, end: str | None,
             continue
         if prev_soc is not None and prev_t is not None:
             dt_min = (t - prev_t).total_seconds() / 60.0
-            if 0 < dt_min <= 15.0 and (soc - prev_soc) / dt_min > max_rate_per_min:
+            rise = soc - prev_soc
+            if 0 < dt_min <= 15.0 and rise > step + 1e-9 and rise / dt_min > max_rate_per_min:
                 return True
         prev_soc, prev_t = soc, t
     return False
@@ -8362,22 +10872,26 @@ def _charge_has_active_use(db, start: str, end: str | None) -> bool:
     return row is not None
 
 
-def _charge_temp_odo(db, start: str, end: str | None):
+def _charge_temp_odo(db, start: str, end: str | None, zero_is_absent: bool = False):
     """Coldest battery temperature (°C) and the odometer (km) seen WHILE CHARGING in a session,
     from the positions log. The min temp is the conservative basis for the cold-charge gate; the
-    odometer gives the per-distance (cycle-ageing) axis of the SoH trend."""
+    odometer gives the per-distance (cycle-ageing) axis of the SoH trend.
+
+    `zero_is_absent`: this car has never sent a battery temperature other than 0, so its zeros are
+    the ones the web's fresh reading wrote for a signal the car did not send — see `_battery_health`."""
     if end:
         rows = db.execute(
             "SELECT battery_min_temp, odometer_km FROM positions "
-            "WHERE vehicle_id = COALESCE(?, vehicle_id) AND charging = 1 "
+            "WHERE vehicle_id = COALESCE(?, vehicle_id) AND " + _charging_sample() + " "
             "AND recorded_at >= ? AND recorded_at <= ? ORDER BY recorded_at",
             (_current_vehicle_id(), start, end)).fetchall()
     else:
         rows = db.execute(
             "SELECT battery_min_temp, odometer_km FROM positions "
-            "WHERE vehicle_id = COALESCE(?, vehicle_id) AND charging = 1 "
+            "WHERE vehicle_id = COALESCE(?, vehicle_id) AND " + _charging_sample() + " "
             "AND recorded_at >= ? ORDER BY recorded_at", (_current_vehicle_id(), start)).fetchall()
-    temps = [r["battery_min_temp"] for r in rows if r["battery_min_temp"] is not None]
+    temps = [r["battery_min_temp"] for r in rows if r["battery_min_temp"] is not None
+             and not (zero_is_absent and r["battery_min_temp"] == 0)]
     odos = [r["odometer_km"] for r in rows if r["odometer_km"] is not None]
     return (min(temps) if temps else None), (max(odos) if odos else None)
 
@@ -8403,15 +10917,17 @@ def get_battery_health(min_soc_delta: float = 12.0, temp_min_c: float | None = N
 
     Single sessions are noisy, so the headline is a weighted mean over the most recent valid ones.
     Charges with no stored telemetry (pruned) are skipped entirely."""
+    with held_vehicle_scope():
+        return _battery_health(min_soc_delta, temp_min_c, min_start_soc)
+
+
+def _battery_health(min_soc_delta: float, temp_min_c, min_start_soc: float) -> dict:
     db = _get()
     # SoH is measured-vs-as-new, so the denominator is the ORIGINAL spec capacity, not
     # the energy-calc capacity the user may have overridden — otherwise adopting a
     # measured (already-aged) value would reset SoH to ~100% and hide the ageing.
-    # battery_capacity_nominal_kwh is snapshotted the first time the user overrides.
-    try:
-        nominal = float(get_setting("battery_capacity_nominal_kwh", "") or get_battery_capacity_kwh())
-    except (TypeError, ValueError):
-        nominal = get_battery_capacity_kwh()
+    # The reference is snapshotted the first time the user overrides, and it is each car's own (#472).
+    nominal = get_soh_reference_kwh() or get_battery_capacity_kwh()
     if temp_min_c is None:
         try:
             temp_min_c = float(get_setting("soh_temp_min_c", "15") or 15)
@@ -8431,6 +10947,13 @@ def get_battery_health(min_soc_delta: float = 12.0, temp_min_c: float | None = N
     ).fetchall()
     _kids = _charge_children_by_parent(db)
     rows = [_charge_group_stats(dict(r), _kids.get(r["id"], [])) for r in rows]
+    zone = _local_tz()          # once for the whole chart, not once per charge dated
+    # Before #435's fix the web's fresh reading stored a battery temperature the car did not send as 0 °C
+    # (#435). A T03 sends none, so those zeros sit in its database and made three of four charges
+    # "cold". A car that has never reported any other battery temperature did not report that one.
+    zero_is_absent = db.execute(
+        "SELECT 1 FROM positions WHERE vehicle_id = COALESCE(?, vehicle_id) AND battery_min_temp <> 0 "
+        "LIMIT 1", (_current_vehicle_id(),)).fetchone() is None
     points = []
     for r in rows:
         delta = (r["end_soc"] or 0) - (r["start_soc"] or 0)
@@ -8438,7 +10961,8 @@ def get_battery_health(min_soc_delta: float = 12.0, temp_min_c: float | None = N
             continue
         # Capacity comes from the part of the charge BELOW the re-anchor zone; everything the user
         # SEES about the charge (its real delta, where it ended) is unchanged.
-        below = _charge_energy_below_soc(db, r["started_at"], r["ended_at"], _SOH_TOP_CUTOFF_SOC)
+        below = _charge_energy_below_soc(db, r["started_at"], r["ended_at"], _SOH_TOP_CUTOFF_SOC,
+                                         tuple(r.get("child_ids", ())))
         if not below:
             continue
         energy, reached, covered = below
@@ -8455,7 +10979,7 @@ def get_battery_health(min_soc_delta: float = 12.0, temp_min_c: float | None = N
         # Drop physically implausible estimates (sampling gaps, bad V/I spikes).
         if not (nominal * 0.5 <= est <= nominal * 1.15):
             continue
-        temp, odo = _charge_temp_odo(db, r["started_at"], r["ended_at"])
+        temp, odo = _charge_temp_odo(db, r["started_at"], r["ended_at"], zero_is_absent)
         cold = temp is not None and temp < temp_min_c
         # Bottom guard: a charge that STARTED near-empty over-reports its SoC rise → capacity
         # under-estimate (the isolated low outlier riri19 saw). Excluded like cold; still charted.
@@ -8467,7 +10991,7 @@ def get_battery_health(min_soc_delta: float = 12.0, temp_min_c: float | None = N
         excluded = cold or soc_jump or active_use or low_start
         exclude_reason = ("cold" if cold else "soc_jump" if soc_jump
                           else "active_use" if active_use else "low_start" if low_start else None)
-        dt = _local_dt(r["started_at"])
+        dt = _local_dt(r["started_at"], zone)
         points.append({
             "charge_id": r["id"],
             "date": dt.strftime("%Y-%m-%d") if dt else (r["started_at"] or "")[:10],
@@ -8577,11 +11101,22 @@ def get_vampire_drain(min_hours: float = 1.0, min_drop_pct: float = 0.2,
     # raised `min_drop_pct` thins the chart without hiding that drain exists at all (#63).
     floor = min(min_drop_pct, _VAMPIRE_NOISE_FLOOR)
     cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
+    # Once for the whole card, not twice per park closed. `_flush` localises a window's two ends,
+    # and resolving the zone reads a setting on a connection of its own: 1608 reads and 0.195 s of
+    # a 0.490 s call on a real database. → tests/test_the_drain_card_reads_the_clock_once.py
+    zone = _local_tz()
+    # Plain tuples, straight off the cursor. This is the one read in Mate measured in hundreds of
+    # thousands of rows — 284 505 frames for ninety days on a real database — and a `sqlite3.Row`
+    # per frame plus a name lookup per field is most of what it costs: 220.43 ms as Rows with
+    # fetchall(), 150.65 ms like this, same frames. The loop below unpacks them in the SELECT's
+    # order, so that order and this unpacking have to stay in step.
+    # → tests/test_the_drain_card_reads_the_clock_once.py
     rows = db.execute(
         "SELECT recorded_at, soc, charging, speed_kmh, odometer_km, ac_port_mode, ready FROM positions "
         "WHERE vehicle_id = COALESCE(?, vehicle_id) AND soc IS NOT NULL AND recorded_at >= ? ORDER BY recorded_at",
         (_current_vehicle_id(), cutoff),
-    ).fetchall()
+    )
+    rows.row_factory = None
 
     windows = []
     # 🔴 The parks that produced NO bar, and why. Without this the page and the bundle could only
@@ -8603,9 +11138,11 @@ def get_vampire_drain(min_hours: float = 1.0, min_drop_pct: float = 0.2,
         # closes at the frozen value and the drop falls in the gap before the trip's start SoC).
         # Close the window at that fresh value + time so the drain is captured — but only when it's
         # a DROP (a rise = BMS recalibration / charge → keep the parked value, never invent drain).
-        if close is not None and close["soc"] is not None and close["soc"] < (soc_end or 0):
-            soc_end, t_end = close["soc"], close["recorded_at"]
-        t0, t1 = _local_dt(w["t0"]), _local_dt(t_end)
+        # `close` is the waking frame as (soc, recorded_at) — a pair, because the caller now reads
+        # plain tuples off the cursor rather than building a row object per frame.
+        if close is not None and close[0] is not None and close[0] < (soc_end or 0):
+            soc_end, t_end = close[0], close[1]
+        t0, t1 = _local_dt(w["t0"], zone), _local_dt(t_end, zone)
         if t0 is None or t1 is None:
             return
         hours = (t1 - t0).total_seconds() / 3600.0
@@ -8674,18 +11211,17 @@ def get_vampire_drain(min_hours: float = 1.0, min_drop_pct: float = 0.2,
             })
 
     cur = None
-    for r in rows:
+    # Unpacked in the SELECT's own order — keep the two in step.
+    for at, soc, charging, speed_kmh, odo, ac_port_mode, rd in rows:
         # A V2L / bidirectional-discharge sample (ac_port_mode==2) is NOT standby: the car is parked
         # but actively powering an external load, so that SoC loss is V2L output, not vampire drain.
         # Treat it like charging — it BOUNDS the parked window and its drop is never read as drain.
-        v2l = r["ac_port_mode"] == 2
+        v2l = ac_port_mode == 2
         # OFF window = car powered down (Ready/ON3 = 0), not charging, not V2L. Falls back to the old
         # speed<1 test only when the ready signal is absent (trips before it was logged). The drain now
         # spans exactly Ready-OFF → next Ready-ON: on-state idle (Ready+P with climate) is NOT counted,
         # while OFF-state remote heating/cooling IS (per the in-card note).
-        rd = r["ready"]
-        idle = (not r["charging"]) and (not v2l) and (rd == 0 if rd is not None else (r["speed_kmh"] or 0) < 1)
-        odo = r["odometer_km"]
+        idle = (not charging) and (not v2l) and (rd == 0 if rd is not None else (speed_kmh or 0) < 1)
         # a rise in odometer since the window's last idle sample → a drive happened (even if its
         # samples were missed) → the park ended there.
         if (cur is not None and odo is not None and cur["odo_last"] is not None
@@ -8699,15 +11235,15 @@ def get_vampire_drain(min_hours: float = 1.0, min_drop_pct: float = 0.2,
             # or V2L transition is left as-is: the pre-charge gap is ambiguous (could be a drive to
             # the charger), and a V2L drop is bidirectional-discharge output (not standby) — so we
             # never infer drain from either.
-            _flush(cur, close=(None if (r["charging"] or v2l) else r))
+            _flush(cur, close=(None if (charging or v2l) else (soc, at)))
             cur = None
             continue
         if cur is None:                     # start a new parked window
-            cur = {"t0": r["recorded_at"], "soc0": r["soc"],
-                   "t_last": r["recorded_at"], "soc_last": r["soc"], "odo_last": odo}
+            cur = {"t0": at, "soc0": soc,
+                   "t_last": at, "soc_last": soc, "odo_last": odo}
         else:                               # extend the current parked window
-            cur["t_last"] = r["recorded_at"]
-            cur["soc_last"] = r["soc"]
+            cur["t_last"] = at
+            cur["soc_last"] = soc
             if odo is not None:
                 cur["odo_last"] = odo
     _flush(cur, ongoing=True)               # the trailing park is still open
@@ -8752,6 +11288,17 @@ def get_vampire_drain(min_hours: float = 1.0, min_drop_pct: float = 0.2,
 def get_v2l_sessions(lookback_days: int = 90, limit: int = 50, vehicle_id: int | None = None) -> dict:
     db = _get()
     cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
+    # A V2L session leaves a mark — ac_port_mode = 2 — and a window without one holds no session to
+    # find. Ask that first: the walk below materialises EVERY frame in the window and builds a row
+    # per sample, which on an add-on measured 57.4 ms for the Overview's card alone, on a page that
+    # refreshes it every 10 s, on a car that had never used V2L.
+    # → tests/test_the_v2l_card_does_not_read_a_week_of_frames.py
+    used = db.execute(
+        "SELECT 1 FROM positions WHERE vehicle_id = COALESCE(?, vehicle_id) AND recorded_at >= ? "
+        "AND ac_port_mode = 2 LIMIT 1",
+        (vehicle_id if vehicle_id is not None else _current_vehicle_id(), cutoff)).fetchone()
+    if used is None:
+        return {"sessions": [], "count": 0, "total_energy_wh": 0.0, "lookback_days": lookback_days}
     if vehicle_id is not None:   # use idx_positions_vehicle(vehicle_id, recorded_at) → fast range scan
         rows = db.execute(
             "SELECT recorded_at, soc, charge_current_a, charge_voltage_v, ac_port_mode FROM positions "
@@ -8989,9 +11536,10 @@ def get_month_track(month: str, max_points: int = 8000) -> list[list[dict]]:
         return []
     db = _get()
     ids = []
+    zone = _local_tz()          # once for the scan, not once per trip
     for r in db.execute("SELECT id, started_at FROM trips WHERE vehicle_id = COALESCE(?, vehicle_id) "
                         "AND started_at IS NOT NULL", (_current_vehicle_id(),)).fetchall():
-        dt = _local_dt(r["started_at"])
+        dt = _local_dt(r["started_at"], zone)
         if dt is not None and dt.strftime("%Y-%m") == month:
             ids.append(r["id"])
     if not ids:
@@ -9003,6 +11551,36 @@ def get_month_track(month: str, max_points: int = 8000) -> list[list[dict]]:
         "ORDER BY trip_id, id", ids
     ).fetchall()
     return _rows_to_segments(rows, max_points)
+
+
+def get_todays_track() -> dict:
+    """The Overview map's line: the selected car's latest trip (by start, merged pieces included),
+    drawn whole from the trip page's own points (_trip_points), with its solid runs and dashed gaps.
+    Drawn while under way, and once ended only if its last reading is from today in the owner's
+    timezone — by recorded_at, the host's clock, since trips.ended_at can be the car's.
+
+    {"key", "segments"}; the key changes with the points, so a map that has drawn them can be told
+    they are unchanged. {"key": None, "segments": []} when there is nothing to draw — also when the
+    newest trip has no readings, joined or not: an older line would end somewhere the car is not."""
+    nothing = {"key": None, "segments": []}
+    db = _get()
+    newest = db.execute("SELECT id, ended_at FROM trips WHERE vehicle_id = COALESCE(?, vehicle_id) "
+                        "ORDER BY started_at DESC, id DESC LIMIT 1", (_current_vehicle_id(),)).fetchone()
+    if not newest:
+        return nothing
+    # Its own last reading, before any frozen one is left out: a frozen end past midnight is still today.
+    last = db.execute("SELECT MAX(recorded_at) FROM trip_positions WHERE trip_id = ?", (newest["id"],)).fetchone()[0]
+    if last is None:
+        return nothing
+    day = _local_dt(last)
+    if newest["ended_at"] is not None and (day is None or day.date() != today_local()):
+        return nothing
+    seg_ids = _segment_ids(db, newest["id"])
+    points = _trip_points(db, seg_ids)
+    # Points are only appended and the filter only ever changes the last run, so a changed line has
+    # another count or another last point.
+    return {"key": f"{seg_ids[0]}:{len(points)}:{points[-1]['recorded_at']}",
+            "segments": _split_track_gaps(points)}
 
 
 def get_frequent_places(min_visits: int = 2, top_n: int = 15) -> list[dict]:
@@ -9153,3 +11731,750 @@ def trip_local_start_hhmm(trip_id: int) -> Optional[str]:
         return None
     dt = _local_dt(row["started_at"])
     return dt.strftime("%H:%M") if dt else None
+
+
+# EV source selection is read-only: historical GPS, SoC, getEC and estimates remain in the database
+# unchanged. REEV energy is deliberately excluded — the generator recharges the pack mid-drive, so
+# the cloud's `totalEnergy` is not that car's appetite. A range-extender's LITRES take the same cloud
+# records by the same matcher, through `_cloud_fuel_index` into `_reev_trip_fuel`.
+def _select_ev_energy(rows):
+    from trip_energy import select_energy
+    return select_energy(_get(), rows)
+
+
+def _clear_cloud_pending(rows):
+    for row in rows:
+        if row.get("energy_source") == "cloud":
+            row["ec_pending"] = False
+    return rows
+
+
+def _finish_ev_detail(row):
+    if row is not None and row.get("energy_source") == "cloud":
+        row["ec_pending"] = False
+    return row
+
+
+def _ev_energy_summary(summary):
+    if is_reev_car():
+        return summary
+    # Through the strips' own totals, so the tile averages and sums by their rules.
+    totals = trips_totals(get_trips(limit=1000000))
+    summary["avg_eff"], summary["kwh_used"] = totals["avg_eff"], totals["kwh_used"]
+    return summary
+
+
+# Private charging places: settings per car; assignment and tariff snapshots per session.
+def charging_places_context():
+    db = _get()
+    vehicle_id = _current_vehicle_id()
+    places = [dict(r) for r in db.execute(
+        'SELECT * FROM charging_places WHERE vehicle_id=? ORDER BY name,id', (vehicle_id,))]
+    totals = [dict(r) for r in db.execute(
+        'SELECT charging_place_name AS name, COUNT(*) AS sessions, SUM(cost) AS cost, '
+        'SUM(CASE WHEN cost IS NULL AND NOT EXISTS ('
+        'SELECT 1 FROM charges parent WHERE parent.id=charges.merged_into_id '
+        'AND parent.cost IS NOT NULL AND (parent.cost_manual=1 OR parent.gross_kwh>0)'
+        ') THEN 1 ELSE 0 END) AS unpriced '
+        'FROM charges WHERE vehicle_id=? AND ended_at IS NOT NULL AND charging_place_id IS NOT NULL '
+        'GROUP BY charging_place_id,charging_place_name ORDER BY name', (vehicle_id,))]
+    return {'charging_places': places, 'charging_place_totals': totals, 'charging_place_vehicle_id': vehicle_id}
+
+
+def save_charging_place(form):
+    import charging_places
+    vehicle_id = _current_vehicle_id()
+    if vehicle_id is None or str(form.get('vehicle_id')) != str(vehicle_id):
+        raise ValueError('place_invalid')
+    values = charging_places.validate(*(form.get(k) for k in
+                                         ('name','latitude','longitude','radius_m','rate','charge_type')))
+    enabled = 1 if form.get('enabled') == 'on' else 0
+    try:
+        place_id = int(form.get('id') or 0)
+    except (TypeError, ValueError):
+        raise ValueError('place_invalid') from None
+    with _conn_rw() as db:
+        if place_id:
+            cur = db.execute('UPDATE charging_places SET name=?,latitude=?,longitude=?,radius_m=?,rate=?,'
+                             'charge_type=?,enabled=? WHERE id=? AND vehicle_id=?',
+                             (*values, enabled, place_id, vehicle_id))
+            if cur.rowcount != 1:
+                raise ValueError('place_invalid')
+        else:
+            db.execute('INSERT INTO charging_places (name,latitude,longitude,radius_m,rate,charge_type,enabled,'
+                       'vehicle_id) VALUES (?,?,?,?,?,?,?,?)', (*values, enabled, vehicle_id))
+
+
+def assign_charging_place(charge_id, place_id):
+    """Assign (or clear) a place on a charge — and, when it is part of a merged group, on every
+    OTHER piece of that group too, the same way a type re-tag already cascades to them
+    (_update_charge_type's own `_segment` loop). A merged charge is drawn as ONE row; snapshotting
+    the place onto the clicked piece alone would leave the other pieces pointing at no place (or a
+    stale one), which the totals in charging_places_context group by — a merged group used to be
+    refused outright for exactly this reason ('unmerge first'), but cascading it is no different
+    from what type changes already do safely."""
+    import charging_places
+    with _conn_rw() as db:
+        row = db.execute('SELECT * FROM charges WHERE id=? AND vehicle_id=?',
+                         (charge_id, _current_vehicle_id())).fetchone()
+        if not row or not row['ended_at']:
+            raise ValueError('place_closed_only')
+        row = dict(row)
+        group_ids = [charge_id, *_merged_piece_ids(db, charge_id)]
+        if place_id:
+            place = db.execute('SELECT * FROM charging_places WHERE id=? AND vehicle_id=?',
+                               (place_id, row['vehicle_id'])).fetchone()
+            if not place:
+                raise ValueError('place_invalid')
+            for gid in group_ids:
+                charging_places.snapshot(db, gid, place, 'manual')
+            return _update_charge_type(db, charge_id, place['charge_type'],
+                                       _free=1 if row['location_type'] == 'FREE' else None)
+        db.executemany('UPDATE charges SET charging_place_id=NULL, charging_place_name=NULL, '
+                       'charging_place_rate=NULL, charging_place_source=NULL WHERE id=?',
+                       [(gid,) for gid in group_ids])
+        return _update_charge_type(db, charge_id, row['location_type'])
+
+
+# ── Events: what the car did, moment by moment ────────────────────────────────
+
+# The groups the Events page's pills switch, and the kinds each covers. The signal kinds are the
+# ones poller/events.py derives from `positions` (its RULES); `trip`, `charge` and `command` are read
+# from their own tables and only shown beside them, never copied.
+EVENT_GROUPS = {
+    "security": ("unlocked",),
+    "doors": ("door_driver", "door_passenger", "door_rear_left", "door_rear_right", "trunk"),
+    "windows": ("window_fl", "window_rl", "sunshade_level"),
+    "charging": ("cable", "v2l", "charge"),
+    "climate": ("climate", "defrost", "rapid_heat", "rapid_cool"),
+    "driving": ("ready", "trip"),
+    "commands": ("command",),
+}
+EVENT_KINDS = tuple(k for kinds in EVENT_GROUPS.values() for k in kinds)
+EVENT_SIGNAL_KINDS = tuple(k for k in EVENT_KINDS if k not in ("trip", "charge", "command"))
+EVENT_LEVEL_KINDS = ("sunshade_level",)        # poller/events.py's LEVELS: a level reached, not a span
+EVENT_GROUP_OF = {k: g for g, kinds in EVENT_GROUPS.items() for k in kinds}
+EVENT_GROUP_ICONS = {"security": "🔒", "doors": "🚪", "windows": "🪟", "charging": "🔌",
+                     "climate": "🌡️", "driving": "🚗", "commands": "📲"}
+EVENT_GROUP_COLORS = {"security": "#f59e0b", "doors": "#a78bfa", "windows": "#38bdf8",
+                      "charging": "#22c55e", "climate": "#f97316", "driving": "#14b8a6",
+                      "commands": "#94a3b8"}
+EVENT_ICONS = {
+    "unlocked": "🔓", "door_driver": "🚪", "door_passenger": "🚪", "door_rear_left": "🚪",
+    "door_rear_right": "🚪", "trunk": "📦", "window_fl": "🪟", "window_rl": "🪟",
+    "sunshade_level": "☀️", "cable": "🔌", "v2l": "💡", "charge": "⚡", "climate": "🌡️", "defrost": "🧊", "rapid_heat": "🔥",
+    "rapid_cool": "❄️", "ready": "🟢", "trip": "🗺", "command": "📲",
+}
+# How far back the Events list reaches, counted back from today: days as days, months to the same
+# day of an earlier month. `all` has no lower bound.
+EVENT_RANGES = ("3d", "7d", "30d", "3m", "6m", "12m", "all")
+EVENTS_DEFAULT_RANGE = "3d"
+EVENTS_PART_ROWS = 1000            # rows sent at once; the next part loads as the list's end comes into view
+EVENT_COMMAND_ALIASES = {"_send_ac_on": "ac_settings"}     # the fan and recirculation go through one helper
+EVENTS_CABLE_WAIT_MIN = 5          # a first charge later than this after the plug-in waited for something
+
+
+@dataclass
+class EventFilter:
+    """What the Events page was asked for. `submitted` tells an empty `groups` apart from no filter
+    at all: an unchecked checkbox sends nothing, so without the marker unchecking every pill would
+    look like opening the page, and show everything."""
+    q: str = ""
+    groups: tuple = ()
+    kinds: tuple = ()
+    date_from: date | None = None
+    date_to: date | None = None
+    submitted: bool = False
+    range: str = EVENTS_DEFAULT_RANGE
+
+    @classmethod
+    def from_query(cls, q: str = "", group=(), kind=(), date_from: str = "", date_to: str = "",
+                   f: str = "", range: str = "") -> "EventFilter":
+        def _day(s):
+            try:
+                d = date.fromisoformat(s) if s else None
+            except ValueError:
+                return None
+            return d if d is None or date(1, 1, 2) <= d <= date(9999, 12, 30) else None   # a day ± its zone stays a datetime
+        return cls(q=(q or "").strip(), groups=tuple(g for g in group if g in EVENT_GROUPS),
+                   kinds=tuple(k for k in kind if k in EVENT_KINDS),
+                   date_from=_day(date_from), date_to=_day(date_to), submitted=bool(f),
+                   range=range if range in EVENT_RANGES else EVENTS_DEFAULT_RANGE)
+
+    def shown_groups(self) -> tuple:
+        return self.groups if (self.groups or self.submitted) else tuple(EVENT_GROUPS)
+
+    def selected_kinds(self) -> set:
+        kinds = {k for g in self.shown_groups() for k in EVENT_GROUPS[g]}
+        return kinds & set(self.kinds) if self.kinds else kinds
+
+    @property
+    def custom(self) -> bool:
+        """Dates typed in win over the range buttons; an empty date field is no bound."""
+        return bool(self.date_from or self.date_to)
+
+    def days(self, zone) -> tuple:
+        """The first and last LOCAL day shown; a first day of None has no lower bound."""
+        today = datetime.now(zone).date()
+        if self.custom:
+            last = self.date_to or today
+            return self.date_from, max(self.date_from, last) if self.date_from else last
+        if self.range == "all":
+            return None, today
+        n, unit = int(self.range[:-1]), self.range[-1]
+        return (today - timedelta(days=n - 1) if unit == "d" else _months_back(today, n)), today
+
+
+def _months_back(day: date, n: int) -> date:
+    """The same day of the month `n` months earlier, the month's last day where it is shorter."""
+    import calendar
+    y, m = divmod(day.year * 12 + day.month - 1 - n, 12)
+    m += 1
+    return date(y, m, min(day.day, calendar.monthrange(y, m)[1]))
+
+
+def _utc(s) -> datetime | None:
+    """A stored timestamp as an aware UTC datetime — the poller's UTC ISO, or a localised ISO with
+    its offset — so rows from different readers sort by the clock and not by their text."""
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(s).replace(" ", "T").rstrip("Z"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _event_row(source, item_id, kind, on, at, lat=None, lon=None, start=None, open=False, t=None,
+               **more) -> dict:
+    """One row of the Events page: something began (`on`; `open` while it lasts), ended (`on`
+    False, with its `start` when that is known) or just happened (`on` None, a command). `t` is
+    when it happened, the car's clock where the row has one; `at` is when Mate wrote it down, the
+    clock of the trips and charges it is matched against."""
+    return {"source": source, "id": item_id, "kind": kind, "on": on, "at": at, "t": at if t is None else t,
+            "lat": lat, "lon": lon, "start": start, "end": None, "open": open, **more}
+
+
+def _signal_moments(db, vehicle_id, kinds: set, start: datetime | None, end: datetime) -> list[dict]:
+    """The transitions of the selected signal kinds in [start, end) by the car's clock, each end
+    with its start and each start with its end: the neighbouring row of its car and kind IN ID
+    ORDER, the order they were written, read from the whole history — a stepped host clock can put
+    the end before the start in time, and they are still a pair. The poller writes a kind's rows
+    alternating 1, 0, 1…, so a start left without an end is the state the car is in. A level kind
+    is a moment on its own, with the level it reached and no pair."""
+    lo, hi = (start.timestamp() * 1000 if start else float("-inf")), end.timestamp() * 1000
+
+    def moment(r, ms, start=None):
+        return _event_row("signal", r["id"], r["kind"], r["state"] == 1, _utc(r["at"]), r["latitude"], r["longitude"],
+                          start=start, t=datetime.fromtimestamp(ms / 1000, timezone.utc), soc=r["soc"],
+                          odometer_km=r["odometer_km"], inside_temp=r["inside_temp"],
+                          target_temp=r["climate_target_temp"], outside_temp=r["outside_temp"])
+    began: dict = {}                     # (car, kind) → (its open start's row, its time, its row on the list or None)
+    out = []
+    for r in db.execute(
+            "SELECT id, vehicle_id, kind, at, frame_ts, state, latitude, longitude, soc, odometer_km, inside_temp,"
+            " climate_target_temp, outside_temp FROM events WHERE vehicle_id = COALESCE(?, vehicle_id)"
+            " ORDER BY id", (vehicle_id,)):
+        if r["kind"] not in kinds:
+            continue
+        ms = r["frame_ts"] or _utc(r["at"]).timestamp() * 1000
+        key, shown = (r["vehicle_id"], r["kind"]), lo <= ms < hi
+        if r["kind"] in EVENT_LEVEL_KINDS:
+            if shown:
+                out.append({**moment(r, ms), "on": None, "level": r["state"]})
+            continue
+        if r["state"] == 1:
+            began[key] = (r, ms, moment(r, ms) if shown else None)
+            if shown:
+                out.append(began[key][2])
+            continue
+        opened = began.pop(key, None)
+        if shown or (opened and opened[2]):
+            m = moment(r, ms, opened and (opened[2] or moment(opened[0], opened[1])))
+            if m["start"]:
+                m["start"]["end"] = m
+            if shown:
+                out.append(m)
+    for _, _, m in began.values():
+        if m:
+            m["open"] = True
+    return out
+
+
+def _session_moments(source, sessions, live) -> list[dict]:
+    """A trip or a charge as two rows, its start and its end, and the one in progress (`live`) as
+    its start alone. Each row carries the session as its page composes it (a merged group is one)."""
+    def where(s, end):
+        if source == "charge":
+            return s.get("latitude"), s.get("longitude")
+        return (s.get("end_lat"), s.get("end_lon")) if end else (s.get("start_lat"), s.get("start_lon"))
+    out = []
+    for s in sessions + live:
+        at = _utc(s.get("started_at"))
+        if at is None:
+            continue
+        start = _event_row(source, s["id"], source, True, at, *where(s, False), session=s, open=s in live)
+        out.append(start)
+        if s not in live:
+            start["end"] = _event_row(source, s["id"], source, False, _utc(s["ended_at"]), *where(s, True),
+                                      start=start, session=s)
+            out.append(start["end"])
+    return out
+
+
+def _bounds(start: datetime | None, end: datetime) -> tuple[str | None, str]:
+    """The window the three session readers below are given, as the ISO strings the tables hold.
+    `start` is None for the whole history, and then only the upper bound applies."""
+    return (start.isoformat() if start else None), end.isoformat()
+
+
+def _trip_moments(db, vehicle_id, start, end) -> list[dict]:
+    """The finished trips of the window as the Trips page composes them, plus the one in progress.
+
+    ⚠️ The window is the one the page was asked for, applied HERE and not afterwards in Python.
+    Composing a trip reads its group, its source and its fuel, so composing a whole history to keep
+    three days of it made the page's cost follow the length of the history: measured in a container
+    limited to a quarter of a core, 3 days 0.29 s, 30 days 0.60 s, `all` 1.88 s — the first two
+    doing nearly the work of the third."""
+    live = [dict(r) for r in db.execute(
+        "SELECT * FROM trips WHERE vehicle_id = COALESCE(?, vehicle_id) AND ended_at IS NULL "
+        "AND merged_into_id IS NULL ORDER BY id", (vehicle_id,)).fetchall()]
+    since, until = _bounds(start, end)
+    trips = get_trips(limit=1_000_000, since=since, until=until)
+    trip_places(trips + live)
+    return _session_moments("trip", trips, live)
+
+
+def _charge_moments(db, vehicle_id, start, end) -> list[dict]:
+    """The finished charges of the window as the Charges page composes them, plus the one in
+    progress. Bounded like the trips above, and for the same reason."""
+    live = []
+    if (c := open_charge()):
+        row = db.execute("SELECT vehicle_id, latitude, longitude, charging_place_name, location_name, note"
+                         " FROM charges WHERE id = ?", (c["id"],)).fetchone()
+        live = [{**c, **dict(row)}]
+    since, until = _bounds(start, end)
+    charges = get_charges(limit=1_000_000, since=since, until=until)
+    charge_places(charges + live)
+    return _session_moments("charge", charges, live)
+
+
+def _command_moments(db, start, end) -> list[dict]:
+    """The commands sent from Mate's pages to the selected car in the window, when the log exists
+    (the web creates it on the first command). A command is one moment, so the bound is its own
+    time — this reader had no bound at all."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'command_log'").fetchone():
+        return []
+    since, until = _bounds(start, end)
+    rows = db.execute(
+        "SELECT id, ts, action, outcome FROM command_log WHERE vin IS NOT NULL AND lower(vin) = lower(?)"
+        " AND (? IS NULL OR ts >= ?) AND ts < ? ORDER BY id",
+        (_selected_vin(), since, since, until)).fetchall()
+    return [_event_row("command", r["id"], "command", None, _utc(r["ts"]), action=r["action"],
+                    outcome=r["outcome"]) for r in rows if _utc(r["ts"])]
+
+
+def _add_context(moments: list[dict], db, vehicle_id) -> None:
+    """What a signal row's own question needs beyond the row: how far a READY span drove and what it
+    used, whether the climate ran parked or during a trip and what it did to the cabin, whether the
+    cable charged and how long it waited first. From the two ends' readings and at most one read of
+    `trips` and one of `charges`, whatever the view's filters, each walked once in time order."""
+    climates, cables = [], []
+    for m in moments:
+        start, kind = m["start"], m["kind"]
+        if m["source"] != "signal":
+            continue
+        if kind == "climate" and m["on"]:
+            climates.append(m)
+        if start is None:
+            continue
+        if kind == "ready":
+            if None not in (start["odometer_km"], m["odometer_km"]) and m["odometer_km"] >= start["odometer_km"]:
+                m["distance_km"] = m["odometer_km"] - start["odometer_km"]
+            m["soc_from"], m["soc_to"] = start["soc"], m["soc"]
+        elif kind == "climate":
+            m["cabin_from"], m["cabin_to"] = start["inside_temp"], m["inside_temp"]
+        elif kind == "cable":
+            cables.append(m)
+    if climates:
+        # Every stored piece on its own: the pause inside a merged trip is time parked.
+        now = datetime.now(timezone.utc)
+        trips = sorted((_utc(r[0]), _utc(r[1]) or now) for r in db.execute(
+            "SELECT started_at, ended_at FROM trips WHERE vehicle_id = COALESCE(?, vehicle_id)"
+            " AND started_at IS NOT NULL", (vehicle_id,)))
+        k = -1                                   # the last trip begun by the climate's start
+        for m in sorted(climates, key=lambda m: m["at"]):
+            while k + 1 < len(trips) and trips[k + 1][0] <= m["at"]:
+                k += 1
+            m["ctx"] = "during_trip" if k >= 0 and trips[k][1] >= m["at"] else "parked"
+    if cables:
+        # The stored rows, not the merged groups: an unmerged plug-in in two pieces is one cable.
+        charges = sorted((_utc(r[0]), r[1] or 0) for r in db.execute(
+            "SELECT started_at, energy_added_kwh FROM charges WHERE vehicle_id = COALESCE(?, vehicle_id)"
+            " AND started_at IS NOT NULL", (vehicle_id,)))
+        lo = 0
+        for m in sorted(cables, key=lambda m: m["start"]["at"]):
+            start = m["start"]
+            while lo < len(charges) and charges[lo][0] < start["at"]:
+                lo += 1
+            hi = lo
+            while hi < len(charges) and charges[hi][0] <= m["at"]:
+                hi += 1
+            inside = charges[lo:hi]
+            if inside:
+                m["energy_kwh"] = sum(kwh for _, kwh in inside)
+                m["soc_from"], m["soc_to"] = start["soc"], m["soc"]
+                # The wait ends when energy flows: a 0 kWh session is the charger still holding it.
+                began = next((at for at, kwh in inside if kwh > 0), None)
+                if began is not None and (began - start["at"]).total_seconds() / 60 > EVENTS_CABLE_WAIT_MIN:
+                    m["waited_min"] = (began - start["at"]).total_seconds() / 60
+
+
+def events_live(db, vehicle_id) -> dict:
+    """Whether an open state may say "(in progress)": the detector has read the history through
+    (`caught_up`, else `pct` of it so far, as the poller's state says) and the car's last frame is
+    younger than three parked polls (`fresh`). A fresh ROW is not enough: while the car sleeps the
+    cloud serves the same frame again and the poller stores it with a fresh time (#232)."""
+    row = db.execute(
+        "SELECT id, frame_ts, recorded_at FROM positions WHERE vehicle_id = COALESCE(?, vehicle_id) "
+        "ORDER BY id DESC LIMIT 1", (vehicle_id,)).fetchone()
+    if not row:
+        return {"caught_up": True, "fresh": False, "last_frame": None, "pct": 100}
+    stored = db.execute("SELECT value FROM settings WHERE key = ?", (f"events_state_{vehicle_id}",)).fetchone()
+    state = json.loads(stored[0]) if stored else {}
+    age = _position_age_s(row["frame_ts"], row["recorded_at"])
+    last_frame = (datetime.fromtimestamp(row["frame_ts"] / 1000, timezone.utc) if row["frame_ts"]
+                  else _utc(row["recorded_at"]))
+    return {"caught_up": bool(state.get("caught_up")), "pct": int(state.get("pct", 0)),
+            "fresh": age is not None and age < 3 * poll_seconds(driving=False),
+            "last_frame": last_frame}
+
+
+def _anchor(m) -> str:
+    return f"ev-{m['source']}-{m['id']}" + ("" if m["source"] in ("signal", "command") else "-on" if m["on"] else "-off")
+
+
+def _nearest_place(places, lat, lon) -> dict | None:
+    """The charging place whose radius holds the point, the nearest of several."""
+    import charging_places
+    best = None
+    for p in places:
+        d = charging_places.distance_m(lat, lon, p["latitude"], p["longitude"])
+        if d <= p["radius_m"] and (best is None or d < best[0]):
+            best = (d, p)
+    return best[1] if best else None
+
+
+# What a row may print beside its label; absent from a row, None.
+_EVENT_FIGURES = ("extra", "distance_km", "energy_kwh", "duration_min", "soc_from", "soc_to", "cost",
+                  "waited_min", "ctx", "target_temp", "outside_temp", "cabin_from", "cabin_to",
+                  "from_anchor", "from_hms", "from_day", "place_key", "place_at", "point", "words",
+                  "place_osm")
+
+
+def _present_event(m: dict, zone, live: dict, t, places, lang) -> None:
+    """The row as the page prints it: label, times, the place, and for an end the time it began. A
+    state still open says so only when the detector is up to date and the car's frame is fresh;
+    with the frame stale it names the frame's time, and while the history is still being read it
+    says nothing, because its end may not be read yet."""
+    for field in _EVENT_FIGURES:
+        m.setdefault(field, None)
+    local, wrote = m["t"].astimezone(zone), m["at"].astimezone(zone)
+    m["day"], m["hms"], m["hour"] = local.date(), local.strftime("%H:%M:%S"), local.strftime("%H:00")
+    # The day heading names the day; Mate's clock names its own only where it wrote on another.
+    mate = wrote.strftime("%H:%M:%S") if wrote.date() == local.date() else \
+        f"{i18n.fmt_day_month_year(lang, wrote.date())} {wrote.strftime('%H:%M:%S')}"
+    m["time_title"] = t("events_time_mate").format(time=mate)
+    if m["source"] == "signal":
+        m["time_title"] = f"{t('events_time_car').format(time=m['hms'])} · {m['time_title']}"
+    m["anchor"], m["icon"] = _anchor(m), EVENT_ICONS[m["kind"]]
+    m["color"] = EVENT_GROUP_COLORS[EVENT_GROUP_OF[m["kind"]]]
+    edge = "on" if m["on"] else "off"
+    if m["kind"] in EVENT_LEVEL_KINDS:
+        m["label"] = (t(f"events_{m['kind']}_level").format(pct=m["level"]) if m["level"]
+                      else t(f"events_{m['kind']}_off"))
+    elif m["source"] == "signal":
+        m["label"] = t(f"events_{m['kind']}_{edge}")
+    elif m["source"] in ("trip", "charge"):
+        m["label"] = t(f"events_{m['source']}_{'started' if m['on'] else 'ended'}")
+    else:
+        m["label"] = t("events_kind_command")
+        outcome = t(f"events_outcome_{m['outcome']}")
+        if outcome.startswith("events_outcome_"):          # an outcome the locale does not name
+            outcome = m["outcome"] or ""
+        # The logged action is the name of the function that sent it, never shown as it is.
+        action = t(f"events_cmd_{EVENT_COMMAND_ALIASES.get(m['action'], m['action'])}")
+        m["extra"] = outcome if action.startswith("events_cmd_") else f"{action} · {outcome}"
+    s = m.get("session") or {}
+    m["words"] = s.get("search_text", s.get("note"))      # searched, not printed: see trip_places
+    m["has_fix"] = has_gps_fix(m["lat"], m["lon"])
+    if m["source"] == "charge":                    # as its card names it, without the "(charging place)" mark
+        m["place"], m["place_osm"] = s.get("place"), s.get("place_osm")
+    elif m["source"] == "trip":                    # its own end's name: a charging place, else the address
+        end = "start" if m["on"] else "end"
+        m["place"], m["place_osm"] = s.get(f"{end}_place"), s.get(f"{end}_place_osm")
+    else:
+        m["place"] = None
+    if m["has_fix"]:
+        # Inside a charging place the place is the point (names repeat, so by id); elsewhere a ~110 m grid.
+        near = _nearest_place(places, m["lat"], m["lon"])
+        m["place_key"] = f"place:{near['id']}" if near else f"{round(m['lat'], 3):.3f},{round(m['lon'], 3):.3f}"
+        m["place_at"] = (near["latitude"], near["longitude"]) if near else None
+        m["place"] = m["place"] or (near and near["name"])
+    m["still_open"] = m["open"] and live["caught_up"] and live["fresh"]
+    m["last_frame_hhmm"] = (live["last_frame"].astimezone(zone).strftime("%H:%M")
+                            if m["open"] and live["caught_up"] and not live["fresh"] and live["last_frame"] else None)
+    start = m["start"]
+    if start is not None and m["t"] >= start["t"]:
+        m["duration_min"] = (m["t"] - start["t"]).total_seconds() / 60
+    if m["on"] is False and m["source"] in ("trip", "charge"):          # the figures of its page
+        m["soc_from"], m["soc_to"] = s.get("start_soc"), s.get("end_soc")
+        if m["source"] == "trip":
+            # Driving time, as Trips shows it: the pause inside a merged trip is not part of it.
+            m["distance_km"], m["duration_min"] = s.get("distance_km"), s.get("duration_min")
+        else:
+            m["energy_kwh"], m["cost"] = s.get("energy_added_kwh"), s.get("cost")
+    if start is not None:
+        s_local = start["t"].astimezone(zone)
+        m["from_anchor"], m["from_hms"] = _anchor(start), s_local.strftime("%H:%M:%S")
+        m["from_day"] = (None if s_local.date() == local.date()
+                         else i18n.fmt_day_month_year(lang, s_local.date()))
+
+
+def _event_lines(items: list[dict], lo: datetime | None, hi: datetime, weekdays, lang) -> tuple[list, int, list]:
+    """The list as the page draws it, top to bottom: a heading per local day, a separator per hour
+    and the rows, each line with its cells of the tracks that join an end to its start, as in a
+    graph of git history. A pair spans the rows between its two ends whichever is higher (a stepped
+    clock can put the start above its end); a partner outside the days shown runs the track off
+    that edge of the list, faded, and a state still on runs it to the top. A partner the word
+    filter hid gets no track. Each pair takes the lowest track free over its rows, track 0 next to
+    the dots; returns the lines, the number of tracks, and each track's straight runs as
+    (first line, end line, track, cell class)."""
+    n = len(items)
+    row_of = {m["anchor"]: i for i, m in enumerate(items)}
+
+    def beyond(m):                       # where a partner off the list lies: an edge, or None if filtered out
+        if (lo is None or m["t"] >= lo) and m["t"] < hi:
+            return None
+        return n if m["t"] < hi else -1
+    pairs = []                           # (top row, bottom row, group, faded); -1 and n are the list's edges
+    for i, m in enumerate(items):
+        g = EVENT_GROUP_OF[m["kind"]]
+        partner = m["start"] if m["start"] is not None else m["end"] if m["on"] else None
+        if partner is not None:
+            j = row_of.get(_anchor(partner))
+            if j is None:
+                edge = beyond(partner)
+                if edge is not None:
+                    pairs.append((min(i, edge), max(i, edge), g, True))
+            elif m["start"] is not None:                  # a pair on the list is drawn once, from its end
+                pairs.append((min(i, j), max(i, j), g, False))
+        elif m["open"]:
+            pairs.append((-1, i, g, False))
+    pairs.sort()
+    ends: list = []                      # per track, the bottom row of its last pair
+    placed = []
+    for top, bottom, g, faded in pairs:
+        lane = next((k for k, e in enumerate(ends) if e < top), len(ends))
+        ends[lane:lane + 1] = [bottom]
+        placed.append((top, bottom, g, faded, lane))
+
+    lines, line_of, day, hour = [], [], None, None
+    for m in items:
+        if m["day"] != day:
+            day, hour = m["day"], None
+            lines.append({"kind": "day", "label": f"{weekdays[day.weekday()]} {i18n.fmt_day_month_year(lang, day)}"})
+        if m["hour"] != hour:
+            hour = m["hour"]
+            lines.append({"kind": "hour", "label": hour})
+        line_of.append(len(lines))
+        lines.append({"kind": "row", "e": m, "joined": False})
+    cells = [[[] for _ in ends] for _ in lines]
+    runs = []
+    for top, bottom, g, faded, lane in placed:
+        first = line_of[top] + 1 if top >= 0 else 0
+        last = line_of[bottom] if bottom < n else len(lines)
+        runs.append((first, last, lane, f"{'w' if faded else 'v'}-{g}"))
+        for k in range(first, last):
+            cells[k][lane].append(runs[-1][3])
+        for row, corner in ((top, "n"), (bottom, "u")):
+            if 0 <= row < n:
+                k = line_of[row]
+                cells[k][lane].append(f"{corner}-{g}")
+                for inner in range(lane):
+                    cells[k][inner].append(f"h-{g}")
+                lines[k]["joined"] = True
+    for line, row in zip(lines, cells):
+        line["cells"] = [" ".join(c) for c in reversed(row)]          # outermost track first, left to right
+    return lines, len(ends), runs
+
+
+def _event_part(lines: list, lanes: int, runs: list, part: int) -> tuple[list, list | None]:
+    """The lines of one part of the list, EVENTS_PART_ROWS rows with the headings before them, and
+    for a part that is followed by another, the track cells running on into it: the line that
+    loads the next part carries them, so the tracks have no gap while it loads."""
+    starts, rows = [0], 0
+    for k, line in enumerate(lines):
+        if line["kind"] == "row":
+            rows += 1
+            if rows % EVENTS_PART_ROWS == 0 and k + 1 < len(lines):
+                starts.append(k + 1)
+    if part >= len(starts):
+        return [], None
+    if part + 1 == len(starts):
+        return lines[starts[part]:], None
+    cut, on = starts[part + 1], [""] * lanes
+    for first, last, lane, cls in runs:
+        if first <= cut <= last:
+            on[lane] = cls
+    return lines[starts[part]:cut], on[::-1]
+
+
+# The last composition of the Events page, so a reader scrolling the parts of one list does not pay
+# for it again at every part. Composing is the page's whole cost — four sources read, matched into
+# pairs, given their context and laid out into tracks — and `_event_part` only slices the result.
+# Measured in a container limited to a quarter of a core, on a database of 634 trips and 4,516
+# events: the `all` range composes in 0.61 s, and asking for its second part cost another 0.70 s.
+#
+# ⚠️ It must not change what the page SAYS. The parts of one list share a `version`, and a part
+# asked for with another version comes back as the first part, the list having changed meanwhile —
+# that guard is what keeps the parts consistent with each other, and a cache keyed on the version
+# the client sends would quietly retire it. So validity is not the version but `PRAGMA
+# data_version`, which SQLite moves whenever ANOTHER connection commits — every poll, and every
+# merge or note written by the web on its own write connection — read on a connection this module
+# holds, because the value only means something to the connection that read it (see below).
+# Unchanged means nothing has been
+# written since, so the composition cannot have changed and the version it carries is still the one
+# a fresh composition would produce. Changed means we compose again and the guard runs exactly as
+# before. One entry: a reader scrolls one list.
+_events_cache: dict = {}
+
+
+_version_conn: list = [None, None]           # [path, connection]
+_version_lock = threading.Lock()             # one connection, many request threads
+
+
+def _data_version(_db=None) -> int:
+    """How many times another connection has committed to this database, as SQLite counts it.
+
+    ⚠️ Read on a connection of our OWN, held here, and never on the caller's. `PRAGMA data_version`
+    is a per-connection counter: it moves when ANOTHER connection commits, and its absolute value
+    means nothing outside the connection that read it. The web serves its requests from a thread
+    pool with a read connection per thread, so comparing a value taken on one thread with a value
+    taken on another compares two unrelated counters — which can match by accident, and did: two
+    tests of the parts went green while the cache served a list a write had already changed.
+
+    So one connection answers this question for the whole process, opened on first use and reopened
+    when the path changes (the demo flag points it elsewhere). It only ever reads the pragma."""
+    path = DB_PATH
+    with _version_lock:                      # one connection is not a thread-safe cursor
+        if _version_conn[0] != path or _version_conn[1] is None:
+            if _version_conn[1] is not None:
+                try:
+                    _version_conn[1].close()
+                except sqlite3.Error:
+                    pass
+            _version_conn[0], _version_conn[1] = path, _conn(path)
+        return _version_conn[1].execute("PRAGMA data_version").fetchone()[0]
+
+
+def _cache_key(flt: "EventFilter", lang: str, vehicle_id) -> tuple:
+    return (vehicle_id, lang, flt.q, flt.groups, flt.kinds, flt.date_from, flt.date_to,
+            flt.submitted, flt.range)
+
+
+def _events_version(lines: list, points: list) -> str:
+    """What a later part must match to join the parts on the page: the lines in order with their
+    track cells, and the map's points. A row written meanwhile moves the cut, the tracks or the
+    points' numbers; an address found meanwhile, a row's place."""
+    crc = zlib.crc32(repr(points).encode())
+    for line in lines:
+        e = line["e"] if line["kind"] == "row" else None
+        key = (e["anchor"], e.get("place"), e.get("place_osm")) if e else line["label"]
+        crc = zlib.crc32(f"{key}|{line['cells']}|{line.get('joined')}\n".encode(), crc)
+    return f"{crc:08x}"
+
+
+def get_events_grouped(flt: EventFilter, t, lang: str, part: int = 0, asked: str | None = None) -> dict:
+    """The Events page: every moment of the selected car in the days asked for (the last three by
+    default), newest first, one heading per LOCAL day — a state beginning and the same state ending
+    are two rows, the end saying how long it lasted. Four sources composed in Python — the signal
+    transitions, the trips, the charges and the commands — each through its own reader and all on
+    one UTC clock before sorting; the map's points are the places of the rows listed. The whole
+    range is composed and its tracks laid out; `lines` is the `part` asked for, `more` the cells
+    of the line that loads the next one, `version` what the parts of one list share: a part `asked`
+    for with another version comes back as the first part, the list having changed meanwhile."""
+    db = _get()
+    vehicle_id = _current_vehicle_id()
+    key, seen = _cache_key(flt, lang, vehicle_id), _data_version()
+    held = _events_cache.get("one")
+    if part and held is not None and held["key"] == key and held["seen"] == seen:
+        return _event_answer(held, part, asked)        # the same list, still untouched: just slice it
+    zone = _local_tz()
+    first, last = flt.days(zone)
+    start = datetime(first.year, first.month, first.day, tzinfo=zone).astimezone(timezone.utc) if first else None
+    end = (datetime(last.year, last.month, last.day, tzinfo=zone) + timedelta(days=1)).astimezone(timezone.utc)
+    kinds = flt.selected_kinds()
+    items = []
+    if kinds & set(EVENT_SIGNAL_KINDS):
+        items += _signal_moments(db, vehicle_id, kinds, start, end)
+    if "trip" in kinds:
+        items += _trip_moments(db, vehicle_id, start, end)
+    if "charge" in kinds:
+        items += _charge_moments(db, vehicle_id, start, end)
+    if "command" in kinds:
+        items += _command_moments(db, start, end)
+    items = [m for m in items if (start is None or start <= m["t"]) and m["t"] < end]
+    _add_context(items, db, vehicle_id)
+    live = events_live(db, vehicle_id)
+    places = [dict(p) for p in db.execute(
+        "SELECT id, name, latitude, longitude, radius_m FROM charging_places"
+        " WHERE vehicle_id = COALESCE(?, vehicle_id) AND enabled = 1", (vehicle_id,))]
+    for m in items:
+        _present_event(m, zone, live, t, places, lang)
+    q = flt.q.lower()
+    if q:
+        items = [m for m in items if any(q in (m.get(f) or "").lower() for f in ("label", "place", "extra", "words"))]
+    items.sort(key=lambda m: (m["t"], m["id"]), reverse=True)        # one second: the later write first
+    listed = {m["anchor"] for m in items}
+    by_day: dict = {}
+    points: dict = {}
+    for m in items:
+        m["from_listed"] = m.get("from_anchor") in listed
+        by_day.setdefault(m["day"], []).append(m)
+        if m["has_fix"]:
+            # The first row of a point is its newest, where a click on the point scrolls the list.
+            p = points.setdefault(m["place_key"], {"key": m["place_key"], "row": m["anchor"], "at": m["place_at"],
+                                                   "lat": 0.0, "lon": 0.0, "n": 0, "i": len(points)})
+            p["lat"] += m["lat"]
+            p["lon"] += m["lon"]
+            p["n"] += 1
+            m["point"] = p["i"]
+    for p in points.values():                                       # a charging place stands where it is set
+        p["lat"], p["lon"] = p["at"] or (round(p["lat"] / p["n"], 6), round(p["lon"] / p["n"], 6))
+    weekdays = i18n.weekday_abbrs(lang)
+    days = [{"date": d, "label": f"{weekdays[d.weekday()]} {i18n.fmt_day_month_year(lang, d)}",
+             "items": by_day[d]} for d in sorted(by_day, reverse=True)]
+    points = [{"key": p["key"], "row": p["row"], "lat": p["lat"], "lon": p["lon"]} for p in points.values()]
+    lines, lanes, runs = _event_lines(items, start, end, weekdays, lang)
+    composed = {"key": key, "seen": seen, "days": days, "lines": lines, "lanes": lanes, "runs": runs,
+                "version": _events_version(lines, points), "count": len(items), "live": live,
+                "first": first, "last": last, "points": points,
+                "address_credit": any(m["place_osm"] for m in items)}
+    _events_cache["one"] = composed
+    return _event_answer(composed, part, asked)
+
+
+def _event_answer(composed: dict, part: int, asked: str | None) -> dict:
+    """One part of a composed list. The version guard lives here, so it reads the same whether the
+    composition was just made or came back from the cache."""
+    version = composed["version"]
+    if part and asked is not None and version != asked:
+        part = 0
+    lines, more = _event_part(composed["lines"], composed["lanes"], composed["runs"], part)
+    return {"days": composed["days"], "lines": lines, "more": more, "part": part, "version": version,
+            "lanes": composed["lanes"], "count": composed["count"], "live": composed["live"],
+            "first": composed["first"], "last": composed["last"], "points": composed["points"],
+            "address_credit": composed["address_credit"]}

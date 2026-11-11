@@ -1,7 +1,7 @@
 """trips.start_geohash/end_geohash — the similar-trips comparator's fast candidate
 pre-filter (see test_similar_trips.py for the matching logic). Written at trip
 creation/finalize (pure math on lat/lon already captured, no network call — unlike the
-auto-note's reverse-geocoding there's no reason to defer this to a background sweep), and
+address lookup (place_lookup) there's no reason to defer this to a background sweep), and
 backfilled once for every trip that predates the columns."""
 import types
 
@@ -71,7 +71,7 @@ def test_backfill_skips_trips_without_coordinates(tmp_path):
 
 
 def test_backfill_leaves_a_null_island_trip_without_a_geohash(tmp_path):
-    """_resolve_coord returns 0.0 — never None — when a frame carries no usable GPS fix, so
+    """gps_position.resolve returns (0, 0) — never None — when a frame carries no usable GPS fix, so
     trips holding start_lat/start_lon = 0.0 are already sitting in every existing database.
     Geohashing those would drop all of them into one bogus bucket off West Africa, and a trip
     whose FIRST fix happened to be missing would then never match its own siblings on the same

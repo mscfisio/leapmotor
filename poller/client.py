@@ -1,17 +1,24 @@
 """
 Leapmotor API client wrapper.
-Uses leapmotor-api 0.3.1, which natively maps the B10/B11 status path to /c10 and
+The cloud client maps the B10/B11 status path to /c10 and
 serves the T03 named-field status, so no endpoint patching is needed here. We still
 parse the raw signal dict ourselves (_parse_signal) to stay independent of the
 library's typed model and insulated from its enum changes.
 """
+import mate_api  # explicit independent runtime; no sitecustomize hook
 import logging
 import os
+import re
+import time
 from dataclasses import dataclass
+from typing import Optional
 
-from leapmotor_api import LeapmotorApiClient
+from api_backend import LeapmotorApiClient
 
 import capability_profile
+from charge_signals import _charge_power_kw, _sf, _si, is_charging, is_plugged_in as _is_plugged_in
+import gps_position
+from events import cable_in_port
 
 log = logging.getLogger(__name__)
 
@@ -21,13 +28,13 @@ class VehicleData:
     vin: str
     timestamp_ms: int
     soc: float
-    range_km: float
+    range_km: Optional[float]           # None when the car reports none (#365)
     odometer_km: float
     speed_kmh: float
     gear: str            # P R N D
     vehicle_state: str   # parked driving
     charging_status: int
-    charge_power_kw: float
+    charge_power_kw: float | None    # |I×V| from 1178/1177; None = no reading the car can vouch for
     latitude: float
     longitude: float
     outside_temp: float
@@ -41,12 +48,14 @@ class VehicleData:
     climate_defrost: bool     # windshield defrost active (signal 1945 == 2)
     trunk_open: bool
     windows_open: bool
-    sunshade_open: bool
+    sunshade_pct: int | None  # how far the sunshade is open, % (signal 1724); 0 = closed, None = not said
     any_door_open: bool       # driver/passenger/rear doors or trunk
     plug_connected: bool      # cable inserted (signal 1149)
     remaining_charge_min: int # minutes to full (signal 1200), 0 when not charging
-    charge_voltage_v: float   # charging voltage (signal 1177)
-    charge_current_a: float   # charging current (signal 1178)
+    charge_voltage_v: float | None   # pack voltage (signal 1177); None = the car did not say
+    charge_current_a: float | None   # pack current (signal 1178), + discharge / − charge; None = not said
+    speed_reported: bool = True     # whether the frame carried 1319; if not: speed_kmh 0, `positions` NULL
+    odometer_reported: bool = True  # whether the frame carried 1318; if not: odometer_km 0, `positions` NULL
     is_reev: bool = False     # car reports a fuel tank (signal 3235) → range-extender model
     fuel_level_pct: float = None  # REEV fuel tank level % (signal 3235); None on a BEV
     # Litres actually in the tank — signal 3263, reported in MILLILITRES. Decoded by @gm27271
@@ -68,10 +77,10 @@ class VehicleData:
     window_fr_open: bool = False
     window_rl_open: bool = False
     window_rr_open: bool = False
-    tire_fl_bar: float = 0.0
-    tire_fr_bar: float = 0.0
-    tire_rl_bar: float = 0.0
-    tire_rr_bar: float = 0.0
+    tire_fl_bar: float | None = None   # None = the car did not send it
+    tire_fr_bar: float | None = None
+    tire_rl_bar: float | None = None
+    tire_rr_bar: float | None = None
     # Comfort STATE sensors (read-only). They reflect reality on the B10 even though the
     # matching remote COMMANDS don't actuate (see capability_profile). 0 = off, >0 = level/on.
     seat_heat_driver: int = 0       # signal 2100 driverSeatHeating
@@ -82,7 +91,8 @@ class VehicleData:
     mirror_heat_left: int = 0       # signal 49 leftMirrorHeating
     mirror_heat_right: int = 0      # signal 50 rightMirrorHeating
     ready: bool = False             # signal 1258 bcmKeyPositionOn3 — faithful READY/ON3 (physical key only)
-    charge_completed: bool = False  # signal 3736 chargeCompleted — true at full charge (validate on a real charge)
+    ready_reported: bool = True     # whether the frame carried 1258; if not: ready False, `positions` NULL
+    charge_completed: bool = False  # signal 3736 chargeCompleted — not a full-charge flag, see _parse_signal
     security_active: bool | None = None   # signal 1255 vehicleSecurityActive — None = the car never said
     charge_limit_percent: int | None = None  # configured max-charge SoC (from the config block, not a
                                              # signal); None if unknown / model doesn't report it
@@ -90,10 +100,11 @@ class VehicleData:
     # LATCHES at 1 for ~5-10 min after a charge, see _is_plugged_in), 2 = V2L bidirectional discharge
     # active. Verified on-car 2026-06-19: V2L switch ON + adapter → 47=2, battery discharging (1178>0).
     ac_port_mode: int = 0
+    dc_gun_connected: bool | None = None  # DC fast-charge gun inserted (signal 1197); None = not reported
 
     # Climate detail (read+write validated on-car 2026-06-20): fan level (signal 1941 acAirVolume,
-    # 1-7; HOLDS the last level even when A/C is off), recirculation (signal 1943: 1=recirc/in,
-    # 0=fresh/out), base mode (signal 3713: 0=auto·1=cool·3=heat·4=vent). NB: markoceri's lib
+    # up to the car's top speed; HOLDS the last level even when A/C is off), recirculation (signal 1943: 1=recirc/in,
+    # 0=fresh/out), base mode (signal 3713: 0=auto·1=cool·3=heat·4=vent). NB: the old SDK
     # mislabels 1941 as drive_status — the on-car diff proved it's the fan air-volume.
     fan_level: int = 0
     recirculation: bool = False
@@ -106,6 +117,12 @@ class VehicleData:
     # Kept apart from plug_connected because the two answer different questions: the Overview and
     # the MQTT sensor want "is the cable in", the session machinery wants "is a charge running".
     charge_deferred: bool = False
+
+    @property
+    def cable_connected(self) -> bool:
+        """The cable in the port, as the pages and the events read it — not `plug_connected`, which is
+        the charge session the poller opens and closes charges on (#429)."""
+        return cable_in_port(self.plug_connected, self.ac_port_mode, self.gear, self.speed_kmh)
 
     @property
     def v2l_active(self) -> bool:
@@ -141,20 +158,9 @@ class EmptyStatusError(Exception):
     retry rather than treating it as a hard failure."""
 
 
-# Title/body keywords that mark an inbox message as an OTA / software update (lowercase, substring),
-# across the languages a Leapmotor account may use. STOPGAP until a real OTA message pins its
-# msg_type — see LeapmotorMateClient.check_ota(). Kept broad enough to catch the notice, specific
-# enough that everyday messages (vehicle sharing, etc.) don't match.
-_OTA_KEYWORDS = (
-    "ota", "fota", "firmware", "aggiorn", "software update", "software-update", "system update",
-    "vehicle update", "update available", "mise à jour", "mise a jour", "logiciel",
-    "aktualis", "software-aktualisierung", "upgrade",
-)
-
-
 class LeapmotorMateClient:
     def __init__(self, username: str, password: str, pin: str, cert_path: str, key_path: str,
-                 device_id: str | None = None):
+                 device_id: str | None = None, on_login=None):
         self._api = LeapmotorApiClient(
             username=username,
             password=password,
@@ -166,6 +172,9 @@ class LeapmotorMateClient:
         )
         import session_share
         session_share.install(self._api)   # share ONE token with the web (avoid mutual eviction)
+        # told by the backend of every login the cloud is really asked for — from whichever read
+        # or command needed it, never for a resumed session: on_login(None) or on_login(exc)
+        self._api.on_login = on_login
         self._vehicle = None
         self._vehicles: list = []          # every car on the account, in the order the cloud lists them
         self._named_mode_logged = False    # log the T03/EU named-field path once
@@ -194,10 +203,28 @@ class LeapmotorMateClient:
                      extra.vin, extra.car_type, getattr(extra, "is_shared", False))
 
     def relogin(self):
-        """Force a fresh login to self-heal a broken session. The account TLS cert
-        lives in a /tmp temp file; if it vanishes, every request fails forever with
-        'Could not find the TLS certificate file'. Dropping the shared-session blob
-        and re-logging in re-creates the cert. Also recovers auth/token drops."""
+        """Self-heal a broken session — spending a token REFRESH first, and a full login only
+        if that does not hold.
+
+        The account TLS cert lives in a /tmp temp file; if it vanishes, every request fails
+        forever with 'Could not find the TLS certificate file'. Dropping the shared-session blob
+        and re-logging in re-creates the cert. Also recovers auth/token drops.
+
+        ⚠️ But this path is reached from an ORDINARY poll error too — a read timeout, a dropped
+        connection — and those are blips, not dead sessions. Three bundles from 17-18/09/2026
+        (beta #49 + #295 @gm27271, #296 @adoewa, @ebagnoli) show the same three lines over and
+        over: a `Read timed out`, a re-login, a refusal. From 17/09 the cloud takes 5-12 logins a
+        day from an account where it used to take ~310, so each blip spent one of the few left and
+        threw away a refresh token that was most likely still good. The refresh is one signed
+        request against a different endpoint; when the cause really is the vanished cert it fails
+        as well, and the full login below runs exactly as it does today."""
+        if getattr(self._api, "refresh_token", None):
+            try:
+                self._api.token_refresh()
+                log.info("Session refreshed — no login spent")
+                return
+            except Exception as e:  # noqa: BLE001 — any failure just means: do the full login
+                log.info("Token refresh did not hold (%s) — falling back to a full login", e)
         try:
             import sqlite3
             c = sqlite3.connect(os.environ.get("DB_PATH", "leapmotor_mate.db"), timeout=5)
@@ -271,7 +298,7 @@ class LeapmotorMateClient:
             # T03 / EU responses carry live data as NAMED fields at the top level of
             # `data` (e.g. "soc", "speed", "gearStatus") instead of a numeric-ID
             # `signal` sub-dict like C10/B10. Rebuild the signal dict our parser
-            # expects from those named fields (id↔name map per leapmotor-api 0.3.1).
+            # expects from those named fields (the cloud's id↔name map).
             sig = _named_fields_to_signal(data)
             if sig and not self._named_mode_logged:
                 log.info("T03/EU named-field status detected — mapped %d live fields", len(sig))
@@ -286,10 +313,8 @@ class LeapmotorMateClient:
         # often a poll perturbed by a just-issued command (e.g. changing the charge limit). Treat it
         # as "no live data" (like an asleep poll) so it can't be stored as a spurious soc=0 row that
         # then seeds a phantom "charged from 0%" reconstruction / "recover missed charges" hit.
-        _soc_raw = sig.get("100003")
-        if _soc_raw is None:
-            _soc_raw = sig.get("1204")
-        if _soc_raw is None or (float(_soc_raw or 0) == 0 and float(sig.get("3260") or 0) > 5):
+        # The rule lives in capability_profile: the web stores positions too and refuses the same.
+        if not capability_profile.has_soc_reading(sig):
             raise EmptyStatusError("vehicle status carries no usable SoC (partial/glitch read)")
         vd = _parse_signal(vehicle.vin, sig)
         vd.raw_signals = sig   # full dict for research-mode full-PID logging (ignored in normal builds)
@@ -305,38 +330,6 @@ class LeapmotorMateClient:
         except (TypeError, ValueError):
             pass
         return vd
-
-    def check_ota(self) -> dict:
-        """Scan the account message inbox for an OTA / software-update notice. This is the ONLY
-        automatic "update available" signal Leapmotor exposes — there is NO dedicated OTA-status
-        endpoint (even the official-app flow / LeapConnect needs the FOTA task_id typed in by hand);
-        the cloud delivers "update available" as an inbox MESSAGE. Best-effort, never raises.
-        Returns {ok: bool (endpoint answered), scanned: int, ota: bool, title, time}.
-
-        `ok` distinguishes the three states that all otherwise surface as a bare "None" on the
-        Overview and used to be indistinguishable (issue #156, a Malaysia C10): the inbox is
-        genuinely empty (ok=True, scanned=0), it has messages but none is an update (ok=True,
-        scanned>0, ota=False), or we couldn't read the inbox at all for this account/region
-        (ok=False). The caller logs each outcome so a diagnostics bundle can tell which it is.
-
-        We match on the message title/body because the numeric `msg_type` is undocumented and was
-        None on every message we've captured so far — so this keyword match is a deliberate STOPGAP:
-        the moment a real OTA message is seen on-car, key off its exact msg_type instead and tighten
-        this. Non-OTA messages (vehicle sharing, etc.) are intentionally ignored — not surfaced."""
-        try:
-            ml = self._api.get_message_list(page_no=1, page_size=20)
-            msgs = getattr(ml, "messages", None) or []
-        except Exception as e:  # noqa: BLE001 — strict lib parser can raise on odd payloads
-            log.warning("OTA inbox scan: message endpoint failed (%s) — cannot check for updates", e)
-            return {"ok": False}
-        for m in msgs:
-            hay = f"{getattr(m, 'title', '') or ''} {getattr(m, 'message', '') or ''}".lower()
-            if any(k in hay for k in _OTA_KEYWORDS):
-                st = getattr(m, "send_time", None)
-                return {"ok": True, "scanned": len(msgs), "ota": True,
-                        "title": getattr(m, "title", None),
-                        "time": int(st) if st else None}
-        return {"ok": True, "scanned": len(msgs), "ota": False}
 
     def get_charge_schedule(self) -> dict | None:
         """The car's own charge window (cmd 190) — flat dict: chargeEnable, starttime, endtime,
@@ -362,7 +355,7 @@ class LeapmotorMateClient:
         import time as _time
         from urllib.parse import quote
         try:
-            from leapmotor_api.crypto import build_signed_headers
+            from leapmotor_cloud.mate_compat import adapter_owned_headers as build_signed_headers
             api, vin = self._api, (vehicle or self._vehicle).vin
             now_ms = int(_time.time() * 1000)
             b_ms = now_ms - 7 * 86400 * 1000
@@ -396,7 +389,7 @@ class LeapmotorMateClient:
         import json as _json
         from urllib.parse import quote
         try:
-            from leapmotor_api.crypto import build_consumption_last_week_headers
+            from leapmotor_cloud.mate_compat import adapter_owned_headers as build_consumption_last_week_headers
             api, vin = self._api, (vehicle or self._vehicle).vin
             h = build_consumption_last_week_headers(
                 sign_key=api.sign_key, device_id=api.device_id, carvin=vin,
@@ -426,7 +419,7 @@ class LeapmotorMateClient:
         self._api.close()
 
 
-# Numeric signal-id → T03 named-field map (verbatim from leapmotor-api 0.3.1's
+# Numeric signal-id → T03 named-field map (from the cloud's
 # _SIGNAL_TO_NAMED). C10/B10 report these as numeric IDs inside `data["signal"]`;
 # the T03 / EU API reports the SAME data as these named fields at the top level of
 # `data`. We invert this to rebuild a numeric `signal` dict for the T03 so the shared
@@ -442,7 +435,12 @@ _SIGNAL_TO_NAMED = {
     "1480": "parkingBrakeState", "6048": "speedLimit", "6047": "speedLimitUnit",
     "12054": "speedLimitActive",
     "3725": "latitude", "3724": "longitude",
-    "3": "latitudeSigned", "2": "longitudeSigned",
+    # #282: the T03 has no separate signed pair — its `latitude`/`longitude` ARE signed, so they
+    # fill the signed slots too. These used to read `latitudeSigned`/`longitudeSigned`, names no
+    # response carries: 2/3 stayed empty on every T03, the resolver took abs() of the only value
+    # and re-applied a remembered +1, and a T03 west of Greenwich was plotted east. Twin of
+    # web/command_client.py's copy — test_a_t03_west_of_greenwich_keeps_its_longitude.py.
+    "3": "latitude", "2": "longitude",
     "1938": "acSwitch", "2183": "acSetting", "2184": "acSettingRight", "1349": "interiorTemp",
     "1943": "recirculationMode", "1945": "windshieldDefrost", "1946": "rearWindowHeating",
     "3713": "climateMode", "2669": "rapidCooling", "2681": "rapidHeating",
@@ -453,8 +451,11 @@ _SIGNAL_TO_NAMED = {
     "1695": "leftRearWindowStatus", "1696": "rightRearWindowStatus",
     "1298": "driverDoorLockStatus", "1277": "lbcmDriverDoorStatus", "1278": "rbcmDriverDoorStatus",
     "1279": "lbcmLeftRearDoorStatus", "1280": "rbcmRightRearDoorStatus", "1281": "bbcmBackDoorStatus",
-    "2667": "leftFrontTirePressure", "2653": "rightFrontTirePressure",
-    "2646": "leftRearTirePressure", "2660": "rightRearTirePressure",
+    # Tyre pressures: the library documents 2667 as the left front, but on the car 2646 is
+    # (_parse_signal reads FL=2646, FR=2653, RL=2660, RR=2667), so each named field goes
+    # under the id the parser reads for that wheel.
+    "2646": "leftFrontTirePressure", "2653": "rightFrontTirePressure",
+    "2660": "leftRearTirePressure", "2667": "rightRearTirePressure",
     "2641": "leftFrontTirePressureState", "2648": "rightFrontTirePressureState",
     "2655": "leftRearTirePressureState", "2662": "rightRearTirePressureState",
     "1256": "bcmKeyPositionOn1", "1257": "bcmKeyPositionOn2", "1258": "bcmKeyPositionOn3",
@@ -480,16 +481,10 @@ def _named_fields_to_signal(data: dict) -> dict | None:
 _GEAR_MAP = {0: "P", 1: "R", 2: "N", 3: "D"}
 
 
-def _sf(sig: dict, k: str):
-    v = sig.get(k)
-    try:    return float(v) if v is not None else None
-    except (TypeError, ValueError): return None
-
-
-def _si(sig: dict, k: str):
-    v = sig.get(k)
-    try:    return int(v) if v is not None else None
-    except (TypeError, ValueError): return None
+def _bar(sig: dict, k: str):
+    """A tyre pressure in bar from its kPa signal, or None when the car did not send one."""
+    kpa = _sf(sig, k)
+    return None if kpa is None else round(kpa / 100.0, 2)
 
 
 # Below this magnitude the charge current is just plugged-idle / sensor noise.
@@ -499,61 +494,24 @@ def _si(sig: dict, k: str):
 _CHARGE_CURRENT_MIN_A = 2.0
 
 
+def use_pin_of(api, db, vin: str) -> None:
+    """Authorise the next command with the PIN of the car it is for (#186, @cookingeek).
+
+    The session is shared by every car, and a command can arrive for either: with two cars that
+    differ, the session's own PIN would authenticate one car's command with the other's four digits,
+    a failure that happens only sometimes and never says why. A car without one gets none, not the
+    last car's."""
+    try:
+        api.operation_password = db.get_operate_pin(vin)
+    except Exception:  # noqa: BLE001 — a PIN lookup must never stop a command from being tried
+        api.operation_password = ""
+
+
 def set_charge_current_min(amps: float) -> None:
     """Update the charge-detection current floor (A) from the Settings value."""
     global _CHARGE_CURRENT_MIN_A
     if amps and amps > 0:
         _CHARGE_CURRENT_MIN_A = amps
-
-
-def _charge_power_kw(sig: dict) -> float:
-    """Charge/regen power from current (1178) × voltage (1177). Signal 49 is NOT a
-    power — in the Leapmotor app it's the left-mirror-heating flag. Magnitude only;
-    the recorder decides charge vs regen from the current sign."""
-    current = _sf(sig, "1178")
-    voltage = _sf(sig, "1177")
-    if current is None or voltage is None or abs(current) < _CHARGE_CURRENT_MIN_A:
-        return 0.0
-    return round(abs(current * voltage) / 1000.0, 3)
-
-
-def _is_plugged_in(sig: dict) -> bool:
-    """Whether the charge cable is physically connected. Uses signal 1149 (charge
-    connection status: 1=connected, 2=charging), gated by motion.
-
-    Why 1149 and not 47: signal 47 (acInputSlowCharge) was the old primary, but on the
-    B10 it LATCHES at 1 after an AC charge and only clears ~5 min later, when the car's
-    charge controller tears down the AC subsystem — it does NOT drop on unplug. That kept
-    a finished charge SESSION open long after the cable was pulled (the plug_connected
-    OR-term in the state machine never went false), inflating the session window.
-    Signal 1149 instead drops to 0 promptly when the charge SESSION ends — at completion
-    (target SoC reached) or on unplug. Verified on-car twice: 1149 fell ~40s after the car
-    hit its charge limit and the session closed at once, while 47 stayed latched at 1 for
-    10+ minutes (right through the physical unplug). Its only flaw is reading 1 spuriously
-    during regen at speed, so we suppress it while the car is moving (it can never be
-    plugged in while driving anyway — same motion gate as _is_charging). Falls back to
-    signal 47 only when 1149 is absent (other models)."""
-    if _si(sig, "1010") not in (None, 0):       # gear R/N/D → moving, cannot be plugged
-        return False
-    if (_sf(sig, "1319") or 0) > 2.0:            # speed > 2 km/h → moving (gear may lag)
-        return False
-    conn = _si(sig, "1149")
-    if conn is not None:
-        # 1=connected, 2=charging, 3=a third connected state the REEVs cycle THROUGH mid-charge
-        # (seen on the C10/B10 range-extenders alongside 1=2, always parked, current ~0). Treating
-        # 3 as unplugged made the cable read as pulled every time it flickered 2→3→2, which closed
-        # and reopened the session and shredded one slow AC charge into many empty fragments — each
-        # then dropped as a phantom (beta #12/#13). Keep the session whole across the flicker; the
-        # motion gate above still bars anything that could read 3 while driving. (5 = the drive-time
-        # cable code, deliberately NOT here.)
-        # 4 = connected, but the charge is DEFERRED to the programmed window: the cable is in and
-        # the car is deliberately not drawing. Measured on Silvio's B10 on 09/08/26 (#243) — he
-        # enabled the schedule mid-charge and the code went 2 → 4 with the cable untouched, while
-        # the official app, reading that same frame, kept drawing the cable. It used to fall into
-        # "unplugged" by exclusion, which is what blanked the cable on the Overview. See
-        # `_is_deferred_charge`: 4 must never be read as charging.
-        return conn in (1, 2, 3, 4)
-    return _si(sig, "47") == 1                   # legacy fallback when 1149 is missing
 
 
 def _is_deferred_charge(sig: dict) -> bool:
@@ -583,59 +541,8 @@ def _temp_or_none(raw):
 
 
 def _is_charging(sig: dict) -> bool:
-    """Whether the car is actually charging. Charging only happens while PARKED, so the
-    car must be stationary (gear P, speed ~0); plus the cable plugged in (1149) AND a
-    meaningful charge current (1178). The motion gate is essential: during regen braking
-    the pack current is strongly negative (same sign as charging) AND 1149 reads 1
-    spuriously, so without it driving is mistaken for charging — fragmenting trips and
-    creating phantom charge sessions. Signal 1939 (AC fan mode) is NOT used."""
-    if _si(sig, "1010") not in (None, 0):   # gear R/N/D → moving, cannot be charging
-        return False
-    if (_sf(sig, "1319") or 0) > 2.0:       # speed > 2 km/h → moving (gear signal may lag)
-        return False
-    # 5 is the drive-time cable code, NOT a connection — _is_plugged_in leaves it out for the same
-    # reason, and the two readers of 1149 must agree. The motion gate above does not always catch
-    # it: on ebagnoli's C10 (beta #13) 1149 read 5 at 08:30 on 23/07 while the speed frame was
-    # still the previous evening's 0 km/h, which opened a 0-minute session — harmless only because
-    # it delivered nothing and the phantom guard dropped it.
-    # ⚠️ 4 (charge postponed to the programmed window) is deliberately NOT excluded here, though it
-    # is a "not drawing" code. We have measured 4 only at rest (0.1 A); nobody has watched a car
-    # whose window OPENS while the code stays at 4. Excluding it would then drop the entire
-    # scheduled charge, silently — the worse failure by far. Let the current decide, as it does for
-    # every other code: parked with a real charge current IS a charge, whatever the cable says.
-    if _si(sig, "1149") in (None, 0, 5):   # cable not connected → cannot be charging
-        return False
-    current   = _sf(sig, "1178")
-    remaining = _si(sig, "1200")
-    power     = _charge_power_kw(sig)
-
-    if current is not None:
-        if abs(current) < _CHARGE_CURRENT_MIN_A:   # resting/plugged-idle → not charging
-            # ...EXCEPT a C10 REEV charging in AC: on that car the pack current (1178) reads ~0
-            # during slow AC charging — the on-board charger feeds the pack by a path this sensor
-            # doesn't see — so the BEV rule "current ≥ 2 A" never fires and the session is missed
-            # (beta #13 ebagnoli; same signature back to the earliest 1.36.1 bundle). Trust the
-            # cable's OWN state when it explicitly says "charging" (1149==2, not the
-            # "connected/waiting" 1149==1 of a scheduled charge) AND a charge is in progress
-            # (remaining minutes > 0). Driving is already gated out above, and a bare 0→2→0 cable
-            # blip has no remaining-time so it still can't open a phantom.
-            #
-            # ⚠️ This is the C10 signature ONLY — NOT the B10 REEV, whatever this comment used to
-            # say. @michapr (beta #12) was diagnosed as this case on 23/07 and it was wrong: his
-            # pack current during AC charging reads −3.8 A, well above the floor. v2.8.4 shipped
-            # this very rule for him and changed nothing, because his cable sits at 1149==1 and
-            # only brushes 2 for a few seconds at a time — the test below essentially never fires
-            # on that car. Retracted in the issue on 24/07 ("I had tuned it on a C10's signature
-            # and wrongly assumed the two REEVs behaved the same"), and fixed for real in v2.8.6
-            # by the SoC-rise branch in state_machine.py, which is what actually covers a B10 REEV.
-            # Do not re-add michapr here: two REEV models, two different signatures, two rules.
-            if _si(sig, "1149") == 2 and (_si(sig, "1200") or 0) > 0:
-                return True
-            return False
-        return remaining is not None or power >= 1.0
-    if power >= 1.0:
-        return remaining is not None
-    return _si(sig, "1149") == 2                    # fallback: connection status "charging"
+    """Whether the car is charging, against the user's charge-detection floor."""
+    return is_charging(sig, _CHARGE_CURRENT_MIN_A)
 
 
 # ── GPS sign memory (GitHub #43) ────────────────────────────────────────────────
@@ -644,98 +551,41 @@ def _is_charging(sig: dict) -> bool:
 # an absolute value — re-flipping west-of-Greenwich / southern-hemisphere cars into the sea
 # (the #30 symptom returns; smalley1992 is the second UK car to hit it). A car can't cross
 # the equator or prime meridian between polls, so we remember the last AUTHORITATIVE sign
-# per VIN and re-apply it to the unsigned magnitude. The memory is only ever written by a
-# signed read, never by the fallback, so it can't be polluted. seed_coord_signs() primes it
-# from a persisted setting on poller startup, so an add-on update / restart doesn't plot the
-# car in the sea until the next signed poll arrives.
-_coord_sign: dict[str, dict[str, float]] = {}
-
-# #232: "written only by a signed read" is not the same as "written only by a SIGNED read". Signal
-# 2 was believed whenever it was non-zero, with no sanity check, so one frame that arrived carrying
-# the bare magnitude taught the wrong hemisphere — and poller/main.py then persisted it, so the
-# mistake outlived the restart and both readers mirrored the car for good.
-#
-# The physics the guard was missing: a car cannot teleport across the line. Driving to the other
-# side means passing through zero, so a real crossing is always observed NEAR the line; a dropped
-# sign is observed at full magnitude (8.6° W becoming 8.6° E is 1720 km between two polls).
-_MERIDIAN_NEAR_DEG = 1.0          # within ~85 km of the line a crossing is ordinary — believe it
-_SIGN_FLIP_CONFIRMATIONS = 10     # far from it, the flip must be argued: 10 polls in a row
-# Consecutive signed polls, per VIN and axis, asking for the opposite hemisphere. Kept OUT of
-# _coord_sign so get_coord_signs() still returns only the two signs poller/main.py persists — a
-# counter leaking in there would rewrite the setting on every poll.
-_sign_flip_pending: dict[str, dict[str, int]] = {}
+# per VIN and re-apply it to the unsigned magnitude; gps_position decides, for this process and
+# the web alike. seed_coord_signs() primes it from a persisted setting on poller startup, so an
+# add-on update / restart doesn't plot the car in the sea until the next signed poll arrives.
+_gps: dict[str, gps_position.Memory] = {}
 
 
-def _coerce_float(raw) -> float:
-    if raw in (None, ""):
-        return 0.0
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def seed_coord_signs(vin: str, lat_sign: float = 0.0, lon_sign: float = 0.0) -> None:
-    """Prime the per-VIN GPS sign memory at poller startup. 0 = unknown (leaves it unset)."""
+def seed_coord_signs(vin: str, lat_sign: float = 0.0, lon_sign: float = 0.0,
+                     newest_frame_ts: Optional[int] = None) -> None:
+    """Prime the per-VIN GPS sign memory at poller startup. 0 = unknown (leaves it unset).
+    `newest_frame_ts` is the newest usable frame clock on record (db.get_newest_frame_ts), so no
+    frame heard before the restart, the one the cloud re-serves first among them, is new again."""
     if not vin:
         return
-    mem = _coord_sign.setdefault(vin, {})
+    mem = _gps.setdefault(vin, gps_position.Memory())
+    mem.newest_frame_ts = max(mem.newest_frame_ts, newest_frame_ts or 0)
+    signs = mem.signs
     if lat_sign:
-        mem["lat"] = -1.0 if lat_sign < 0 else 1.0
+        signs["lat"] = -1.0 if lat_sign < 0 else 1.0
     if lon_sign:
-        mem["lon"] = -1.0 if lon_sign < 0 else 1.0
+        signs["lon"] = -1.0 if lon_sign < 0 else 1.0
 
 
 def get_coord_signs(vin: str) -> dict:
     """Current remembered signs for this VIN (only updated by authoritative signed reads)."""
-    return dict(_coord_sign.get(vin, {}))
+    return dict(_gps[vin].signs) if vin in _gps else {}
 
 
-def _resolve_coord(vin: str, axis: str, signed_raw, unsigned_raw) -> float:
-    """Resolve one GPS axis. The signed signal (2/3) is authoritative and refreshes the
-    remembered sign; when only the unsigned signal is present, re-apply the remembered sign
-    to its magnitude (#43). Returns 0.0 when no usable value exists. With no memory yet (a
-    fresh install before any signed poll) the unsigned value is used as-is — unchanged from
-    the pre-#43 behaviour, so east-of-Greenwich cars are never affected.
+def restore_gps_record(vin: str, text: str) -> None:
+    """Load what the last run persisted (gps_position.record), after the signs are seeded."""
+    if vin:
+        gps_position.restore(_gps.setdefault(vin, gps_position.Memory()), text)
 
-    A signed read that contradicts a hemisphere we already know is only believed near the line, or
-    after _SIGN_FLIP_CONFIRMATIONS polls in a row say the same thing (#232)."""
-    mem = _coord_sign.setdefault(vin, {})
-    s = _coerce_float(signed_raw)
-    if s != 0.0:
-        proposed = -1.0 if s < 0 else 1.0
-        known = mem.get(axis)
-        if known is None or known == proposed or s < 0.0 or abs(s) <= _MERIDIAN_NEAR_DEG:
-            # Nothing to protect (fresh install), nothing to argue about, a value that proves its
-            # own sign, or a car genuinely at the line. Any of the four also settles a pending flip.
-            #
-            # 🔑 `s < 0` is why the guard is one-directional: a LOST sign can only ever surface as
-            # a positive number, because the signals it would be confused with are magnitudes and
-            # have no minus to drop. A negative reading is therefore evidence, not noise — doubting
-            # it would strand a car that moved west or south for ten polls and buy nothing.
-            mem[axis] = proposed
-            _sign_flip_pending.get(vin, {}).pop(axis, None)
-            return s
-        seen = _sign_flip_pending.setdefault(vin, {}).get(axis, 0) + 1
-        _sign_flip_pending[vin][axis] = seen
-        if seen >= _SIGN_FLIP_CONFIRMATIONS:
-            # Argued for long enough to be real: a car shipped across the line with its SIM dark
-            # never gets to be seen near it, and refusing forever would strand that owner.
-            log.warning("GPS %s: the opposite hemisphere has now been reported %d polls running — "
-                        "accepting it and re-learning the sign", axis, seen)
-            mem[axis] = proposed
-            _sign_flip_pending[vin].pop(axis, None)
-            return s
-        # NO coordinate in this line: the poller log ships inside the diagnostics bundle, which
-        # strips the GPS signals precisely so it can be attached in public (#232 asked for it).
-        log.warning("GPS %s: cloud reported the opposite hemisphere far from the line (%d/%d) — "
-                    "a car cannot cross it in one poll, keeping the remembered sign",
-                    axis, seen, _SIGN_FLIP_CONFIRMATIONS)
-        return abs(s) * known
-    u = _coerce_float(unsigned_raw)
-    if u == 0.0:
-        return 0.0
-    return abs(u) * mem.get(axis, 1.0)
+
+def get_gps_record(vin: str) -> str:
+    return gps_position.record(_gps.setdefault(vin, gps_position.Memory()))
 
 
 def _parse_signal(vin: str, sig: dict) -> VehicleData:
@@ -752,19 +602,24 @@ def _parse_signal(vin: str, sig: dict) -> VehicleData:
     # to the web today (the windows_pct gate is never marked broken) and the B10 is safe because it
     # sends no % signals. window_open_states returns [FL, FR, RL, RR].
     win_states = capability_profile.window_open_states(sig, bool(vin))
+    dc_gun = _si(sig, "1197")   # None when absent or unreadable — the cloud has sent "" before
+    fuel_pct = _sf(sig, "3235")
+    fuel_ml = _sf(sig, "3263")
 
-    return VehicleData(
+    data = VehicleData(
         vin=vin,
         timestamp_ms=int(sig.get("sts") or sig.get("1") or 0),
         soc=float(sig.get("100003") or sig.get("1204") or 0),
-        range_km=float(sig.get("3260") or 0),
-        is_reev=(sig.get("3235") is not None),   # fuel level present → range-extender variant
-        fuel_level_pct=(float(sig["3235"]) if sig.get("3235") is not None else None),  # REEV tank %
-        fuel_liters=(float(sig["3263"]) / 1000.0 if sig.get("3263") is not None else None),  # 3263 = mL
-        fuel_range_km=(float(sig["3259"]) if sig.get("3259") is not None else None),       # REEV fuel range
-        combined_range_km=(float(sig["3261"]) if sig.get("3261") is not None else None),   # REEV total range
+        range_km=capability_profile.battery_range_km(sig),   # None: not reported (#365)
+        is_reev=(sig.get("3235") is not None),   # fuel level FIELD present → range-extender variant
+        fuel_level_pct=fuel_pct,                                        # REEV tank %
+        fuel_liters=(fuel_ml / 1000.0 if fuel_ml is not None else None),  # 3263 = mL
+        fuel_range_km=_sf(sig, "3259"),                                 # REEV fuel range
+        combined_range_km=_sf(sig, "3261"),                             # REEV total range
         odometer_km=float(sig.get("1318") or 0),
         speed_kmh=speed_kmh,
+        speed_reported=_sf(sig, "1319") is not None,
+        odometer_reported=_sf(sig, "1318") is not None,
         gear=gear,
         vehicle_state=vehicle_state,
         charging_status=1 if _is_charging(sig) else 0,
@@ -772,9 +627,10 @@ def _parse_signal(vin: str, sig: dict) -> VehicleData:
         # Signals 2/3 carry the SIGNED coordinates; 3724/3725 (and 2190/2191) are unsigned —
         # west-of-Greenwich cars lost the longitude sign there (GitHub #30: Lichfield B10
         # reports 2=-1.915912 but 3724=+1.915912; on east-of-Greenwich cars 2 == 3724). When
-        # a poll omits the signed pair, _resolve_coord re-applies the last known sign (#43).
-        latitude=_resolve_coord(vin, "lat", sig.get("3"), sig.get("3725") or sig.get("2190")),
-        longitude=_resolve_coord(vin, "lon", sig.get("2"), sig.get("3724") or sig.get("2191")),
+        # a poll omits the signed pair, gps_position re-applies the last known sign (#43).
+        # Set last, below: a frame that fails to parse must not have taught the sign memory.
+        latitude=0.0,
+        longitude=0.0,
         outside_temp=None,   # no ambient-temp signal exists (2101 = driverSeatVentilation)
         # 🔴 A temperature the car did not send is ABSENT, not zero. `or 0` turned silence into
         # 0.0 — a value that looks like a reading, and in August, at forty degrees outside, an
@@ -793,22 +649,23 @@ def _parse_signal(vin: str, sig: dict) -> VehicleData:
         climate_cooling=int(sig.get("2669") or 0) == 2,
         climate_heating=int(sig.get("2681") or 0) == 2,
         climate_defrost=int(sig.get("1945") or 0) == 2,
-        fan_level=int(sig.get("1941") or 0),                        # 1941 acAirVolume: fan level 1-7
+        fan_level=int(sig.get("1941") or 0),                        # 1941 acAirVolume: fan level
         recirculation=int(sig.get("1943") or 0) == 1,              # 1943: 1=recirc(in) / 0=fresh(out)
-        climate_mode=int(sig["3713"]) if sig.get("3713") is not None else None,  # 3713: 0 auto/1 cool/3 heat/4 vent
-        climate_power=int(sig["1348"]) if sig.get("1348") is not None else None,  # 1348 PTC power (W)
+        climate_mode=_si(sig, "3713"),    # 3713: 0 auto/1 cool/3 heat/4 vent
+        climate_power=_si(sig, "1348"),   # 1348 PTC power (W)
         trunk_open=int(sig.get("1281") or 0) != 0,
         windows_open=any(bool(w) for w in win_states),
-        sunshade_open=int(sig.get("1724") or 0) != 0,
+        sunshade_pct=_si(sig, "1724"),
         any_door_open=any(
             int(sig.get(k) or 0) != 0
             for k in ("1277", "1278", "1279", "1280", "1281")
         ),
         plug_connected=_is_plugged_in(sig),
+        dc_gun_connected=None if dc_gun is None else dc_gun != 0,
         charge_deferred=_is_deferred_charge(sig),
         remaining_charge_min=int(sig.get("1200") or 0),
-        charge_voltage_v=float(sig.get("1177") or 0),
-        charge_current_a=float(sig.get("1178") or 0),
+        charge_voltage_v=_sf(sig, "1177"),   # absent is None, not 0 V (same rule as the temperatures)
+        charge_current_a=_sf(sig, "1178"),
         ac_port_mode=int(sig.get("47") or 0),    # 47 acInputSlowCharge: 0 idle / 1 AC charge / 2 V2L
         seat_heat_driver=int(sig.get("2100") or 0),
         seat_heat_passenger=int(sig.get("2118") or 0),
@@ -829,18 +686,22 @@ def _parse_signal(vin: str, sig: dict) -> VehicleData:
         window_fr_open=bool(win_states[1]),
         window_rl_open=bool(win_states[2]),
         window_rr_open=bool(win_states[3]),
-        # Tyre signal→wheel mapping. The leapmotor-api docs label these LF=2667/RF=2653/
+        # Tyre signal→wheel mapping. Older third-party docs label these LF=2667/RF=2653/
         # LR=2646/RR=2660, but that's WRONG: cross-checked on TWO real B10s against the official
         # app's per-wheel view — the #32 reporter's UK car AND Silvio's IT car, both with the
         # 280-kPa wheel at the REAR-RIGHT — the true order is the ascending-id one:
-        # 2646=FL, 2653=FR, 2660=RL, 2667=RR. (State signals pair the same way:
-        # FL=2655, FR=2648, RL=2662, RR=2641 — see _parse_vehicle_status.)
-        tire_fl_bar=round(float(sig.get("2646") or 0) / 100.0, 2),
-        tire_fr_bar=round(float(sig.get("2653") or 0) / 100.0, 2),
-        tire_rl_bar=round(float(sig.get("2660") or 0) / 100.0, 2),
-        tire_rr_bar=round(float(sig.get("2667") or 0) / 100.0, 2),
+        # 2646=FL, 2653=FR, 2660=RL, 2667=RR. (The alarm flags do not move with them: the old SDK,
+        # leapmotor-ha and ioBroker all pair them as 2641=FL, 2648=FR, 2655=RL, 2662=RR — see the
+        # web's _parse_vehicle_status.)
+        tire_fl_bar=_bar(sig, "2646"),
+        tire_fr_bar=_bar(sig, "2653"),
+        tire_rl_bar=_bar(sig, "2660"),
+        tire_rr_bar=_bar(sig, "2667"),
         ready=int(sig.get("1258") or 0) == 1,   # B10 faithful READY (ON3) sensor
-        charge_completed=int(sig.get("3736") or 0) != 0,  # 3736 chargeCompleted — truthy (confirm value at a real full charge)
+        ready_reported=_sf(sig, "1258") is not None,
+        # 3736 is no full-charge flag: the official app interprets it as isHaveFullCharge (a tip that a healthy-charging
+        # calibration needs a charge to 100 %); a BEV B10 never sets it, a B10 REEV holds it for the whole charge.
+        charge_completed=int(sig.get("3736") or 0) != 0,
         # 🔴 None when the car never sends 1255 — NOT False. Two C10s (@ghuaywen-ai #256,
         # @ebagnoli over 17 continuous days) carry 77 and 88 signals and neither has it, while a
         # B10 sends it 252 times with values 0/1/2. Read as False, an absent signal printed
@@ -848,3 +709,7 @@ def _parse_signal(vin: str, sig: dict) -> VehicleData:
         security_active=(None if sig.get("1255") is None
                          else int(sig.get("1255") or 0) != 0),   # B10 reads 2 when armed; truthy
     )
+    data.latitude, data.longitude = gps_position.resolve(
+        _gps.setdefault(vin, gps_position.Memory()), sig, learn=True,
+        frame_ts=data.timestamp_ms, now_ms=int(time.time() * 1000))
+    return data

@@ -67,6 +67,7 @@
   <script src="static/vendor/tailwind.js"></script>
   <script src="static/vendor/htmx.min.js"></script>
   <script src="static/vendor/apexcharts.min.js"></script>
+  <script src="static/band-chart.js"></script>
   <script>
     tailwind.config = {
       theme: {
@@ -112,14 +113,6 @@
       font-weight: 700;
       color: white;
     }
-    /* A grid of label+value pairs whose values must line up across a row. The label is what
-       varies: in a narrow cell it wraps in some languages and not in others, and since the
-       value simply follows it, one value ended up 18px lower than the one beside it. Reserving
-       the two-line height for every label in the grid puts them back on a shared baseline.
-       3em = two lines at this font-size and line-height, so it follows the type rather than a
-       hard-coded pixel count. Scoped to .stat-pairs: .stat-label itself is used all over the
-       app, mostly where nothing wraps and the extra height would only add slack. */
-    .stat-pairs .stat-label { min-height: 3em; }
     /* A fixed 3-up row of counters leaves each tile about 100px on a phone, and the label inside
        is one uppercase word that cannot wrap. Dutch BINNENKORT measures 83px there, so it touches
        both edges — which reads as badly centred rather than merely tight, and is what @adoewa
@@ -143,7 +136,7 @@
     .chevron { transition: transform .2s; display: inline-block; color: rgb(100 116 139); }
     details[open] > .tree-summary .chevron { transform: rotate(90deg); }
 
-    /* ── Trip row ───────────────────────────────────────────────── */
+    /* ── Trip row, and the charge row that reads like it ────────── */
     .trip-row {
       display: flex; align-items: center; gap: .75rem;
       padding: .5rem .75rem; border-radius: .5rem;
@@ -151,10 +144,54 @@
       text-decoration: none; transition: background .15s, border-color .15s;
     }
     .trip-row:hover { background: rgba(51,65,85,.4); border-color: #334155; }
+    @media (max-width: 639px) { .trip-row { column-gap: .5rem; } }   /* a phone's middle column needs the room */
+    /* A trip row lays out by its own width, not the window's: a sidebar, or the Overview's card, leaves it far less.
+       Narrow, the places and the battery take lines of their own; wider, the energy's source goes under the figures;
+       wide, all of it is one line. */
+    .trip-row[data-trip-id] { container-type: inline-size; }
+    .trip-row .trip-places-beside, .trip-row .trip-soc { display: none; }
+    .trip-row .trip-source { width: 100%; margin-top: -.5rem; text-align: right; }
+    @container (min-width: 560px) {
+      .trip-row .trip-places-beside { display: grid; }
+      .trip-row .trip-soc { display: flex; }
+      .trip-row .trip-places-under, .trip-row .trip-soc-line { display: none; }
+    }
+    @container (min-width: 800px) { .trip-row .trip-source { width: auto; margin-top: 0; margin-left: .5rem; text-align: left; } }
+    /* A charge row is a <summary>: the click opens the body under it, its buttons keep their own click. */
+    .charge-row { cursor: pointer; list-style: none; border-color: #1e293b; }   /* four lines a row: a border a shade lighter than a trip's keeps them apart */
+    .charge-row::-webkit-details-marker { display: none; }
+    /* An opened card stands out from the rows around it: a lighter border on the row and the body, more room after it. */
+    .charge-card[open] { margin-bottom: 1rem; }
+    .charge-card[open] > .charge-row { border-bottom-left-radius: 0; border-bottom-right-radius: 0; border-color: #334155; }
+    .charge-body { background: #0b1526; border: 1px solid #1e293b; border-top: 0; border-radius: 0 0 .5rem .5rem; padding: .75rem; }
+    .charge-card[open] > .charge-body { border-color: #334155; }
+    .charge-note-line { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .charge-actions > button { white-space: nowrap; }
+    /* The curve's thumbnail draws its own two frames; a charge without a curve (✎, ✨) gets one box instead. */
+    .charge-thumb { width: 84px; height: 64px; flex-shrink: 0; }
+    @media (min-width: 640px) { .charge-thumb { width: 120px; } }   /* a computer's row: proportions nearer the big chart's */
+    .charge-thumb-box { border-radius: .375rem; background: #0a1424; border: 1px solid #1a2438; }
+    /* On a phone the middle column dissolves: the times and type stay beside the kWh, and the lines after
+       them (where it happened, the note) take the row's whole width, as a trip row's places do. One
+       element each, since the routes that redraw them address them by id. */
+    @media (max-width: 639px) {
+      .charge-row { align-items: flex-start; }   /* the kWh at the row's top, however tall the type column grows */
+      .charge-row > .charge-mid { display: contents; }
+      .charge-row > .charge-mid > * { width: 100%; order: 2; }
+      .charge-row > .charge-mid > .charge-head { width: auto; flex: 1 1 0; order: 0; }
+      .charge-row > .charge-kwh { order: 1; max-width: 34%; }   /* the €/kWh line wraps, the times keep their room */
+    }
+    /* Each side ellipsised on its own; the shorter one stays whole as long as it fits half the line. */
+    .trip-places { display: grid; grid-template-columns: minmax(0, max-content) auto minmax(0, max-content); justify-content: start; column-gap: .3rem; }
+    .trip-places > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .trip-thumb {
       width: 84px; height: 48px; flex-shrink: 0; border-radius: .375rem;
       background: #0a1424; border: 1px solid #1a2438; object-fit: cover;
     }
+
+    /* ── Charge card: where it happened ─────────────────────────── */
+    /* Cards redraw their own line, so the credit is always there and shows while any card shows an OSM address. */
+    [data-charges-list]:not(:has([data-address-osm])) [data-address-credit] { display: none; }
 
     /* ── Efficiency pill ────────────────────────────────────────── */
     .eff-pill {
@@ -177,11 +214,16 @@
     .soc-used { background: linear-gradient(90deg, #f59e0b, #ef4444); }
 
     /* ── Trips dashboard: hero tiles (Mushroom-gradient) ────────── */
+    .hero-wrap { container-type: inline-size; }
     .hero-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: .75rem; }
-    @media (min-width: 768px) { .hero-grid { grid-template-columns: repeat(4, 1fr); } }
+    /* All the tiles in one row where five fit, measured on the page beside Mate's and HA's sidebars, not the window;
+       narrower, two by two, an odd last one across both. */
+    @container (min-width: 880px) { .hero-grid { grid-template-columns: none; grid-auto-flow: column; grid-auto-columns: 1fr; } }
+    @container (max-width: 879.98px) { .hero-grid > .hero-tile:last-child:nth-child(odd) { grid-column: 1 / -1; } }
+    /* The icon above the figure: beside it, a fifth of the page has no room for a long label such as "Verbrauchte Energie". */
     .hero-tile {
       position: relative; overflow: hidden; border-radius: 1rem;
-      padding: 1rem 1.1rem; display: flex; align-items: center; gap: .85rem;
+      padding: 1rem 1.1rem; display: flex; flex-direction: column; align-items: center; text-align: center; gap: .5rem;
       border: 1px solid rgba(148,163,184,.12);
     }
     .hero-ico {
@@ -197,6 +239,7 @@
     .t-trips { background: linear-gradient(135deg, #4f46e5 0%, #3730a3 100%); }
     .t-eff   { background: linear-gradient(135deg, #334155 0%, #1e293b 100%); }
     .t-regen { background: linear-gradient(135deg, #16a34a 0%, #14532d 100%); }
+    .t-energy { background: linear-gradient(135deg, #0284c7 0%, #0c4a6e 100%); }
 
     /* ── Inline collapse button (inside year/month summaries) ─────── */
     .collapse-btn {
@@ -210,12 +253,9 @@
     .collapse-btn:hover { background: rgba(51,65,85,.6); border-color: #475569; color: #e2e8f0; }
     details[open] > summary .collapse-btn { display: inline-flex; }
 
-    /* ── Hero tiles: compact vertical layout on small phones ───────── */
+    /* ── Hero tiles: compact on small phones ───────── */
     @media (max-width: 639px) {
       .hero-tile {
-        flex-direction: column;
-        align-items: center;
-        text-align: center;
         padding: .65rem .4rem;
         gap: .3rem;
       }
@@ -224,6 +264,7 @@
       .hero-label { font-size: .62rem; letter-spacing: .03em; white-space: normal; line-height: 1.3; }
     }
 
+    :root { color-scheme: dark; }     /* the browser's own parts (date icons, pickers, scrollbars) drawn for a dark page */
     .htmx-indicator { display: none; }
     .htmx-request .htmx-indicator { display: inline; }
     .htmx-request.htmx-indicator { display: inline; }
@@ -251,6 +292,10 @@
       border-color: #14b8a6 !important;
       box-shadow: 0 0 0 2px rgba(20, 184, 166, 0.35);
     }
+    /* a Shift-click or a held finger picks days, not the text between them or a callout */
+    [data-range] > .cal-day { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+    /* a held day waiting for the tap that ends the range */
+    .cal-day[data-anchor] { outline: 2px dashed #14b8a6; outline-offset: 2px; }
   </style>
 </head>
 <body class="h-full bg-slate-900 text-slate-100 flex flex-col md:flex-row" data-autorefresh="{% block autorefresh %}30{% endblock %}">
@@ -258,8 +303,18 @@
   <!-- Mobile Header -->
   <header class="md:hidden flex items-center justify-between px-4 py-3 bg-slate-800 border-b border-slate-700 sticky top-0 z-[1001]">
     <div class="flex items-center gap-2">
-      <img src="static/mate-icon.svg" alt="LeapMotor Mate" class="h-6 w-6">
-      <span class="text-sm font-medium text-slate-100">LeapMotor <span class="text-brand">Mate</span></span>
+      {# #342, @matttiaromano: on a phone the menu is behind the hamburger, so getting back to
+         Overview took two taps on the one control every other app makes a one-tap shortcut.
+         `href="."` and not "/": under the Home Assistant ingress the page lives below a prefix
+         that <base href> supplies, and an absolute root would leave Mate altogether.
+         The mark and the name only — the version chip beside them renders an anchor of its own
+         when an update is waiting, and an anchor inside an anchor is closed at the inner one.
+         → tests/test_the_logo_goes_home.py #}
+      <a href="." aria-label="{{ t('nav_overview') }}"
+         class="flex items-center gap-2 rounded-md hover:opacity-80 focus:outline-none">
+        <img src="static/mate-icon.svg" alt="LeapMotor Mate" class="h-6 w-6">
+        <span class="text-sm font-medium text-slate-100">LeapMotor <span class="text-brand">Mate</span></span>
+      </a>
       {% if version %}<span title="{{ ("MateDesktop " ~ shell_version) if shell_version else "" }}" class="text-[10px] text-slate-500 font-normal self-end mb-0.5 whitespace-nowrap">v{{ version }}{% if shell_version %}<span class="opacity-50"> · D{{ shell_version }}</span>{{ app_badge(update, t) }}{% endif %}</span>{% endif %}
       {% if demo %}<span title="Sample data — no real car" class="text-[10px] font-bold text-slate-900 bg-amber-400 rounded px-1.5 py-0.5 self-center ml-1 tracking-wide">DEMO</span>{% endif %}{% if research %}{{ beta_badge() }}{% endif %}
       {{ version_badge(update, t) }}
@@ -288,8 +343,11 @@
     <!-- Logo (hidden on mobile, shown in header) -->
     <div class="hidden md:block px-5 py-5 border-b border-slate-700">
       <div class="flex items-center gap-2">
-        <img src="static/mate-icon.svg" alt="LeapMotor Mate" class="h-6 w-6">
-        <span class="text-sm font-medium text-slate-100">LeapMotor <span class="text-brand">Mate</span></span>
+        <a href="." aria-label="{{ t('nav_overview') }}"
+           class="flex items-center gap-2 rounded-md hover:opacity-80 focus:outline-none">
+          <img src="static/mate-icon.svg" alt="LeapMotor Mate" class="h-6 w-6">
+          <span class="text-sm font-medium text-slate-100">LeapMotor <span class="text-brand">Mate</span></span>
+        </a>
         {% if version %}<span title="{{ ("MateDesktop " ~ shell_version) if shell_version else "" }}" class="text-[10px] text-slate-500 font-normal self-end mb-0.5 whitespace-nowrap">v{{ version }}{% if shell_version %}<span class="opacity-50"> · D{{ shell_version }}</span>{{ app_badge(update, t) }}{% endif %}</span>{% endif %}
       {% if demo %}<span title="Sample data — no real car" class="text-[10px] font-bold text-slate-900 bg-amber-400 rounded px-1.5 py-0.5 self-center ml-1 tracking-wide">DEMO</span>{% endif %}{% if research %}{{ beta_badge() }}{% endif %}
       {{ version_badge(update, t) }}
@@ -366,7 +424,7 @@
       <a href="charges"     class="nav-link {% if page=='charges'     %}active{% endif %}">
         <span class="text-lg">🔌</span> {{ t('nav_charges') }}
       </a>
-      {% if is_reev and research %}
+      {% if is_reev %}
       <a href="reev"        class="nav-link {% if page=='reev'        %}active{% endif %}">
         <span class="text-lg">⛽</span> {{ t('nav_reev') }}
       </a>
@@ -379,6 +437,9 @@
       </a>
       <a href="statistics"  class="nav-link {% if page=='statistics'  %}active{% endif %}">
         <span class="text-lg">📊</span> {{ t('nav_statistics') }}
+      </a>
+      <a href="events"      class="nav-link {% if page=='events'      %}active{% endif %}">
+        <span class="text-lg">🕒</span> {{ t('nav_events') }}
       </a>
       <a href="report"      class="nav-link {% if page=='report'      %}active{% endif %}">
         <span class="text-lg">📆</span> {{ t('nav_report') }}
@@ -520,7 +581,8 @@
                 font-weight:700;text-decoration:none;white-space:nowrap">{{ t('unconfigured_banner_btn') }}</a>
     </div>
     {% endif %}
-    <div class="max-w-6xl mx-auto px-4 sm:px-6 py-6">
+    {# The pages' column. The Map empties it: on a wide screen the map is the page (D#438). #}
+    <div class="{% block content_width %}max-w-6xl{% endblock %} mx-auto px-4 sm:px-6 py-6">
       {% block content %}{% endblock %}
     </div>
   </main>
@@ -570,40 +632,84 @@
   </script>
 
   <script>
+    // The menu keeps its place across a page. Seventeen items are taller than the window they sit
+    // in (measured: 822 px of nav in 524 px at 1280x800), every page is a full load, and the
+    // sidebar was rebuilt scrolled to the top — so the item you had just used was off screen again
+    // and reaching Settings meant scrolling down every single time. Same mechanism as the <main>
+    // scroll below: sessionStorage, so it is this tab's own and nothing is remembered for tomorrow.
+    (function () {
+      const nav = document.querySelector('#sidebar nav');
+      if (!nav) return;
+      const KEY = 'lm_nav_scroll';
+      try {
+        const at = parseFloat(sessionStorage.getItem(KEY) || '0');
+        if (at > 0) nav.scrollTop = at;
+      } catch (e) { /* private window, blocked storage: the menu simply starts at the top */ }
+      function remember() {
+        try { sessionStorage.setItem(KEY, String(nav.scrollTop)); } catch (e) {}
+      }
+      // Written on the scroll itself, not on a timer: a click on a nav link navigates away, and a
+      // pending timer would never fire.
+      nav.addEventListener('scroll', remember, {passive: true});
+    })();
+  </script>
+
+  <script>
+  // Whether a reload now takes nothing from the reader: no form field focused, no interaction in the last 20s, no
+  // HTMX request in flight, the tab shown, no choice part-way through.
+  var lmLastInteraction = Date.now();
+  ['input', 'change', 'focusin', 'keydown', 'submit', 'pointerdown', 'touchstart', 'scroll']
+    .forEach(ev => document.addEventListener(ev, () => { lmLastInteraction = Date.now(); }, true));
+  function lmMayReload() {
+    const ae = document.activeElement;
+    if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT' || ae.isContentEditable)) return false;
+    if (document.hidden) return false;
+    if (Date.now() - lmLastInteraction < 20000) return false;
+    if (document.querySelector('.htmx-request')) return false;
+    // Thinking is not idling. The guards above protect a field you are typing in, but not a
+    // choice you are part-way through: @pdifeo (beta #22) sat in merge mode weighing which
+    // trips to join, said nothing for twenty seconds, and the reload took the whole view with
+    // it — "se si pensa troppo la pagina fa refresh e bisogna ripensare di nuovo". A mode the
+    // user switched on, or an open dialog, means unfinished business: leave it alone.
+    if (document.querySelector('[data-holds-selection]')) return false;
+    const dlg = document.getElementById('merge-modal');
+    return !(dlg && getComputedStyle(dlg).display !== 'none');
+  }
+  // A reload that keeps the reader's place: the <main> scroll position it stores is put back as the page is drawn again.
+  function lmReload() {
+    const main = document.querySelector('main');
+    if (main) sessionStorage.setItem('lm_scroll_' + location.pathname, String(main.scrollTop));
+    location.reload();
+  }
+  (function () {
+    const main = document.querySelector('main');
+    const KEY = 'lm_scroll_' + location.pathname;
+    const saved = sessionStorage.getItem(KEY);
+    if (saved && main) {
+      sessionStorage.removeItem(KEY);
+      const put = () => { main.scrollTop = parseInt(saved, 10) || 0; };
+      put();
+      // Blocks loaded after the first paint make the page taller: back to the place as each arrives, until the reader moves.
+      const READER = ['wheel', 'touchstart', 'keydown', 'pointerdown'];
+      const done = () => { document.body.removeEventListener('htmx:afterSettle', put); READER.forEach(ev => removeEventListener(ev, done, true)); };
+      document.body.addEventListener('htmx:afterSettle', put);
+      READER.forEach(ev => addEventListener(ev, done, true));
+    }
+  })();
+  </script>
+
+  <script>
     // Global idle-aware auto-refresh: keep display pages fresh without a manual reload. Reloads
-    // every N seconds (from <body data-autorefresh>, 0 = disabled) but ONLY when the page is idle —
-    // never while a form field is focused, an interaction happened in the last 20s, an HTMX request
-    // is in flight, or the tab is hidden — so it can never wipe unsaved form input. Form/editor pages
+    // every N seconds (from <body data-autorefresh>, 0 = disabled) but ONLY when the page is idle
+    // (lmMayReload above), so it can never wipe unsaved form input. Form/editor pages
     // (settings, costs, scheduling, prepare-car, navigation, map) and pages with their own live
-    // updates (overview, charges) set data-autorefresh="0". The <main> scroll position is preserved.
+    // updates (overview, charges) set data-autorefresh="0". The <main> scroll position is preserved (lmReload).
     (function () {
       const secs = parseInt(document.body.dataset.autorefresh || '0', 10);
       if (!secs) return;
-      const main = document.querySelector('main');
-      const KEY = 'lm_scroll_' + location.pathname;
-      const saved = sessionStorage.getItem(KEY);
-      if (saved && main) { main.scrollTop = parseInt(saved, 10) || 0; sessionStorage.removeItem(KEY); }
-
-      let lastInteraction = Date.now();
-      ['input', 'change', 'focusin', 'keydown', 'submit', 'pointerdown', 'touchstart', 'scroll']
-        .forEach(ev => document.addEventListener(ev, () => { lastInteraction = Date.now(); }, true));
-
       setInterval(() => {
-        const ae = document.activeElement;
-        if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT' || ae.isContentEditable)) return;
-        if (document.hidden) return;
-        if (Date.now() - lastInteraction < 20000) return;
-        if (document.querySelector('.htmx-request')) return;
-        // Thinking is not idling. The guards above protect a field you are typing in, but not a
-        // choice you are part-way through: @pdifeo (beta #22) sat in merge mode weighing which
-        // trips to join, said nothing for twenty seconds, and the reload took the whole view with
-        // it — "se si pensa troppo la pagina fa refresh e bisogna ripensare di nuovo". A mode the
-        // user switched on, or an open dialog, means unfinished business: leave it alone.
-        if (document.querySelector('[data-holds-selection]')) return;
-        const dlg = document.getElementById('merge-modal');
-        if (dlg && getComputedStyle(dlg).display !== 'none') return;
-        if (main) sessionStorage.setItem(KEY, String(main.scrollTop));
-        location.reload();
+        if (!lmMayReload()) return;
+        lmReload();
       }, secs * 1000);
     })();
   </script>
@@ -634,6 +740,16 @@
   })();
   </script>
   <script>
+  // A view picked on a page, kept in its address so that a reload draws it again; no value = the default, no parameter.
+  function lmKeepInAddress(name, value) {
+    var q = new URLSearchParams(location.search);
+    if (value) q.set(name, value);
+    else q.delete(name);
+    var s = q.toString();
+    history.replaceState(history.state, '', location.pathname + (s && '?' + s) + location.hash);     // not relative: <base href>
+  }
+  </script>
+  <script>
   // Calendar grids (Trips, Charges, Wallbox): show WHICH DAY the list below belongs to.
   //
   // A day cell fetches only #<page>-day-drawer, on purpose — clicking around a month should
@@ -654,6 +770,32 @@
   (function () {
     var KEY = 'lm_calday_' + location.pathname;
 
+    // The month on screen is kept in the address (?month=), which the page is drawn on after a reload; a day
+    // or month picked replaces a ?highlight= link, whose day would otherwise win over the pick.
+    var shown = document.querySelector('[data-cal-month]');
+    shown = shown ? shown.dataset.calMonth : '';
+    function address() {
+      var cal = document.querySelector('[data-cal-month]');
+      if (!cal) return;
+      shown = cal.dataset.calMonth;
+      lmKeepInAddress('highlight', null);
+      lmKeepInAddress('month', shown);     // today's month is none: a reload then follows the date into the next one
+      // The page's search, too, whose Back to calendar opens the month it was made on.
+      document.querySelectorAll('form input[type=hidden][name=year]').forEach(function (el) { el.value = cal.dataset.year; });
+      document.querySelectorAll('form input[type=hidden][name=month]').forEach(function (el) { el.value = cal.dataset.month; });
+    }
+    document.body.addEventListener('htmx:afterSettle', function () {
+      var cal = document.querySelector('[data-cal-month]');
+      if (cal && cal.dataset.calMonth !== shown) address();
+    });
+
+    // Days in the order they were picked: the first is where the next Shift-click starts, after a reload too.
+    function remember(u, from, to) {
+      var y = /[?&]year=(\d+)/.exec(u), m = /[?&]month=(\d+)/.exec(u);
+      if (y && m) sessionStorage.setItem(KEY, y[1] + '-' + m[1] + '-' + from + (to != from ? '-' + to : ''));
+      address();
+    }
+
     document.addEventListener('click', function (e) {
       var cell = e.target.closest ? e.target.closest('.cal-day') : null;
       if (!cell) return;
@@ -663,21 +805,171 @@
         c.removeAttribute('data-selected');
       });
       cell.setAttribute('data-selected', '');
+      delete grid.calAnchor;     // the one ringed day is where a range starts
       var u = cell.getAttribute('hx-get') || '';
-      var y = /[?&]year=(\d+)/.exec(u), m = /[?&]month=(\d+)/.exec(u), d = /[?&]day=(\d+)/.exec(u);
-      if (y && m && d) sessionStorage.setItem(KEY, y[1] + '-' + m[1] + '-' + d[1]);
+      var d = /[?&]day=(\d+)/.exec(u);
+      if (d) remember(u, d[1], d[1]);
+    });
+
+    function ring(grid, from, to) {
+      var first = Math.min(from, to), last = Math.max(from, to);
+      grid.querySelectorAll('.cal-day[data-day]').forEach(function (c) {
+        var d = +c.dataset.day;
+        if (d >= first && d <= last) c.setAttribute('data-selected', '');
+        else c.removeAttribute('data-selected');
+      });
+    }
+
+    // A range grid (data-range: Trips) opens days from..to through this one function: the drawer, the
+    // rings, the anchor the next Shift-click starts from, and the choice a reload brings back.
+    function choose(grid, from, to) {
+      var first = Math.min(from, to), last = Math.max(from, to);
+      var cell = grid.querySelector('.cal-day[data-day]');
+      if (!cell) return;
+      unhold();     // whatever chose, a held day is no longer waiting
+      var u = cell.getAttribute('hx-get');
+      htmx.ajax('GET', u.replace(/([?&]day=)\d+/, '$1' + first) + (last > first ? '&to_day=' + last : ''),
+                {source: cell, target: cell.getAttribute('hx-target'), swap: 'innerHTML'})
+          .catch(function () {});     // rejected when replaced or failed to send: htmx's own events act on both
+      ring(grid, from, to);
+      grid.calAnchor = from;
+      remember(u, from, to);
+    }
+
+    // The remembered first day, as long as the rings are still what was remembered (a ?highlight= link is not).
+    function rememberedAnchor(grid) {
+      var ringed = grid.querySelectorAll('.cal-day[data-selected]');
+      if (!ringed.length) return 0;
+      var u = ringed[0].getAttribute('hx-get'), y = /[?&]year=(\d+)/.exec(u), m = /[?&]month=(\d+)/.exec(u);
+      var p = (sessionStorage.getItem(KEY) || '').split('-'), from = +p[2], to = +(p[3] || p[2]);
+      var first = +ringed[0].dataset.day, last = +ringed[ringed.length - 1].dataset.day;
+      var same = y && m && p[0] === y[1] && p[1] === m[1] && Math.min(from, to) === first && Math.max(from, to) === last;
+      return same ? from : 0;
+    }
+
+    function rangeCell(e) {
+      return e.target.closest ? e.target.closest('[data-range] > .cal-day') : null;
+    }
+
+    // The click a lifted finger sends after a hold, which no new touch precedes: the hold already acted.
+    var swallow = false;
+
+    // Capturing, so it runs before htmx opens the clicked day alone.
+    document.addEventListener('click', function (e) {
+      var cell = rangeCell(e);
+      if (pending && !pending.isConnected) unhold();     // the month changed under it
+      if (swallow || (pending && cell)) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        var from = !swallow && pending;
+        swallow = false;
+        if (!from) return;
+        unhold();
+        // A tap on another day ends the range; a tap on the held day lets it go.
+        if (cell !== from) choose(cell.parentElement, +from.dataset.day, +cell.dataset.day);
+        return;
+      }
+      if (!cell || !e.shiftKey) return;
+      var grid = cell.parentElement, ringed = grid.querySelector('.cal-day[data-selected]');
+      var anchor = grid.calAnchor || rememberedAnchor(grid) || (ringed && +ringed.dataset.day);
+      if (!anchor) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      choose(grid, anchor, +cell.dataset.day);
+    }, true);
+
+    // Dragging the mouse across days rings them as it goes and opens them on release.
+    var drag = null;
+    function undrag() {     // a drag that opened nothing puts back the days chosen before it
+      drag.grid.querySelectorAll('.cal-day[data-day]').forEach(function (c) {
+        if (drag.was.indexOf(c) >= 0) c.setAttribute('data-selected', '');
+        else c.removeAttribute('data-selected');
+      });
+      drag = null;
+    }
+    document.addEventListener('pointerdown', function (e) {
+      var cell = rangeCell(e);
+      if (!cell || e.pointerType !== 'mouse' || e.button !== 0 || e.shiftKey) return;
+      var grid = cell.parentElement;
+      drag = {grid: grid, from: +cell.dataset.day, to: +cell.dataset.day,
+              was: [].slice.call(grid.querySelectorAll('.cal-day[data-selected]'))};
+    });
+    document.addEventListener('pointerover', function (e) {
+      if (!drag) return;
+      if (!(e.buttons & 1)) return undrag();     // released outside the window
+      var cell = rangeCell(e);
+      if (!cell || cell.parentElement !== drag.grid) return;
+      drag.to = +cell.dataset.day;
+      ring(drag.grid, drag.from, drag.to);
+    });
+    document.addEventListener('pointerup', function () {
+      if (!drag) return;
+      // No drag: the click opens the day. After one, the click goes to the grid, which opens nothing.
+      if (drag.to === drag.from || !drag.grid.isConnected) return undrag();     // nor a grid replaced meanwhile
+      var d = drag;
+      drag = null;
+      choose(d.grid, d.from, d.to);
+    });
+    document.addEventListener('pointercancel', function () {
+      if (drag) undrag();
+    });
+
+    // On a phone: holding a day still for half a second makes it the start of a range, and the next tap
+    // on another day ends it. A finger that moves scrolls, and the browser cancels its pointer.
+    var hold = null, pending = null;     // hold: the finger on a day; pending: the held day's cell
+    function unhold() {
+      if (pending) pending.removeAttribute('data-anchor');
+      pending = null;
+    }
+    function letGo() {
+      clearTimeout(hold.timer);
+      if (hold.held) unhold();
+      hold = null;
+    }
+    document.addEventListener('pointerdown', function (e) {
+      swallow = false;
+      if (e.pointerType !== 'touch') return;
+      if (hold) return letGo();     // a second finger: a pinch, not a hold
+      if (!e.isPrimary) return;     // …and one beside a finger off the days starts none
+      var cell = rangeCell(e);
+      if (!cell) return;
+      var h = hold = {id: e.pointerId, timer: setTimeout(function () {
+        unhold();
+        pending = cell;
+        cell.setAttribute('data-anchor', '');
+        h.held = true;
+      }, 500)};
+    });
+    document.addEventListener('pointerup', function (e) {
+      if (!hold || e.pointerId !== hold.id) return;
+      clearTimeout(hold.timer);
+      swallow = !!hold.held;
+      hold = null;
+    });
+    // A held finger that goes on to scroll was not choosing a day after all.
+    document.addEventListener('pointercancel', function (e) {
+      if (hold && e.pointerId === hold.id) letGo();
+    });
+    // A held finger brings up the browser's menu otherwise; a right-click keeps its menu.
+    document.addEventListener('contextmenu', function (e) {
+      if (hold && rangeCell(e)) e.preventDefault();
+    });
+
+    // A day's date under a range heading opens that day alone, ringed as if its cell were clicked.
+    document.addEventListener('click', function (e) {
+      var link = e.target.closest ? e.target.closest('[data-cal-day]') : null;
+      var root = link && link.closest('[id$="-calendar-month"]');
+      var grid = root && root.querySelector('[data-range]');
+      if (grid) choose(grid, +link.dataset.calDay, +link.dataset.calDay);
     });
 
     // Only ever adds open_day to a request for the month the day belongs to, so paging to
     // another month opens nothing — and a request that already carries open_day (a ?highlight=
-    // link) is left exactly as it is.
+    // link) is left as it is, unless that day lies in a remembered range.
     document.body.addEventListener('htmx:configRequest', function (e) {
       var path = e.detail.path || '';
       if (!/\/calendar(\?|$)/.test(path)) return;
-      if (/[?&]open_day=/.test(path) || e.detail.parameters.open_day) return;
-      var stored = sessionStorage.getItem(KEY);
-      if (!stored) return;
-      var parts = stored.split('-');
+      var named = /[?&]open_day=/.test(path) || e.detail.parameters.open_day;
       // Read the month off the PATH, not off e.detail.parameters: htmx leaves a query string
       // written into hx-get in the path and never copies it into parameters, so trusting
       // parameters would make every month look like the current one — and paging back a month
@@ -686,8 +978,19 @@
       var now = new Date();
       var year = y ? y[1] : String(now.getFullYear());
       var month = m ? m[1] : String(now.getMonth() + 1);
+      var stored = sessionStorage.getItem(KEY);
+      if (!stored) return;
+      var parts = stored.split('-');
       if (year !== parts[0] || month !== parts[1]) return;
-      e.detail.parameters.open_day = parts[2];
+      if (named) {
+        // A link to a day in the remembered range (a trip page's way back to the list) opens the range.
+        var day = +(/[?&]open_day=(\d+)/.exec(path) || [])[1] || 0;
+        if (!parts[3] || day < Math.min(parts[2], parts[3]) || day > Math.max(parts[2], parts[3])) return;
+        e.detail.path = path.replace(/([?&]open_day=)\d+/, '$1' + parts[2]);
+      } else {
+        e.detail.parameters.open_day = parts[2];
+      }
+      if (parts[3]) e.detail.parameters.open_to = parts[3];
     });
   })();
   </script>
@@ -855,14 +1158,23 @@
         if (!rc) { location.reload(); return; }
         htmx.ajax(rc.verb, rc.path, {
           source: d.elt, target: tgt, swap: tgt.getAttribute('hx-swap') || 'innerHTML'
-        });
-      });
+        }).catch(function () {});   // rejected when the retry is aborted, times out or fails to send: every one of
+      });                           // those is an htmx event the listeners above already act on
+      box.lmFor = tgt;
       box.appendChild(msg);
       box.appendChild(btn);
       host.insertBefore(box, tgt.nextSibling);
     }
     document.body.addEventListener('htmx:responseError', failed);   // the server answered, badly
     document.body.addEventListener('htmx:sendError', failed);       // it never got there
+    // A newer request for a day drawer makes its failure stale: the retry would replace the newer day. Only
+    // there: a block that refreshes itself asks for what failed again, and keeps its strip until it answers.
+    document.body.addEventListener('htmx:beforeRequest', function (e) {
+      if (!/-day-drawer$/.test(e.detail.target && e.detail.target.id)) return;
+      var host = e.detail.target.parentElement;
+      var old = host && host.querySelector(':scope > .lm-load-error');
+      if (old && old.lmFor === e.detail.target) old.remove();
+    });
     // A later success on the same block clears the strip: no stale complaint left behind.
     document.body.addEventListener('htmx:afterSwap', function (e) {
       var host = e.target && e.target.parentElement;
@@ -872,5 +1184,40 @@
   })();
   </script>
 
+{# One tooltip for the whole app: any element with data-tip="…" shows it on hover, on tap and on
+   keyboard focus. The browser's own `title` needs a second of hovering, never shows on touch and
+   not at all inside the Home Assistant app. Delegated on the document, so content swapped in by
+   HTMX gets it too. Lines break only where the text has a newline — a fact sheet is not prose. #}
+<div id="mate-tip" class="hidden fixed z-[1100] pointer-events-none rounded-lg border border-slate-600 bg-slate-900 px-2.5 py-1.5 text-[11px] leading-snug text-slate-200 shadow-lg max-w-[min(20rem,90vw)] whitespace-pre-line" role="tooltip"></div>
+<script>
+  (function () {
+    var tip = document.getElementById('mate-tip'), cur = null;
+    function place(x, y) {
+      var w = tip.offsetWidth, h = tip.offsetHeight;
+      var l = Math.min(x + 12, window.innerWidth - w - 8), t = y + 16;
+      if (t + h > window.innerHeight - 8) t = y - h - 10;
+      tip.style.left = Math.max(8, l) + 'px'; tip.style.top = Math.max(8, t) + 'px';
+    }
+    function show(el, x, y) { cur = el; tip.textContent = el.getAttribute('data-tip'); tip.classList.remove('hidden'); place(x, y); }
+    function hide() { cur = null; tip.classList.add('hidden'); }
+    function at(e) { return e.target && e.target.closest ? e.target.closest('[data-tip]') : null; }
+    document.addEventListener('pointermove', function (e) {
+      if (e.pointerType !== 'mouse') return;
+      var el = at(e); if (!el) return hide();
+      if (el !== cur) show(el, e.clientX, e.clientY); else place(e.clientX, e.clientY);
+    });
+    document.addEventListener('pointerdown', function (e) {
+      var el = at(e); if (!el) return hide();
+      if (el === cur && !tip.classList.contains('hidden')) return hide();   // a second tap closes it
+      show(el, e.clientX, e.clientY);
+    });
+    document.addEventListener('focusin', function (e) {
+      var el = at(e); if (!el) return hide();
+      var r = el.getBoundingClientRect(); show(el, r.left, r.bottom);
+    });
+    document.addEventListener('focusout', hide);
+    document.addEventListener('scroll', hide, true);
+  })();
+</script>
 </body>
 </html>

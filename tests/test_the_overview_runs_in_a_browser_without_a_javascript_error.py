@@ -13,7 +13,7 @@ would go red on a slow network rather than on a defect. An uncaught exception is
 but our bug.
 
 Costs: fastapi + uvicorn + pytest-playwright + a Chromium. None of them are in CI's minimal env
-(.github/workflows/ci.yml installs pytest, cryptography, jinja2, leapmotor-api, paho-mqtt), so
+(.github/workflows/ci.yml installs pytest, cryptography, jinja2, paho-mqtt), so
 today this file SKIPS there and guards only the laptop it runs on — the same half-measure
 test_access_card_markup.py's docstring warns about. Adding them to the CI step is what turns it
 into a real guard; that is a separate, deliberate decision, not something this file assumes.
@@ -51,10 +51,9 @@ def _free_port() -> int:
 def _seed(db_path: pathlib.Path) -> None:
     """The smallest database that reaches the code under test.
 
-    A latitude and a longitude are not decoration here: they are what puts the Overview down the
-    `{% if status.latitude and status.longitude %}` branch, and that branch is where the Leaflet
-    script lives. Seed a car with no fix and this test would pass over a page that never ran the
-    half we care about.
+    A latitude and a longitude are not decoration here: the Overview's map, and the Leaflet code
+    that draws it, is created only from a real position. Seed a car with no fix and this test would
+    pass over a page that never ran the half we care about.
 
     `speed_kmh` is written explicitly, and 0.0 rather than left out, because leaving it out is a
     500: main._driving does `pos.get("speed_kmh", 0) > 1`, and a default only answers for a key
@@ -107,7 +106,8 @@ def mate_url(tmp_path_factory):
     # To a file, not a pipe: when the server is the thing that went wrong, its own output is the
     # only account of why, and a pipe we are not draining is exactly where it gets lost.
     log = data / "web.log"
-    proc = subprocess.Popen([sys.executable, str(ROOT / "web" / "main.py")], env=env,
+    proc = subprocess.Popen([sys.executable, str(ROOT / "tests" / "no_internet.py"),
+                             str(ROOT / "web" / "main.py")], env=env,
                             stdout=log.open("w"), stderr=subprocess.STDOUT, text=True)
     url = f"http://127.0.0.1:{port}"
     try:

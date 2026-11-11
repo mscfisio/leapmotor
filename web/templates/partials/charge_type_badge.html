@@ -1,53 +1,49 @@
 {% set ct = charge_types.get(charge.location_type) %}
-<div id="charge-type-{{ charge.id }}" class="charge-type-selector">
+{# `badge_oob`: this partial is the PRIMARY target for /type, /cost and /free (its own root IS what
+   gets swapped in) but only a passenger for /place, whose target is the place line beside it — there
+   it needs hx-swap-oob so htmx redirects it here instead of nesting it inside that other swap. #}
+<div id="charge-type-{{ charge.id }}" class="charge-type-selector"
+     {% if badge_oob %}hx-swap-oob="true"{% endif %}>
+  {# The real total paid, independent of the type badge next to it — sits BEFORE it, since the
+     price is typed once and never changes what the type dropdown offers. #}
+  {% with cost_oob=false %}{% include "partials/charge_cost_manual.html" %}{% endwith %}
   <!-- Current type badge + dropdown -->
   <div style="position:relative;display:inline-block">
     {% if ct %}
     <button onclick="document.getElementById('ct-menu-{{ charge.id }}').classList.toggle('hidden')"
             style="background:{{ ct.color }}22;color:{{ ct.color }};border:1px solid {{ ct.color }}55;
-                   padding:4px 10px;border-radius:20px;font-size:12px;font-weight:700;cursor:pointer;
-                   display:flex;align-items:center;gap:5px">
+                   padding:2px 8px;border-radius:20px;font-size:11px;font-weight:700;cursor:pointer;
+                   display:flex;align-items:center;gap:5px;white-space:nowrap">
       {{ ct.icon }} {{ ct.label }} <span style="font-size:9px;opacity:.7">▼</span>
+    </button>
+    {% elif charge.cost_manual %}
+    {# Priced by hand, no type: "✎ Manual", as it read until v3.15.18 — the owner already answered,
+       with the price, so this is not a charge waiting to be confirmed (db_reader.is_manual_charge;
+       add-on #2). #}
+    <button onclick="document.getElementById('ct-menu-{{ charge.id }}').classList.toggle('hidden')"
+            style="background:#94a3b822;color:#94a3b8;border:1px solid #94a3b855;
+                   padding:2px 8px;border-radius:20px;font-size:11px;font-weight:700;cursor:pointer;
+                   display:flex;align-items:center;gap:5px;white-space:nowrap">
+      ✎ {{ t('charge_manual') }} <span style="font-size:9px;opacity:.7">▼</span>
     </button>
     {% else %}
     <button onclick="document.getElementById('ct-menu-{{ charge.id }}').classList.toggle('hidden')"
             style="background:#f59e0b22;color:#f59e0b;border:1px solid #f59e0b88;
-                   padding:4px 10px;border-radius:20px;font-size:12px;font-weight:700;cursor:pointer;
-                   display:flex;align-items:center;gap:5px">
+                   padding:2px 8px;border-radius:20px;font-size:11px;font-weight:700;cursor:pointer;
+                   display:flex;align-items:center;gap:5px;white-space:nowrap">
       ❓ {{ t('charge_unconfirmed') }} <span style="font-size:9px;opacity:.7">▼</span>
     </button>
     {% endif %}
 
-    <div id="ct-menu-{{ charge.id }}" class="hidden"
+    <div id="ct-menu-{{ charge.id }}" class="hidden" data-row-editor
          style="position:absolute;right:0;top:calc(100% + 4px);z-index:50;
                 background:#1e293b;border:1px solid #334155;border-radius:10px;
                 padding:4px;min-width:150px;box-shadow:0 8px 24px rgba(0,0,0,.5)">
-      {% if not ct %}
+      {% if not ct and not charge.cost_manual %}
       <div style="padding:5px 10px 7px;margin-bottom:3px;font-size:11px;font-weight:700;
                   color:#fbbf24;border-bottom:1px solid #334155">{{ t('charge_confirm_q') }}</div>
       {% endif %}
       {% for key, info in charge_types.items() %}
-      {% if key == 'MANUAL' %}
-      <form hx-post="api/charges/{{ charge.id }}/type"
-            hx-target="#charge-type-{{ charge.id }}"
-            hx-swap="outerHTML"
-            hx-on::after-request="document.getElementById('ct-menu-{{ charge.id }}') && document.getElementById('ct-menu-{{ charge.id }}').classList.add('hidden')"
-            style="margin:0;border-top:1px solid #334155;margin-top:3px;padding-top:4px">
-        <input type="hidden" name="location_type" value="MANUAL">
-        <div style="display:flex;align-items:center;gap:6px;padding:5px 10px">
-          <span style="color:{{ info.color }};font-size:13px">{{ info.icon }}</span>
-          {# Same box, second copy — a reader in złoty was being told to type euros. #}
-          <input type="number" name="cost" step="0.01" min="0" placeholder="{{ currency.symbol }}"
-                 value="{% if charge.location_type == 'MANUAL' and charge.cost %}{{ '%.2f'|format(charge.cost) }}{% endif %}"
-                 onclick="event.stopPropagation()"
-                 style="width:72px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#fff;padding:4px 6px;font-size:13px">
-          <button type="submit"
-                  style="margin-left:auto;background:{{ info.color }}22;color:{{ info.color }};border:1px solid {{ info.color }}55;border-radius:6px;padding:4px 10px;font-size:12px;font-weight:700;cursor:pointer">
-            {% if charge.location_type == 'MANUAL' %}✓{% else %}OK{% endif %}
-          </button>
-        </div>
-      </form>
-      {% else %}
       <form hx-post="api/charges/{{ charge.id }}/type"
             hx-target="#charge-type-{{ charge.id }}"
             hx-swap="outerHTML"
@@ -62,8 +58,29 @@
           {% if charge.location_type == key %}<span style="margin-left:auto;font-size:10px">✓</span>{% endif %}
         </button>
       </form>
-      {% endif %}
       {% endfor %}
+      {# ✎ Manual — the row where the receipt's total was typed until v3.15.18, back where people look
+         for it (add-on #2, @termy91it: "non è più possibile impostare un prezzo manuale"). It sets the
+         PRICE, never the type: it posts to the pencil's own /cost endpoint and is answered with this
+         whole selector, so a charge with no type reads "✎ Manual" the moment the price goes in, and a
+         typed one keeps its type. Pre-filled only with a price typed by hand — an estimate is not a
+         figure to confirm with OK. `required`: an empty OK here would be the pencil's deliberate
+         CLEAR, which reprices the charge; from a menu row it can only be a slip, so htmx does not
+         send it. Taking a typed price back is the pencil's Reset. #}
+      <form hx-post="api/charges/{{ charge.id }}/cost"
+            hx-target="#charge-type-{{ charge.id }}"
+            hx-swap="outerHTML"
+            style="margin:0;border-top:1px solid #334155;margin-top:3px;padding-top:4px">
+        <div style="display:flex;align-items:center;gap:6px;padding:5px 10px">
+          <span style="color:#94a3b8;font-size:13px;white-space:nowrap">✎ {{ t('charge_manual') }}</span>
+          <input type="number" name="cost" step="0.01" min="0" required placeholder="{{ currency.symbol }}"
+                 value="{% if charge.cost_manual and charge.cost is not none %}{{ '%.2f'|format(charge.cost) }}{% endif %}"
+                 onclick="event.stopPropagation()" autocomplete="off" inputmode="decimal"
+                 style="width:72px;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#fff;padding:4px 6px;font-size:13px">
+          <button type="submit"
+                  style="margin-left:auto;background:#94a3b822;color:#94a3b8;border:1px solid #94a3b855;border-radius:6px;padding:4px 10px;font-size:12px;font-weight:700;cursor:pointer">OK</button>
+        </div>
+      </form>
     </div>
   </div>
   {% if charge.location_type == 'HOME' %}
@@ -75,7 +92,7 @@
             style="background:{% if charge.is_free %}#a3e63522{% else %}transparent{% endif %};
                    color:{% if charge.is_free %}#a3e635{% else %}#64748b{% endif %};
                    border:1px solid {% if charge.is_free %}#a3e63566{% else %}#334155{% endif %};
-                   padding:4px 10px;border-radius:20px;font-size:12px;font-weight:700;cursor:pointer;
+                   padding:2px 8px;border-radius:20px;font-size:11px;font-weight:700;cursor:pointer;
                    display:inline-flex;align-items:center;gap:5px;white-space:nowrap">
       🆓 {{ t('charge_free') }}{% if charge.is_free %} ✓{% endif %}
     </button>

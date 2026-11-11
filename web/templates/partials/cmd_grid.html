@@ -1,10 +1,12 @@
 {% import 'partials/_icons.html' as ico %}
+{% if api_v2_command_css %}<style>{{ api_v2_command_css|safe }}</style>{% endif %}
 {% set locked   = status.is_locked      if status and status.is_locked      is not none else none %}
 {% set trunk    = status.trunk_open     if status and status.trunk_open     is not none else none %}
 {% set wins     = status.windows_open   if status and status.windows_open   is not none else none %}
-{% set shade    = status.sunshade_open  if status and status.sunshade_open  is not none else none %}
+{% set shade_pct = status.sunshade_pct if status else none %}
+{% set shade    = ((shade_pct or 0) != 0) if status else none %}
 {% set charging = status.charging       if status else none %}
-{% set plugged  = status.plug_connected if status and status.plug_connected is not none else none %}
+{% set plugged  = status.cable_connected if status and status.cable_connected is not none else none %}
 {% set clim_cool    = status.climate_cooling if status and status.climate_cooling is not none else none %}
 {% set clim_heat    = status.climate_heating if status and status.climate_heating is not none else none %}
 {% set clim_defrost = status.climate_defrost if status and status.climate_defrost is not none else none %}
@@ -138,7 +140,9 @@
 {% endmacro %}
 
 
-<div id="cmd-grid" class="flex flex-col lg:flex-row gap-4 lg:items-start">
+{# Which car this grid draws: the picker moves the whole interface, and a page left open on another car
+   gets this car's grid at its next refetch (the steering slider's hold in commands.html asks). #}
+<div id="cmd-grid" data-vin="{{ vin or '' }}" class="flex flex-col lg:flex-row gap-4 lg:items-start">
   <!-- LEFT column: main control panels (Vehicle + Climate) -->
   <div class="flex flex-col gap-4 flex-1 min-w-0">
 
@@ -207,6 +211,7 @@
              (wins=False) → forced to 0, so the slider can't sit at a stale % that contradicts the
              "Closed" badge (e.g. opened via the slider, then closed by toggle / the official app /
              physically — which never updated the last-commanded value). All four windows together. #}
+          <div data-post="api/windows" class="space-y-1.5">
           <input type="range" min="0" max="{{ (wins_stops | default([0,100])) | length - 1 }}" step="1"
                  value="{{ 0 if (wins is not none and not wins) else (wins_idx | default(0)) }}"
                  {% if drv %}disabled{% endif %}
@@ -217,21 +222,43 @@
             {% else %}<span>{{ t('wins_closed_state') }}</span><span>100%</span>{% endif %}
           </div>
           <div class="text-[10px] text-slate-400"><span id="wins-pct">{{ (0 if (wins is not none and not wins) else (wins_pct | default(0))) ~ '%' }}</span> <span id="wins-res" class="text-emerald-400"></span></div>
+          </div>
         </div>
       </div>
 
       <!-- Sunshade -->
       <div class="rounded-lg border p-3 flex flex-col items-center gap-2 text-center h-full
-        {% if shade %}border-brand/40 bg-brand/5{% else %}border-slate-700 bg-slate-800/40{% endif %}">
+        {% if shade %}border-brand/40 bg-brand/5{% else %}border-slate-700 bg-slate-800/40{% endif %}"
+        data-shade-pct="{{ shade_pct if shade_pct is not none else '' }}">
         <span class="h-7 flex items-center {% if shade %}text-brand{% elif shade is none %}text-slate-600{% else %}text-slate-400{% endif %}">{{ ico.mdi('car-convertible') }}</span>
         <span class="text-xs font-medium text-slate-200 min-h-[2rem] flex items-center justify-center leading-tight">{{ t('sunshade') }}</span>
         <span class="text-[11px] font-bold px-2 py-0.5 rounded-full
           {% if shade %}text-brand bg-brand/10 border border-brand/30
           {% elif shade is none %}text-slate-600 border border-slate-700
           {% else %}text-slate-400 bg-slate-700 border border-slate-600{% endif %}">
-          {% if shade is none %}{{ t('unknown') }}{% elif shade %}{{ t('shade_open_state') }}{% else %}{{ t('shade_closed_state') }}{% endif %}
+          {% if shade is none %}{{ t('unknown') }}{% elif shade %}● {{ t('shade_open_state') }}{% else %}○ {{ t('shade_closed_state') }}{% endif %}
         </span>
-        <div class="mt-auto w-full">{{ toggle_btn(not shade, "open_sunshade", "close_sunshade", t('open_shade_confirm'), t('close_shade_confirm'), drv) }}</div>
+        <div class="mt-auto w-full space-y-1.5">
+          {# Cmd 240 only opens fully or closes: a sunshade stopped part-way offers both. #}
+          {% if shade and shade_pct < 100 %}
+          <div class="grid grid-cols-2 gap-1.5">
+            <div class="space-y-1.5">{{ toggle_btn(true, "open_sunshade", "close_sunshade", t('open_shade_confirm'), t('close_shade_confirm'), drv) }}</div>
+            <div class="space-y-1.5">{{ toggle_btn(false, "open_sunshade", "close_sunshade", t('open_shade_confirm'), t('close_shade_confirm'), drv) }}</div>
+          </div>
+          {% else %}
+          {{ toggle_btn(not shade, "open_sunshade", "close_sunshade", t('open_shade_confirm'), t('close_shade_confirm'), drv) }}
+          {% endif %}
+          {% if shade_pct is not none %}
+          {# Drawn like the windows' slider track, no thumb: the car takes no position, so this only shows one. #}
+          <div class="h-[22px] pb-1.5 flex items-center" aria-hidden="true" data-shade-bar>
+            <div class="w-full h-2 rounded-full border border-[#858585] bg-[#3b3b3b] overflow-hidden">
+              <div class="h-full bg-amber-400" style="width: {{ shade_pct }}%"></div>
+            </div>
+          </div>
+          <div class="flex items-center justify-between text-[9px] text-slate-500 px-0.5"><span>○ {{ t('shade_closed_state') }}</span><span>100%</span></div>
+          <div class="text-[10px] text-slate-400">{{ shade_pct }}%</div>
+          {% endif %}
+        </div>
       </div>
 
     </div>
@@ -307,13 +334,13 @@
       <div class="rounded-lg border border-slate-700 bg-slate-800/40 p-3 flex flex-col items-center gap-2 text-center h-full{% if not clim_fan_ed %} opacity-60{% endif %}">
         <span class="h-7 flex items-center text-teal-400">{{ ico.mdi('fan') }}</span>
         <span class="text-xs font-medium text-slate-200 min-h-[2rem] flex items-center justify-center leading-tight">{{ t('fan_level') }}</span>
-        <span class="text-[11px] font-bold px-2 py-0.5 rounded-full text-teal-400 bg-teal-400/10 border border-teal-400/30"><span id="clim-fan-val">{{ _cfan }}</span> / 7</span>
+        <span class="text-[11px] font-bold px-2 py-0.5 rounded-full text-teal-400 bg-teal-400/10 border border-teal-400/30"><span id="clim-fan-val">{{ _cfan }}</span> / {{ fan_top }}</span>
         <div class="mt-auto w-full space-y-1">
-          <input type="range" min="1" max="7" step="1" value="{{ _cfan }}" name="level" id="clim-fan-slider"
+          <input type="range" min="1" max="{{ fan_top }}" step="1" value="{{ _cfan }}" name="level" id="clim-fan-slider"
                  class="w-full {% if clim_fan_ed %}cursor-pointer accent-teal-400{% else %}cursor-not-allowed accent-slate-600{% endif %}"
                  {% if clim_fan_ed %}hx-post="api/climate-fan" hx-trigger="change" hx-target="#clim-fan-res" hx-swap="innerHTML"
                  oninput="document.getElementById('clim-fan-val').textContent=this.value"{% else %}disabled{% endif %}>
-          <div class="flex justify-between text-[9px] text-slate-500 px-0.5"><span>1</span><span>7</span></div>
+          <div class="flex justify-between text-[9px] text-slate-500 px-0.5"><span>1</span><span>{{ fan_top }}</span></div>
           <div id="clim-fan-res" class="text-[11px] text-emerald-400 min-h-[16px]"></div>
         </div>
       </div>
@@ -345,6 +372,8 @@
           {% else %}text-slate-400 bg-slate-700 border border-slate-600{% endif %}">
           {% if c.on %}{{ t('climate_on_state') }}{% if c.value > 1 and c.control != 'toggle' %} · {{ c.value }}{% endif %}{% else %}{{ t('climate_off_state') }}{% endif %}
         </span>
+        {# Under the badge, not under the slider: the note tells what the car reports, as the badge does. #}
+        {% if c.remote %}<div class="text-[10px] text-slate-400 leading-tight">{{ t('comfort_steering_heat_remote') }}</div>{% endif %}
         {% if c.control == 'slider' %}
         <div class="w-full mt-auto">
           <input type="range" min="0" max="3" step="1" value="{{ c.value }}" name="level"
@@ -354,6 +383,26 @@
                  oninput="document.getElementById('sm-{{ c.func }}-{{ c.position }}').textContent=(this.value==0?'{{ t('lvl_off') }}':('{{ t('lvl_abbr') }} '+this.value))">
           <div class="flex items-center justify-between text-[9px] text-slate-500 px-0.5"><span>{{ t('lvl_off') }}</span><span>1</span><span>2</span><span>3</span></div>
           <div class="text-[10px] text-slate-400 mt-0.5"><span id="sm-{{ c.func }}-{{ c.position }}">{{ t('lvl_off') if c.value == 0 else (t('lvl_abbr') ~ ' ' ~ c.value) }}</span> <span id="sr-{{ c.func }}-{{ c.position }}" class="text-emerald-400"></span></div>
+        </div>
+        {% elif c.control == 'steering' %}
+        {# The seat slider's twin, but it posts the existing on/off commands: the position picks which.
+           1 is shown when the car reports it and never chosen (steerLevel in commands.html). No id, like
+           the seats': htmx refocuses a same-id element after each swap, and focus holds off the 30 s refresh. #}
+        <div class="w-full mt-auto">
+          {# hx-sync: a change while this slider's own command is still out is dropped. Queued (htmx's default)
+             it would go out once the answer is in — as a repeat of the command after an error, when the page
+             has no busy floor to refuse it.
+             The endpoint follows the thumb only when a move of the thumb (a change event) sends the request:
+             the layout's "Try again" replays a failed request from this element without one, and by then the
+             thumb is back on the car's level. #}
+          <input type="range" min="0" max="2" step="1" value="{{ c.value }}" aria-label="{{ t(c.label_key) }}"
+                 hx-post="api/command/{{ c.cmd_on }}" hx-trigger="change" hx-sync="this:drop"
+                 hx-on::config-request="if (event.detail.triggeringEvent && this.value == 0) event.detail.path = 'api/command/{{ c.cmd_off }}'"
+                 hx-target="#tg-{{ c.skey }}" hx-swap="innerHTML"
+                 class="w-full cursor-pointer accent-orange-400"
+                 oninput="steerLevel(this)">
+          <div class="flex items-center justify-between text-[9px] text-slate-500 px-0.5"><span>{{ t('lvl_off') }}</span><span{% if c.value != 1 %} class="opacity-40"{% endif %}>1</span><span>2</span></div>
+          <div class="text-[10px] text-slate-400 mt-0.5 min-h-[14px] leading-tight"><span id="sm-{{ c.skey }}">{{ t('lvl_off') if c.value == 0 else (t('lvl_abbr') ~ ' ' ~ c.value) }}</span> <span id="spin-{{ c.skey }}" class="htmx-indicator text-brand text-xs">⏳</span><span id="tg-{{ c.skey }}" class="text-emerald-400"></span></div>
         </div>
         {% elif c.control == 'toggle' %}
         <form class="w-full mt-auto" hx-post="api/command/{{ c.cmd_off if c.on else c.cmd_on }}"

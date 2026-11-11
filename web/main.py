@@ -1,17 +1,24 @@
 """LeapMotor Mate — web server."""
+import mate_api  # explicit independent runtime; no sitecustomize hook
+from runtime_paths import prepare_installation
+prepare_installation()
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
 from pathlib import Path
+from typing import Annotated
+from urllib.parse import urlencode
 
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request, BackgroundTasks, Query
 from fastapi.responses import (HTMLResponse, RedirectResponse, JSONResponse, Response, FileResponse,
-                               StreamingResponse)
+                               StreamingResponse, PlainTextResponse)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from fastapi.concurrency import run_in_threadpool
 
 sys.path.insert(0, str(Path(__file__).parent))
 import battery_packs
@@ -28,7 +35,7 @@ import auth
 import security
 import update_check
 
-MATE_VERSION = "3.14.23"  # bump together with the git tag + add-on config.yaml at release
+MATE_VERSION = "4.27.0"  # bump together with the git tag + add-on config.yaml at release
 
 import diagnostics
 import demo
@@ -36,6 +43,7 @@ import maintenance
 import research
 import ec_enrich
 import elevation_enrich
+import place_lookup
 
 _IS_DEMO = demo.is_demo()
 demo.install(command_client, ha_client)   # no-op unless MATE_DEMO is set
@@ -96,6 +104,7 @@ def _ensure_schema() -> None:
         sys.path.insert(0, _poller)
         try:
             import schema as _schema
+            import charging_places  # shared pure module; no web/poller name collisions
         finally:
             sys.path.remove(_poller)
         conn = _sq.connect(db_reader.DB_PATH, timeout=15)
@@ -170,6 +179,57 @@ _pin_auto_timezone()
 _repair_manual_charge_timezones()
 _repair_merged_charge_pieces()
 
+
+def _keep_earlier_wallbox_lines() -> None:
+    """Once, after the wallbox's readings began to be kept: the lines of the home charges from before, and of the
+    ones not confirmed yet, which may be home's, of every car, read from Home Assistant's history while its
+    recorder still has them, are kept like the readings since; a charge the history no longer reaches keeps
+    nothing. The first charge Home Assistant does not answer for, on any of its readings, ends the sweep
+    undone: it and the rest are read on a later start."""
+    mapping = ha_client.get_mapping()
+    if not (db_reader.get_setting("wallbox_enabled", "0") == "1" and ha_client.is_configured() and mapping.get("power")):
+        return                                              # not done: a wallbox mapped later is swept on a later start
+    complete = True
+    roles = {role: kind for role, kind in db_reader.WALLBOX_SAMPLE_KINDS.items() if mapping.get(role)}
+    kept, charges = 0, 0
+    for vehicle in db_reader.get_vehicles():
+        if not complete:
+            break
+        with db_reader.vehicle_scope(vehicle["id"]):
+            for charge in db_reader.home_or_unconfirmed_charges_without_wallbox_samples():
+                times = db_reader.get_charge_power_curve(charge["id"])["times"]
+                if not times:
+                    continue
+                hists = {kind: ha_client.read_history(mapping[role], times[0], times[-1]) for role, kind in roles.items()}
+                if any(h is None for h in hists.values()):
+                    complete = False
+                    break
+                n = db_reader.save_wallbox_samples(vehicle["id"], times,
+                                                   {kind: ha_client.step_hold(times, h) for kind, h in hists.items() if h})
+                kept, charges = kept + n, charges + bool(n)
+    if charges:
+        log.info("Wallbox lines kept: %d earlier charge(s), %d reading(s) from Home Assistant's history", charges, kept)
+    if complete:
+        db_reader.set_setting("wallbox_lines_kept", "1")
+
+
+def _maybe_keep_earlier_wallbox_lines() -> None:
+    """Not on the start itself (it reads Home Assistant), and at most once an hour through a stamp in the database,
+    so the second import of this module on the same start does not set it off again."""
+    try:
+        if db_reader.get_setting("wallbox_lines_kept", "0") == "1":
+            return
+        now = time.time()
+        if now - float(db_reader.get_setting("wallbox_lines_keep_at", "0") or 0) < 3600:
+            return
+        db_reader.set_setting("wallbox_lines_keep_at", str(now))
+        threading.Thread(target=_keep_earlier_wallbox_lines, daemon=True).start()
+    except Exception as exc:  # noqa: BLE001 — never block startup over a repair; a later start sets it off again
+        log.warning("Wallbox lines of earlier charges not kept yet: %s", exc)
+
+
+_maybe_keep_earlier_wallbox_lines()
+
 app = FastAPI(title="LeapMotor Mate")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
@@ -179,6 +239,8 @@ ec_enrich.start_background()
 # Same background timer for per-trip elevation gain/loss + outside temperature (Open-Meteo lookup on
 # the GPS track); no-op unless the feature is enabled.
 elevation_enrich.start_background()
+# …and for the addresses of the places recent trips started and ended at (place_lookup).
+place_lookup.start_background()
 
 
 def _nice(x) -> str:
@@ -251,10 +313,53 @@ def _localdate(s) -> str:
 
 templates.env.filters["localdate"] = _localdate
 
+
+def _end_time(end, start) -> str:
+    """A span's end as "HH:MM", with its day ("04 Jul 00:30") when that is not the start's. Both local ISO."""
+    from datetime import datetime
+    try:
+        day, start_day = datetime.fromisoformat(end).date(), datetime.fromisoformat(start).date()
+    except (TypeError, ValueError):     # a time typed in by hand is stored as typed when it is no date
+        return end[11:16]
+    if day != start_day:
+        return f"{i18n.fmt_day_month(db_reader.get_language(), day)} {end[11:16]}"
+    return end[11:16]
+
+templates.env.filters["end_time"] = _end_time
+
+
+def _charge_finish(status) -> str | None:
+    """When the running charge ends, "HH:MM" local (with its day when not the reading's), or None (D#444).
+
+    The car's minutes left count from when the car MEASURED them, not from now: an old reading would
+    otherwise push the end later by its own age. The car's clock (`frame_ts`) when it is not after our
+    reading — a frame cannot be measured after we received it — else when Mate read it."""
+    from datetime import datetime, timedelta, timezone
+    minutes = (status or {}).get("remaining_charge_min")
+    if not minutes or minutes <= 0:
+        return None
+    read = db_reader._local_dt(status.get("recorded_at"))
+    if read is None:
+        return None
+    at = read
+    if status.get("frame_ts"):
+        try:
+            frame = datetime.fromtimestamp(int(status["frame_ts"]) / 1000, timezone.utc)
+            if frame <= read:
+                at = frame.astimezone(read.tzinfo)
+        except (TypeError, ValueError, OverflowError, OSError):
+            pass
+    end = at + timedelta(minutes=minutes)
+    if end.date() != at.date():
+        return f"{i18n.fmt_day_month(db_reader.get_language(), end)} {end:%H:%M}"
+    return f"{end:%H:%M}"
+
+templates.env.globals["charge_finish"] = _charge_finish
+
 # Display-time unit conversion (DB stays metric — see units.py). Filters format "<value> <unit>";
 # the *_unit() / *_val() globals give a bare unit label or converted number (chart axes / JS data).
 import units
-for _name in ("dist", "speed", "temp", "pressure", "elev"):
+for _name in ("dist", "speed", "temp", "temp_range", "pressure", "elev"):
     templates.env.filters[_name] = getattr(units, _name)
 templates.env.filters["eff"] = units.efficiency
 def _eff_cls(e) -> str:
@@ -269,10 +374,10 @@ def _range_at_charge_target(range_km, soc):
     """Overview range estimate aimed at the car's charge limit (disc #266, @adoewa). A template GLOBAL,
     like absent_temps below, because status_card.html is rendered by several routes: a per-route value
     would reach one render and vanish from the rest. Reads the current car's REAL limit (the SoC it
-    stops at, never a value typed into Mate — see _configured_charge_limit) and hands db_reader the
-    pure extrapolation."""
+    stops at, never a value typed into Mate — see db_reader.configured_charge_limit) and hands
+    db_reader the pure extrapolation."""
     vehicle, _ = db_reader.get_vehicle()
-    limit = _configured_charge_limit((vehicle or {}).get("vin") or "")
+    limit = db_reader.configured_charge_limit((vehicle or {}).get("vin") or "")
     return db_reader.range_at_charge_target(range_km, soc, limit)
 
 
@@ -288,7 +393,7 @@ def _range_estimates(range_km, soc):
         return None
     
     vehicle, _ = db_reader.get_vehicle()
-    limit = _configured_charge_limit((vehicle or {}).get("vin") or "")
+    limit = db_reader.configured_charge_limit((vehicle or {}).get("vin") or "")
     
     # Always compute the estimate at 100%
     full_est = db_reader.range_at_charge_target(range_km, soc, 100)
@@ -312,7 +417,8 @@ templates.env.globals.update(
     dist_val=units.dist_val, speed_val=units.speed_val, temp_val=units.temp_val,
     eff_val=units.eff_val, elev_val=units.elev_val, unit_system=units.get_unit_system,
     dist100_unit=units.dist100_unit, cost100_val=units.cost100_val,
-    eff_cls=_eff_cls,
+    eff_cls=_eff_cls, display_tz_name=db_reader.display_tz_name, provider_names=geocode.NAMES,
+    trip_kwh_used=db_reader.trip_kwh_used,   # trip_row.html, in every list that renders it
     # #222 — whether the charger's-own-kWh field can be offered at all. A GLOBAL, not a per-route
     # value: the charge card is rendered by the page AND by two partials that build their context by
     # hand, so a flag passed through _ctx reached the page and silently vanished from the day drawer
@@ -320,6 +426,21 @@ templates.env.globals.update(
     # for the field, watched it disappear between v3.6.6 and v3.6.8. A callable, so it answers per
     # render: the poller can add the column while the web is running.
     gross_kwh_ok=lambda: db_reader._charges_have_gross(db_reader._get()),
+    # #272 — the same question for the solar field, and a GLOBAL for the same reason its twin is
+    # one: the charge card is rendered by the page and by two partials that build their context by
+    # hand, and a flag threaded through _ctx reaches the page and vanishes from the day drawer.
+    solar_kwh_ok=lambda: db_reader._charges_have_solar(db_reader._get()),
+    # #272 — whether Casa is priced by subtracting the owner's own solar. The card asks, because
+    # the field is only meaningful under that mode; a callable so switching the mode in Settings
+    # shows the field without a restart.
+    solar_mode_on=db_reader.home_prices_by_solar,
+    # Which kWh a charge leads with, and what stands under it. A GLOBAL for the reason its
+    # neighbours are: the charge card is rendered from three hand-built contexts, and the Overview
+    # tile reads the same rule.
+    charge_energy=db_reader.charge_energy_view,
+    # …and the figure the €/kWh on the cost cell divides by, the same one the totals sum.
+    billed_kwh=db_reader._billed_kwh,
+    billed_basis=db_reader.billed_basis,
     # #144 — the temperature sensors this car has never once reported, so the status card can leave
     # them out instead of promising a number that will never arrive. A GLOBAL for exactly the reason
     # above: `status_card.html` is rendered by the Overview AND by partials that build their own
@@ -334,15 +455,33 @@ templates.env.globals.update(
 app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
 
 
+def _script_json(value) -> str:
+    """JSON to put inside a <script> with |safe: json.dumps leaves "</script>" as it is, so a string
+    in the settings could close the script and open another. <, > and & are written as escapes."""
+    return json.dumps(value).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+
+
 # ── Setup check middleware ────────────────────────────────────────────────────
 
 @app.middleware("http")
 async def setup_check(request: Request, call_next):
-    path = request.url.path
+    # Security decisions must use the path supplied by ASGI routing. With affected Starlette
+    # versions a malformed Host header can alter request.url.path without altering the route.
+    path = request.scope.get("path", "")
+    # Through Home Assistant's ingress, HA has authenticated the request and frames the panel. Any
+    # other request to the add-on came through port 4000 opened by the owner: standalone rules.
+    ingress = security.via_ingress(request.client.host if request.client else None)
+    # A page on a name of its own, rebound to this Mate, sends that name as both Host and Origin and
+    # passes the origin check below. With no password, answer only to home-network names. With a
+    # password the session cookie belongs to the real name, and a rebound page never carries it.
+    if not ingress and not auth.enabled() and path != "/healthz" \
+            and not security.host_allowed(request.headers.get("host", "")):
+        return Response(security.host_refused(), status_code=403)
     # Cross-site write guard. Ahead of every other gate — including the always-public paths and
     # the auth check — because it protects the install that has NO password, which is the default
-    # one. See web/security.py for why an absent origin is allowed and why add-on mode is exempt.
-    if not security.origin_allowed(request.method, path, request.headers, str(request.base_url)):
+    # one. See web/security.py for why an absent origin is allowed and why ingress is exempt.
+    if not security.origin_allowed(request.method, path, request.headers, str(request.base_url),
+                                   ingress=ingress):
         return Response("cross-site request refused", status_code=403)
     # Always-public: static assets, the liveness probe, and the login page/handler.
     if path.startswith("/static/") or path == "/healthz" or path.startswith("/login"):
@@ -377,8 +516,8 @@ async def security_headers(request: Request, call_next):
     clickjacking half of the attack, which no origin check can see because that click really
     does happen inside Mate. Skipped as an add-on — HA frames the panel deliberately."""
     resp = await call_next(request)
-    if not security.is_addon():
-        for k, v in security.SECURITY_HEADERS.items():
+    if not security.via_ingress(request.client.host if request.client else None):
+        for k, v in security.security_headers().items():
             resp.headers.setdefault(k, v)
     return resp
 
@@ -393,12 +532,12 @@ def _soc_color(soc: float) -> str:
 def _driving(pos: dict) -> bool:
     """Active drive = any gear other than Park (so a stop in traffic with gear D
     still reads as driving, not 'Parked'); speed is a fallback if the gear lags."""
-    return (pos.get("gear") or "P") != "P" or pos.get("speed_kmh", 0) > 1
+    return (pos.get("gear") or "P") != "P" or (pos.get("speed_kmh") or 0) > 1
 
 def _state_color(pos: dict) -> str:
+    if pos.get("driving_stale"): return "text-amber-400"
     if pos.get("charging"): return "text-yellow-400"
     if _driving(pos): return "text-blue-400"
-    if pos.get("plug_connected"): return "text-teal-300"   # cable in, not actively charging
     return "text-green-400"
 
 def _opt_float(s: str) -> "float | None":
@@ -430,12 +569,77 @@ def _fmt_dur(minutes) -> str:
     return f"{m // 60}h {m % 60:02d}m"
 
 
+def _ago(t, seconds) -> str:
+    """"How long ago", in the reader's own language. db_reader computes the seconds and can't
+    translate them (no request, no locale there), so every "…ago" on screen goes through here.
+    Until #178 put an Italian phrase next to it, the Overview's `last seen` was English for
+    everyone and nobody noticed it standing alone."""
+    if seconds is None:
+        return "—"
+    s = max(int(seconds), 0)
+    if s < 60:
+        return t("ago_s").format(n=s)
+    if s < 3600:
+        return t("ago_m").format(n=s // 60)
+    if s < 86400:
+        return t("ago_h").format(n=s // 3600)
+    return t("ago_d").format(n=s // 86400)
+
+
+def _last_position(status, t, have=None) -> dict:
+    """The Overview map's marker: where the car is, how old that position is (the map card's
+    heading says it), and when to ask again — and under it, the route of today's last trip
+    (db_reader.get_todays_track).
+
+    `have` is the route key the map has drawn: the map asks all day, so the same route comes back
+    without its points (`segments` None) instead of a few kilobytes every poll.
+
+    ONE builder for the page's first paint and for /api/last-position, which the map polls — so the
+    marker can only ever move to a position the page itself would have drawn. It reads what the
+    poller already stored (get_latest_status: the last real fix when a poll came back without one);
+    polling it never reaches Leapmotor's servers. A position is shown only when it is one
+    (has_gps_fix): a first poll without a fix stores (0, 0), and there is no earlier fix to fall
+    back on.
+
+    `refresh_s` is the poller's DRIVING cadence (Settings ▸ poll_driving), whatever the car is doing
+    now. The poller's real schedule depends on state this process cannot see — a parked car about to
+    drive and V2L poll at that pace, a boost every 10 s, and a boost can start at any moment — so a
+    map that waited out the parked interval could sit ten minutes behind a car already moving. The
+    read is local, so asking at the pace the owner chose for a moving car costs Leapmotor nothing.
+
+    The age is the position's own (get_latest_status's position_age_s): its FRAME's, not its row's
+    (#232) — a parked car's cloud re-serves one frozen frame, and a fresh row over it once said
+    "22 seconds ago" at a marker that had not moved in hours — and, when a poll came back without a
+    fix, the age of the fix the map falls back to, not of that poll.
+
+    Always the same keys — lat/lon/ago are None while no position is known — so the page and the
+    map never branch on the shape, and the map still learns when to ask again."""
+    status = status or {}
+    refresh_s = db_reader.poll_seconds(driving=True)
+    track = db_reader.get_todays_track()
+    if have is not None and track["key"] == have:
+        track["segments"] = None
+    if not db_reader.has_gps_fix(status.get("latitude"), status.get("longitude")):
+        return {"lat": None, "lon": None, "ago": None, "refresh_s": refresh_s, "track": track}
+    return {"lat": status["latitude"], "lon": status["longitude"],
+            "ago": _ago(t, status.get("position_age_s")),
+            "refresh_s": refresh_s, "track": track}
+
+
 def _ctx(**kwargs):
     """Add shared helpers + i18n to every template context."""
     # Lazy auto-confirm sweep (like update_check: piggybacks on page renders, no bg loop).
     # Self-guarding no-op unless the wallbox_auto_home toggle is on AND a closed untyped
     # wallbox charge exists — so by the time any page shows charges, they're already tagged.
     db_reader.auto_confirm_home_charges()
+    # Its twin: «I always charge at home» makes a charge be born already typed HOME, so it went
+    # through no confirm and nothing ever priced it — green badge, cost '—', and the period spend
+    # counting none of them. Same lazy sweep, same update_charge_type path, and it catches the
+    # backlog of whoever turned that switch on weeks ago.
+    db_reader.price_default_home_charges()
+    # Same piggyback for the rows one plug-in was cut into by a wallbox pause (#374): a cursor read
+    # and one indexed SELECT per render, and each charge is examined exactly once.
+    db_reader.join_charges_split_by_a_pause()
     # Same piggyback for the 📍 station labels — settings probe + tiny SELECT per render,
     # the OSM lookups run in a background thread on a TTL (see charger_locator.maybe_sweep).
     charger_locator.maybe_sweep()
@@ -447,27 +651,13 @@ def _ctx(**kwargs):
     lang = db_reader.get_language()
     t = i18n.get_t(lang)
     def state_label(pos: dict) -> str:
+        if pos.get("driving_stale"): return t("state_stale")
         if pos.get("charging"): return t("state_charging")
         if _driving(pos): return t("state_driving")
-        # Charge finished (or paused) but the cable is still plugged in — don't read as a plain
-        # "Parked"; surface that the car is still connected.
-        if pos.get("plug_connected"):
-            return t("state_charge_complete") if pos.get("charge_completed") else t("state_plugged")
         return t("state_parked")
 
     def ago(seconds) -> str:
-        """"How long ago", in the reader's own language. db_reader computes the seconds and can't
-        translate them (no request, no locale there), so every "…ago" on screen goes through here.
-        Until #178 put an Italian phrase next to it, the Overview's `last seen` was English for
-        everyone and nobody noticed it standing alone."""
-        if seconds is None:
-            return "—"
-        s = max(int(seconds), 0)
-        if s < 60:
-            return t("ago_s").format(n=s)
-        if s < 3600:
-            return t("ago_m").format(n=s // 60)
-        return t("ago_h").format(n=s // 3600)
+        return _ago(t, seconds)
 
     wallbox_enabled = db_reader.get_setting("wallbox_enabled", "0") == "1"
     # Active wallbox profile: shown in sidebar + page title + profiles panel.
@@ -497,7 +687,18 @@ def _ctx(**kwargs):
     # A car that walked in from the poller and never met the wizard is running on its model's
     # default pack. On every page, because the figures it bends are on every page.
     _unconfigured = db_reader.unconfigured_vehicles()
-    return {**kwargs, "lang": lang, "t": t, "version": MATE_VERSION, "demo": _IS_DEMO,
+    _command_css = ""
+    from ui_command_access import fan_top as _fan_top
+    if not _IS_DEMO:
+        from ui_command_access import hidden_controls_css
+        _vin = (_veh or {}).get("vin", "")
+        _command_css = hidden_controls_css(
+            _vin, db_reader.get_setting,
+            # One rule for the page, the injected CSS and Home Assistant: the cloud's data for
+            # this car plus what was measured on the model.
+            shown=lambda _name: capability_profile.command_shown(
+                _vin, _name, car_type=(_veh or {}).get("car_type", "")))
+    return {**kwargs, "api_v2_command_css": _command_css, "lang": lang, "t": t, "version": MATE_VERSION, "demo": _IS_DEMO,
             "unconfigured_cars": ", ".join(
                 (v.get("car_type") or (v.get("vin") or "")[-6:]) for v in _unconfigured),
             "vehicles": _vehicles,
@@ -519,6 +720,8 @@ def _ctx(**kwargs):
             # Charge-schedule view: cars without weekly/cyclic charge abilities (e.g. T03) get the
             # simple start-time + SoC form — no end-time window, no day chips (#146).
             "charge_schedule_advanced": capability_profile.charge_schedule_advanced(_abilities),
+            # The car's top fan speed, for the Vehicle page's Climate card and the Commands slider.
+            "fan_top": _fan_top((_veh or {}).get("vin"), db_reader.get_setting),
             # The car's charge window as "HH:MM – HH:MM", or "" when there isn't one enabled. Lives
             # here rather than in the Overview routes because the hero card is rendered from TWO
             # places (the page, and the 30-second self-refresh) and a value wired into only one of
@@ -611,37 +814,58 @@ async def logout(request: Request):
 async def overview(request: Request):
     vehicle, settings = db_reader.get_vehicle()
     status = db_reader.get_latest_status()
-    trips = db_reader.get_trips(limit=3)
-    # get_trips() returns raw UTC rows; overview.html slices started_at[:10]/[11:16]
-    # directly, so localize here like the Trips page / trip detail do (issue #12).
-    for tr in trips:
-        tr["started_at"] = db_reader._local_iso(tr.get("started_at"))
-        tr["ended_at"] = db_reader._local_iso(tr.get("ended_at"))
+    # Made ready as the Trips lists make theirs, for the same row (local times, a figure still provisional),
+    # but not priced: its rows show no cost.
+    trips = db_reader._prepared_trips(db_reader.get_trips(limit=3))
+    lang = db_reader.get_language()
+    for tr in trips:            # its rows stand on their own, as a search result's do: each says its day
+        dt = db_reader._local_dt(tr.get("started_at"))
+        tr["date_label"] = i18n.fmt_day_month_year(lang, dt) if dt else None
     charges = db_reader.get_charges(limit=1)
+    t = i18n.get_t(lang)
     return templates.TemplateResponse(request, "overview.html", _ctx(
         page="overview", vehicle=vehicle, settings=settings,
-        status=status, recent_trips=trips,
+        status=status, recent_trips=trips, address_credit=db_reader.trip_places(trips),
+        last_position=_last_position(status, t),
         last_charge=charges[0] if charges else None,
         v2l=db_reader.get_v2l_status(),
-        charge_limit=_configured_charge_limit((vehicle or {}).get("vin") or ""),
+        charge_limit=db_reader.configured_charge_limit((vehicle or {}).get("vin") or ""),
         car_resp=db_reader.command_responsiveness(),
         battery_price=db_reader.current_blended_price(),   # #200 — must match /api/status-card
+        data_link=None if _IS_DEMO else db_reader.data_link(status),   # demo runs no poller
     ))
 
 
+def _page_month(month: str) -> tuple[int, int]:
+    """The month a calendar page opens on: `?month=YYYY-MM`, which the page keeps in its address so a reload
+    draws the month being looked at, else today's."""
+    import re
+    m = re.fullmatch(r"([1-9]\d{3})-(\d{1,2})", month)
+    if m and 1 <= int(m[2]) <= 12:
+        return int(m[1]), int(m[2])
+    today = db_reader.today_local()
+    return today.year, today.month
+
+
 @app.get("/trips", response_class=HTMLResponse)
-async def trips_page(request: Request, highlight: int = 0):
+async def trips_page(request: Request, highlight: int = 0, month: str = ""):
     vehicle, _ = db_reader.get_vehicle()
+    place_lookup.maybe_sweep()      # a trip that just ended gets its addresses without waiting for the timer
+    # Read before the history, as Charges reads its session: a trip that ends while the page is drawn is still
+    # named on it, and the next poll reloads the page; read after, the history would stay stale for good.
+    live    = _trip_live_chart()
     summary = db_reader.get_trips_summary()
     total   = summary.get("count") or 0
-    # The calendar's Month view opens on today — or, following a ?highlight=<id> link, on
+    # The calendar's Month view opens on ?month= or today — or, following a ?highlight=<id> link, on
     # whichever month that ONE trip actually falls on (same convention as Ricariche).
-    today = db_reader.today_local()
-    cal_year, cal_month, cal_open_day = today.year, today.month, 0
+    (cal_year, cal_month), cal_open_day = _page_month(month), 0
     if highlight:
         hl_date = db_reader.get_trip_local_date(highlight)
         if hl_date:
             cal_year, cal_month, cal_open_day = hl_date.year, hl_date.month, hl_date.day
+    # A search in the address (a reload, a result's "← Trips") opens on its results instead of the calendar.
+    search = {k: request.query_params.get(k, "") for k in _TRIPS_SEARCH_FIELDS}
+    search_ctx = _trips_search_ctx(search, cal_year, cal_month)
     return templates.TemplateResponse(request, "trips.html", _ctx(
         page="trips", vehicle=vehicle,
         total=total, highlight=highlight, summary=summary,
@@ -658,11 +882,43 @@ async def trips_page(request: Request, highlight: int = 0):
         # swapped calendar area so the drawer's 🔗 preview still has somewhere to open.
         cal_year=cal_year, cal_month=cal_month, cal_open_day=cal_open_day,
         cal_years=db_reader.get_trip_years(),
-        calendar_html=_trips_calendar_html(cal_year, cal_month, cal_open_day),   # drawn, not fetched
+        calendar_html=(templates.get_template("partials/trips_search_results.html").render(search_ctx) if search_ctx
+                       else _trips_calendar_html(cal_year, cal_month, cal_open_day)),   # drawn, not fetched
+        search_qs=search_ctx and search_ctx["search_qs"], search_fields=_TRIPS_SEARCH_FIELDS,
+        live=live,
     ))
 
 
-def _trips_calendar_ctx(year: int, month: int, open_day: int = 0) -> dict:
+def _day_span(year: int, month: int, day: int, to_day: int = 0) -> tuple[int, int]:
+    """`day`..`to_day` (0 = just `day`) as first and last, both inside the month."""
+    import calendar as calmod
+    days_in_month = calmod.monthrange(year, month)[1]
+    first, last = sorted(max(1, min(d, days_in_month)) for d in (day, to_day or day))
+    return first, last
+
+
+def _trips_drawer_ctx(lang: str, year: int, month: int, day: int, to_day: int = 0) -> dict:
+    """What the day drawer prints for `day`, or for the days from `day` to `to_day`: built here for both
+    routes that render the drawer, so they cannot differ."""
+    from datetime import date
+    from itertools import groupby
+    first, last = _day_span(year, month, day, to_day)
+    trips = db_reader.get_trips_calendar_day(year, month, first, last)
+    ctx = {"trips": trips, "day_totals": db_reader.trips_day_totals(trips),
+           "address_credit": db_reader.trip_places(trips)}
+    if first == last:
+        ctx.update(day=first, day_label=i18n.fmt_day_month_year(lang, date(year, month, first)))
+        return ctx
+    # One heading over the range, then each day with trips under its own, newest first like the rows.
+    ctx["range_label"] = i18n.fmt_day_range(lang, date(year, month, first), date(year, month, last))
+    ctx["range_days"] = [
+        {"day": d, "label": i18n.fmt_day_month_year(lang, date(year, month, d)),
+         "trips": ts, "totals": db_reader.trips_day_totals(ts)}
+        for d, ts in ((d, list(g)) for d, g in groupby(trips, key=lambda t: t["_dt"].day))]
+    return ctx
+
+
+def _trips_calendar_ctx(year: int, month: int, open_day: int = 0, open_to: int = 0) -> dict:
     """The Viaggi calendar's context, without a Response around it — so the page can draw the grid
     itself on first paint. Same split as _charges_calendar_ctx, for the same reason (#240)."""
     import calendar as calmod
@@ -694,14 +950,13 @@ def _trips_calendar_ctx(year: int, month: int, open_day: int = 0) -> dict:
         # context, so it is swapped together with the grid when the month buttons are used.
         "offline": db_reader.offline_gaps_summary(year, month),
     }
-    if open_day and open_day in cal["days"]:
-        ctx["open_day"] = open_day     # so the grid can ring the day the drawer is showing
-        ctx["open_day_trips"] = db_reader.get_trips_calendar_day(year, month, open_day)
-        ctx["open_day_label"] = i18n.fmt_day_month_year(lang, date(year, month, open_day))
-        # Same totals the drawer's own endpoint passes — the day content is rendered from HERE too
-        # (month view opening straight onto a day), and a header that only appears down one of the
-        # two paths is the classic way this template has broken before.
-        ctx["open_day_totals"] = db_reader.trips_totals(ctx["open_day_trips"])
+    if open_day:
+        open_day, open_to = _day_span(year, month, open_day, open_to)
+    if open_day and any(d in cal["days"] for d in range(open_day, open_to + 1)):
+        ctx["open_day"] = open_day     # so the grid can ring the days the drawer is showing
+        ctx["open_to"] = open_to
+        # The drawer's own endpoint builds the same context, so both paths print the same heading.
+        ctx["open_drawer"] = _trips_drawer_ctx(lang, year, month, open_day, open_to)
     return ctx
 
 
@@ -710,23 +965,27 @@ def _trips_calendar_html(year: int, month: int, open_day: int = 0) -> str:
         _trips_calendar_ctx(year, month, open_day))
 
 
-def _render_trips_calendar(request: Request, year: int, month: int, open_day: int = 0):
+def _render_trips_calendar(request: Request, year: int, month: int, open_day: int = 0, open_to: int = 0):
     """Shared by /api/trips/calendar and the search endpoint's empty-filters fallback."""
     return templates.TemplateResponse(request, "partials/trips_calendar_month.html",
-                                      _trips_calendar_ctx(year, month, open_day))
+                                      _trips_calendar_ctx(year, month, open_day, open_to))
 
 
 @app.get("/api/trips/calendar", response_class=HTMLResponse)
-async def trips_calendar(request: Request, year: int = 0, month: int = 0, open_day: int = 0):
+async def trips_calendar(request: Request, year: int = 0, month: int = 0,
+                         open_day: Annotated[int, Query(ge=0, le=31)] = 0,
+                         open_to: Annotated[int, Query(ge=0, le=31)] = 0):
     """Viaggi 'calendar' Month view (HTMX partial, day totals only) — the day drawer loads
     a day's actual trips lazily on click (see trips_calendar_day below)."""
-    return _render_trips_calendar(request, year, month, open_day)
+    return _render_trips_calendar(request, year, month, open_day, open_to)
 
 
 @app.get("/api/trips/calendar/day", response_class=HTMLResponse)
-async def trips_calendar_day(request: Request, year: int, month: int, day: int,
+async def trips_calendar_day(request: Request, year: int, month: int, day: Annotated[int, Query(ge=1, le=31)],
+                             to_day: Annotated[int, Query(ge=0, le=31)] = 0,
                              merge: int = 0, gap: int = db_reader.TRIP_MERGE_GAP_DEFAULT):
     """One day's trips for the Month view's day drawer, with that day's own totals (#175).
+    `to_day` opens the days from `day` to it instead: totals over the range, then each day's own.
 
     `merge=1` swaps that list for THIS day's mergeable pairs, each with the 🔗 connector between
     them, and keeps the max-stop slider (#204 @riri19). The pairs used to live in their own
@@ -734,20 +993,21 @@ async def trips_calendar_day(request: Request, year: int, month: int, day: int,
     drawer's heading already says which day this is, so under it a row needs only its clock."""
     lang = db_reader.get_language()
     from datetime import date
-    d = date(year, month, day)
+    d = date(year, month, _day_span(year, month, day, to_day)[0])
     gap = max(db_reader.TRIP_MERGE_GAP_MIN, min(db_reader.TRIP_MERGE_GAP_MAX, gap))
-    day_trips = db_reader.get_trips_calendar_day(year, month, day)
+    ctx = _trips_drawer_ctx(lang, year, month, day, to_day)
+    # Chains, not pairs: pairs overlap on the trip between them and drew it twice (#249).
+    candidates = db_reader.get_merge_chains(gap, day=d) if merge else []
+    if merge:                       # the chains' rows are shown instead of the day's
+        ctx["address_credit"] = db_reader.trip_places([step["trip"] for chain in candidates for step in chain])
     return templates.TemplateResponse(request, "partials/trips_calendar_day.html", {
         "t": i18n.get_t(lang), "fmt_dur": _fmt_dur,
         "is_reev": db_reader.is_reev_car(), "research": research.research_enabled(),
-        "trips": day_trips,
-        "day_totals": db_reader.trips_totals(day_trips),
-        "day_label": i18n.fmt_day_month_year(lang, d),
-        # The drawer builds its own 🔗 / slider URLs, so it needs the day back as three numbers.
-        "year": year, "month": month, "day": day,
+        **ctx,
+        # The 🔗 and slider URLs the drawer builds take these, with the day from _trips_drawer_ctx.
+        "year": year, "month": month,
         "merge_mode": bool(merge), "gap": gap,
-        # Chains, not pairs: pairs overlap on the trip between them and drew it twice (#249).
-        "candidates": db_reader.get_merge_chains(gap, day=d) if merge else [],
+        "candidates": candidates,
         "merge_gap_min": db_reader.TRIP_MERGE_GAP_MIN, "merge_gap_max": db_reader.TRIP_MERGE_GAP_MAX,
     })
 
@@ -761,18 +1021,38 @@ async def trips_search(request: Request, q: str = "", drive_mode: str = "",
                         year: int = 0, month: int = 0):
     """Viaggi free-text + advanced-filter search (HTMX partial) — replaces the calendar with
     a flat, most-recent-first list of matches. No filter at all (search cleared) falls back
-    to the calendar Month view instead of an empty list. km_min/km_max are typed in the
-    user's own distance unit (the form label follows dist_unit()) and converted to km here,
-    same as a manually-entered odometer reading — search_trips itself is always metric.
-    The numeric fields arrive as strings (see _opt_float) — an empty advanced-filter field
-    must never 422 the whole request."""
-    n_km_min, n_km_max = _opt_float(km_min), _opt_float(km_max)
-    n_eff_min, n_eff_max = _opt_float(eff_min), _opt_float(eff_max)
-    n_duration_min, n_duration_max = _opt_float(duration_min), _opt_float(duration_max)
+    to the calendar Month view instead of an empty list."""
+    ctx = _trips_search_ctx({"q": q, "drive_mode": drive_mode, "km_min": km_min, "km_max": km_max,
+                             "eff_min": eff_min, "eff_max": eff_max, "duration_min": duration_min,
+                             "duration_max": duration_max, "date_from": date_from, "date_to": date_to},
+                            year, month)
+    if ctx is None:
+        return _render_trips_calendar(request, year, month)
+    return templates.TemplateResponse(request, "partials/trips_search_results.html", ctx)
+
+
+# The Trips search's filters, by the names the search endpoint and the page's address give them.
+_TRIPS_SEARCH_FIELDS = ("q", "drive_mode", "km_min", "km_max", "eff_min", "eff_max",
+                        "duration_min", "duration_max", "date_from", "date_to")
+
+
+def _trips_search_ctx(filters: dict[str, str], year: int, month: int) -> dict | None:
+    """The Trips search results' template context for `filters`, by the search endpoint's parameter names,
+    or None when no filter is set. km_min/km_max are typed in the user's own distance unit (the form label
+    follows dist_unit()) and converted to km here, same as a manually-entered odometer reading —
+    search_trips itself is always metric. The numeric fields arrive as strings (see _opt_float) — an empty
+    advanced-filter field must never 422 the whole request."""
+    q, drive_mode = filters.get("q", ""), filters.get("drive_mode", "")
+    date_from, date_to = filters.get("date_from", ""), filters.get("date_to", "")
+    n_km_min, n_km_max = _opt_float(filters.get("km_min", "")), _opt_float(filters.get("km_max", ""))
+    n_eff_min, n_eff_max = _opt_float(filters.get("eff_min", "")), _opt_float(filters.get("eff_max", ""))
+    n_duration_min = _opt_float(filters.get("duration_min", ""))
+    n_duration_max = _opt_float(filters.get("duration_max", ""))
     if not any((q.strip(), drive_mode.strip(), n_km_min is not None, n_km_max is not None,
                 n_eff_min is not None, n_eff_max is not None, n_duration_min is not None,
                 n_duration_max is not None, date_from.strip(), date_to.strip())):
-        return _render_trips_calendar(request, year, month)
+        return None
+    search_qs = urlencode([(k, v.strip()) for k, v in filters.items() if v.strip()])
     lang = db_reader.get_language()
     trips = db_reader.search_trips(
         text=q, drive_mode=drive_mode,
@@ -780,22 +1060,29 @@ async def trips_search(request: Request, q: str = "", drive_mode: str = "",
         eff_min=n_eff_min, eff_max=n_eff_max, duration_min=n_duration_min, duration_max=n_duration_max,
         date_from=date_from, date_to=date_to)
     # The same split Ricariche got in #191, which Viaggi never got: a result standing on its own has
-    # to say WHICH DAY it was — a hit read "17:52 → 18:15" and nothing more. Set the label HERE, in
-    # the search route only, and let the row print it when it's there. Unconditionally in the row
-    # and the calendar's day drawer starts repeating its own heading underneath itself, once per
-    # trip — the same reason merging moved INTO the drawer rather than carrying its own dates (#204).
+    # to say WHICH DAY it was — a hit read "17:52 → 18:15" and nothing more. Set the label here, as
+    # every route whose rows stand alone does (the Charges search, the Overview), and let the row print
+    # it when it's there. Unconditionally in the row and the calendar's day drawer starts repeating its
+    # own heading underneath itself, once per trip — the same reason merging moved INTO the drawer
+    # rather than carrying its own dates (#204).
     for t in trips:
         dt = db_reader._local_dt(t.get("started_at"))
         t["date_label"] = i18n.fmt_day_month_year(lang, dt) if dt else None
     today = db_reader.today_local()
-    return templates.TemplateResponse(request, "partials/trips_search_results.html", {
+    y, m = year or today.year, month or today.month
+    return {
         "t": i18n.get_t(lang), "fmt_dur": _fmt_dur,
         "is_reev": db_reader.is_reev_car(), "research": research.research_enabled(),
         "trips": trips, "year": year or today.year, "month": month or today.month,
+        "address_credit": db_reader.places_credit(trips),      # search_trips named every trip's places
         # disc #263 — the period's own total (km, fuel, cost) for whatever the filters selected, so a
         # custom billing cycle reads off the results instead of being added up by hand.
         "search_total": db_reader.search_results_total_trips(trips),
-    })
+        # The search as the page's address has it, and the page's address a result's trip page leads back to:
+        # with the month Back to calendar opens, today's unsaid as on the calendar.
+        "search_qs": search_qs,
+        "back": "trips?" + ("" if (y, m) == (today.year, today.month) else f"month={y}-{m:02d}&") + search_qs,
+    }
 
 
 def _route_svg(points: list[dict], w: int = 84, h: int = 48, pad: int = 6) -> str:
@@ -847,8 +1134,139 @@ async def trip_route_svg(trip_id: int):
                     headers={"Cache-Control": "public, max-age=86400"})
 
 
+def _nice_scale(lo: float, hi: float, min_span: float = 4.0) -> tuple[float, float]:
+    """The scale the big chart gives a band (`niceScale` in band-chart.js): a round step, four of them
+    from a round floor under `lo` to above `hi`, never narrower than `min_span`."""
+    import math
+    if hi - lo < min_span:
+        mid = (lo + hi) / 2
+        lo, hi = mid - min_span / 2, mid + min_span / 2
+    mag = 10 ** math.floor(math.log10((hi - lo) / 4))
+    for m in (1, 2, 2.5, 3, 4, 5, 10, 20):
+        step = m * mag
+        if step % 1:
+            continue
+        a = math.floor(lo / step) * step
+        if a + 4 * step >= hi:
+            return a, a + 4 * step
+    return lo, hi
+
+
+def _curve_runs(times: list, values: list) -> list[list[tuple[float, float]]]:
+    """(instant, value) runs of a series, broken where the chart breaks its line: at a reading the poll
+    did not carry (None, never a 0) and at a gap wider than three typical steps, the typical step being
+    the median spacing (`spread` in band-chart.js). A finished charge's curve holds only the samples
+    with current flowing, so a pause arrives as such a gap, not as 0 kW. A lone reading is a run of one:
+    it draws no line but holds the time axis and the scale, as on the big chart."""
+    from datetime import datetime
+    from itertools import pairwise
+    secs = []
+    for t in times:
+        try:
+            secs.append(datetime.fromisoformat(t).timestamp())
+        except (TypeError, ValueError):
+            secs.append(None)
+    deltas = sorted(b - a for a, b in pairwise(secs) if a is not None and b is not None and b > a)
+    step = deltas[len(deltas) // 2] if deltas else 0
+    runs, run, prev = [], [], None
+    for t, v in zip(secs, values):
+        gap = step > 0 and prev is not None and t is not None and t - prev > step * 3
+        if t is None or v is None or gap:
+            if run:
+                runs.append(run)
+            run = []
+        if t is not None and v is not None:
+            run.append((t, float(v)))
+        prev = t if t is not None else prev
+    if run:
+        runs.append(run)
+    return runs
+
+
+def _curve_svg(curve: dict, w: int = 84, h: int = 64) -> str:
+    """The thumbnail of a charge's curve: power above SoC on one time axis, on the big chart's scales
+    (band-chart.js). A pixel column keeps its first, lowest, highest and last sample, so a one-sample
+    dip survives; a pause is a hole in both lines, no samples a dashed baseline in both."""
+    fh, gap, pad = (h - 4) // 2, 4, 4
+    frames = [(0, fh), (fh + gap, fh)]
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}">']
+    for top, height in frames:
+        out.append(f'<rect x="0.5" y="{top + 0.5}" width="{w - 1}" height="{height - 1}" rx="6" '
+                   f'fill="#0a1424" stroke="#1a2438"/>')
+    series = [(_curve_runs(curve.get("times") or [], curve.get("power") or []), "#fbbf24", frames[0], "power"),
+              (_curve_runs(curve.get("times") or [], curve.get("soc") or []), "#22c55e", frames[1], "soc")]
+    instants = [t for runs, *_ in series for run in runs for t, _ in run]
+    t0, t1 = (min(instants), max(instants)) if instants else (0.0, 0.0)
+    span = (t1 - t0) or 1.0
+
+    def x_of(t):
+        return pad + (t - t0) / span * (w - 2 * pad)
+
+    def columns(run):
+        cols = {}
+        for t, v in run:
+            cols.setdefault(int(x_of(t)), []).append((t, v))
+        pts = []
+        for _, c in sorted(cols.items()):
+            pts.extend(sorted({c[0], min(c, key=lambda p: p[1]), max(c, key=lambda p: p[1]), c[-1]}))
+        return pts
+
+    for runs, colour, (top, height), kind in series:
+        if not runs:
+            y = top + height / 2
+            out.append(f'<path d="M{pad} {y} L{w - pad} {y}" fill="none" stroke="#334155" '
+                       f'stroke-width="1.5" stroke-dasharray="3 3"/>')
+            continue
+        values = [v for run in runs for _, v in run]
+        if kind == "power":
+            lo, hi = _nice_scale(0.0, max(max(values), 4.0))
+        else:
+            lo, hi = _nice_scale(min(values), max(values))
+            if hi > 100:
+                lo, hi = 100 - (hi - lo), 100
+        rng = (hi - lo) or 1.0
+        drawn = [[(round(x_of(t), 1), round(top + pad + (1 - (v - lo) / rng) * (height - 2 * pad), 1))
+                  for t, v in columns(run)] for run in runs]
+        out.append(_curve_unit(kind, colour, top, height, w, [p for pts in drawn for p in pts]))
+        for pts in (pts for pts in drawn if len(pts) > 1):
+            d = "M" + " L".join(f"{x} {y}" for x, y in pts)
+            out.append(f'<path d="{d}" fill="none" stroke="{colour}" stroke-width="2" '
+                       f'stroke-linecap="round" stroke-linejoin="round"/>')
+    out.append("</svg>")
+    return "".join(out)
+
+
+def _curve_unit(kind: str, colour: str, top: float, height: float, w: int, pts: list) -> str:
+    """A frame's unit in the first corner (top left, top right, bottom right, bottom left) its line
+    crosses least, so the label rarely sits under the line."""
+    text, width = ("kW", 11) if kind == "power" else ("%", 7)
+    corners = [(6, top + 10, "start"), (w - 6, top + 10, "end"),
+               (w - 6, top + height - 4, "end"), (6, top + height - 4, "start")]
+
+    def crossed(corner):
+        x, y, anchor = corner
+        x0 = x if anchor == "start" else x - width
+        return sum(x0 - 2 <= px <= x0 + width + 2 and y - 9 <= py <= y + 2 for px, py in pts)
+
+    x, y, anchor = min(corners, key=crossed)
+    return (f'<text x="{x}" y="{y}" text-anchor="{anchor}" font-family="system-ui,sans-serif" font-size="8" '
+            f'font-weight="600" fill="{colour}" fill-opacity="0.8">{text}</text>')
+
+
+@app.get("/charges/{charge_id}/curve.svg")
+async def charge_curve_svg(charge_id: int, w: int = Query(84, ge=60, le=240)):
+    """The thumbnail beside a charge's row, `w` pixels wide (a computer's row asks for a wider one
+    than a phone's). A finished charge's curve is cached for a day: the row changes the address's
+    `?v=` when a merge or split changes the curve under the same id. A running charge's curve grows,
+    so it is not cached, nor is an empty one: the curve is the selected car's, the charge may not be."""
+    curve = db_reader.get_charge_power_curve(charge_id)
+    keep = db_reader.get_charge(charge_id).get("ended_at") and curve.get("times")
+    return Response(content=_curve_svg(curve, w=w), media_type="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=86400" if keep else "no-store"})
+
+
 @app.get("/trips/{trip_id}", response_class=HTMLResponse)
-async def trip_detail(request: Request, trip_id: int):
+async def trip_detail(request: Request, trip_id: int, back: str = ""):
     vehicle, _ = db_reader.get_vehicle()
     trip = db_reader.get_trip_detail(trip_id)
     if not trip:
@@ -861,11 +1279,37 @@ async def trip_detail(request: Request, trip_id: int):
     return templates.TemplateResponse(request, "trip_detail.html", _ctx(
         page="trips", vehicle=vehicle, trip=trip,
         prev_trip_id=adjacent["prev_id"], next_trip_id=adjacent["next_id"],
+        back_link=_back_link(back), **_trip_place_lines(trip),
     ))
 
 
+def _trip_place_lines(trip: dict) -> dict:
+    """What partials/trip_place_lines.html needs: a line for each end with a GPS fix, named or not (none
+    without any fix), and whether to credit OpenStreetMap."""
+    address_credit = db_reader.trip_places([trip])
+    place_ends = [{"end": end, "label": trip[f"{end}_place"], "charging": trip[f"{end}_place_charging"],
+                   "fix": db_reader.has_gps_fix(trip.get(f"{end}_lat"), trip.get(f"{end}_lon"))}
+                  for end in ("start", "end")]
+    return {"place_ends": place_ends if any(p["fix"] for p in place_ends) else [], "address_credit": address_credit}
+
+
+@app.post("/api/trips/{trip_id}/places", response_class=HTMLResponse)
+async def trip_look_up_places(request: Request, trip_id: int):
+    """🧭 in the Trip summary: the trip's ends without an address are looked up now, whatever the switch in
+    Address lookup says and however old the trip; then its lines are drawn again, saying why when an address
+    did not come."""
+    import asyncio
+    trip = db_reader.get_trip_detail(trip_id)
+    if not trip:
+        return HTMLResponse("", status_code=404)
+    points = [(trip.get(f"{end}_lat"), trip.get(f"{end}_lon")) for end in ("start", "end")]
+    lookup = await asyncio.get_event_loop().run_in_executor(None, place_lookup.look_up_now, points)
+    return templates.TemplateResponse(request, "partials/trip_place_lines.html",
+                                      _ctx(trip=trip, lookup=lookup, **_trip_place_lines(trip)))
+
+
 @app.get("/trips/{trip_id}/similar", response_class=HTMLResponse)
-def trip_similar(request: Request, trip_id: int):
+def trip_similar(request: Request, trip_id: int, back: str = ""):
     """🔎 'Compare similar trips' — every OTHER trip on the same route (same start/end
     corner of the map AND a validated GPS-overlap of the actual path, not just nearby
     endpoints — see db_reader.get_similar_trips), so temperature/traffic/efficiency can be
@@ -885,6 +1329,7 @@ def trip_similar(request: Request, trip_id: int):
     similar = db_reader.get_similar_trips(trip_id)
     return templates.TemplateResponse(request, "trip_similar.html", _ctx(
         page="trips", vehicle=vehicle, trip=trip, similar=similar, fmt_dur=_fmt_dur,
+        back_link=_back_link(back),
     ))
 
 
@@ -1006,25 +1451,6 @@ async def set_trip_note(request: Request, trip_id: int):
     return HTMLResponse("✓ " + i18n.get_t(db_reader.get_language())("note_saved"))
 
 
-@app.post("/api/trips/{trip_id}/auto-note", response_class=HTMLResponse)
-async def trip_generate_auto_note(request: Request, trip_id: int):
-    """🧭 manual 'Generate' button: builds the start/end address+time+temperature summary
-    and writes it straight into the trip's note field, replacing whatever was there (the UI
-    confirms with the user first when there was something to lose — trip_detail.html's
-    conditional hx-confirm). Reverse-geocoding is a live network call (Nominatim's usage
-    policy forbids bulk/automated lookups), so this only ever runs on a click for THIS one
-    trip — never a background sweep. Swaps in just the textarea, so the Salva button below
-    still submits the fresh text normally."""
-    import asyncio
-    provider = db_reader.get_setting("geocoder_provider", "")
-    key = db_reader.get_secret("geocoder_key", "") or None
-    note = await asyncio.get_event_loop().run_in_executor(
-        None, db_reader.generate_trip_auto_note, trip_id, provider, key)
-    t = i18n.get_t(db_reader.get_language())
-    return templates.TemplateResponse(request, "partials/trip_note_textarea.html",
-                                      {"trip": {"id": trip_id, "note": note}, "t": t})
-
-
 @app.delete("/api/charges/{charge_id}")
 async def delete_charge(request: Request, charge_id: int):
     """Permanently delete one charge session (HTMX, confirmed in the UI). Reloads the charges list,
@@ -1035,69 +1461,88 @@ async def delete_charge(request: Request, charge_id: int):
 
 
 @app.get("/api/charges/merge-preview", response_class=HTMLResponse)
-async def charges_merge_preview(request: Request, a: int, b: int):
+async def charges_merge_preview(request: Request, a: int, b: int, station: str = "", calendar: int = 0,
+                                year: int = 0, month: int = 0, day: int = 0, to_day: int = 0):
     """The single charge the merge WOULD produce — figures plus the pause it swallows — so the
-    confirm step shows what changes, not just that something will."""
+    confirm step shows what changes, not just that something will. The drawer's days travel on to
+    the confirm button, so the redraw after the merge keeps them open."""
     g = db_reader.preview_merge_charges(a, b)
     if not g:
         return HTMLResponse("")
     return templates.TemplateResponse(request, "partials/charge_merge_preview.html",
-                                      _ctx(g=g, a=a, b=b))
+                                      _ctx(g=g, a=a, b=b, station=station, calendar_context=bool(calendar),
+                                           drawer_q=_drawer_query(year, month, day, to_day)))
+
+
+def _retarget_charges_calendar(request: Request, charge_id: int, station: str,
+                               year: int = 0, month: int = 0, day: int = 0, to_day: int = 0):
+    """After a merge/unmerge, redraw the month grid + day drawer in place instead of reloading the
+    whole page — the reload used to drop the day/scroll the owner had open in Charges (they'd land
+    back at the top and have to find their place again). The drawer that offered the button says
+    which days it had open (`year`/`month`/`day`/`to_day`), and they open again while the charge
+    falls among them, so a range stays a range. A merged charge begins where its first piece began,
+    which may be the evening before, out of those days: then, and without them, the day the charge
+    falls on opens, in its own month, so it is on show. `None` when the charge can't be dated (should
+    not happen for a row that was just written) or the caller wasn't in the calendar view to begin
+    with (search results don't carry a #charges-calendar-month to redraw)."""
+    d = db_reader.get_charge_local_date(charge_id)
+    if not d:
+        return None
+    if (year, month) != (d.year, d.month) or not min(day, to_day or day) <= d.day <= max(day, to_day or day):
+        year, month, day, to_day = d.year, d.month, d.day, 0
+    resp = _render_charges_calendar(request, year, month, station, day, to_day)
+    resp.headers["HX-Retarget"] = "#charges-calendar-month"
+    resp.headers["HX-Reswap"] = "outerHTML"
+    resp.headers["HX-Trigger-After-Settle"] = json.dumps({"chargeOpen": charge_id})   # its row, opened (charges.html)
+    return resp
 
 
 @app.post("/api/charges/merge", response_class=HTMLResponse)
-async def charges_merge(request: Request, a: int, b: int):
+async def charges_merge(request: Request, a: int, b: int, station: str = "", calendar: int = 0,
+                        year: int = 0, month: int = 0, day: int = 0, to_day: int = 0):
     """Join two charge rows the car split when it declared the cable gone on a pause. The earlier
     becomes the parent. Reversible. Re-validates every guard here — the page only offers the
     button, it does not grant the permission."""
     res = db_reader.merge_charges(a, b)
     if res.get("ok"):
-        return Response(status_code=200, headers={"HX-Refresh": "true"})
+        resp = calendar and _retarget_charges_calendar(request, res["parent_id"], station, year, month, day, to_day)
+        return resp or Response(status_code=200, headers={"HX-Refresh": "true"})
     t = i18n.get_t(db_reader.get_language())
     return HTMLResponse(f'<div style="color:#f87171;font-size:13px;padding:6px 0">⚠️ {t("charge_merge_failed")}</div>')
 
 
 @app.post("/api/charges/unmerge", response_class=HTMLResponse)
-async def charges_unmerge(request: Request, parent: int):
+async def charges_unmerge(request: Request, parent: int, station: str = "", calendar: int = 0,
+                          year: int = 0, month: int = 0, day: int = 0, to_day: int = 0):
     """Split a merged charge back into the rows the car reported (reversible — nothing was lost)."""
     db_reader.unmerge_charges(parent)
-    return Response(status_code=200, headers={"HX-Refresh": "true"})
+    resp = calendar and _retarget_charges_calendar(request, parent, station, year, month, day, to_day)
+    return resp or Response(status_code=200, headers={"HX-Refresh": "true"})
 
 
 @app.post("/api/charges/{charge_id}/note", response_class=HTMLResponse)
 async def set_charge_note(request: Request, charge_id: int):
     """#107: save the charge's optional user note (station location, shade, reliability, weather…).
-    Returns a small 'saved' confirmation that HTMX drops next to the button."""
+    Returns a small 'saved' confirmation that HTMX drops next to the button, carrying the note as
+    stored, which the page writes into the note's line."""
+    from html import escape
     form = await request.form()
-    db_reader.save_charge_note(charge_id, form.get("note") or "")
-    return HTMLResponse("✓ " + i18n.get_t(db_reader.get_language())("note_saved"))
-
-
-@app.post("/api/charges/{charge_id}/auto-note", response_class=HTMLResponse)
-async def charge_generate_auto_note(request: Request, charge_id: int):
-    """🧭 manual 'Generate' button: builds the station-address + start/end time+temperature
-    summary and writes it straight into the charge's note field, replacing whatever was
-    there (the UI confirms with the user first when there was something to lose —
-    charge_card.html's conditional hx-confirm). Both the station lookup and the
-    reverse-geocoding a HOME charge skips are live network calls, so this only ever runs
-    on a click for THIS one charge — never a background sweep. Swaps in just the
-    textarea, so the Salva button below still submits the fresh text normally."""
-    import asyncio
-    provider = db_reader.get_setting("geocoder_provider", "")
-    key = db_reader.get_secret("geocoder_key", "") or None
-    note = await asyncio.get_event_loop().run_in_executor(
-        None, db_reader.generate_charge_auto_note, charge_id, provider, key)
-    t = i18n.get_t(db_reader.get_language())
-    return templates.TemplateResponse(request, "partials/charge_note_textarea.html",
-                                      {"c": {"id": charge_id, "note": note}, "t": t})
+    saved = db_reader.save_charge_note(charge_id, form.get("note") or "")
+    return HTMLResponse(f'<span data-saved-note="{escape(saved)}">✓ '
+                        + i18n.get_t(db_reader.get_language())("note_saved") + "</span>")
 
 
 @app.get("/charges", response_class=HTMLResponse)
-async def charges_page(request: Request, highlight: int = 0, station: str = ""):
+async def charges_page(request: Request, highlight: int = 0, station: str = "", back: str = "", month: str = ""):
     vehicle, _ = db_reader.get_vehicle()
+    place_lookup.maybe_sweep()      # a charge that just ended gets its address without waiting for the timer
+    # Read before the history: a session that closes while the page is drawn then still reads as open, and
+    # the next poll of the live panel reloads the page; read after it, the history would stay stale for good.
+    session = db_reader.open_charge()
     stats   = db_reader.get_charge_stats()
     prices  = db_reader.get_charge_prices()
     status  = db_reader.get_latest_status()
+    live    = await run_in_threadpool(_charging_chart)   # it may read Home Assistant: not on the event loop
     total   = stats.get("session_count") or 0
     station_info = None
     if station:
@@ -1105,19 +1550,18 @@ async def charges_page(request: Request, highlight: int = 0, station: str = ""):
         # top_n cap, same as search_charges(station=...) below.
         stations = db_reader.get_charging_stations(top_n=None)
         station_info = next((s for s in stations if s["key"] == station), None)
-    # The calendar's Month view opens on today — or, following a ?highlight=<id> link (e.g. a
+    # The calendar's Month view opens on ?month= or today — or, following a ?highlight=<id> link (e.g. a
     # map popup), on whichever month that ONE charge actually falls on, so it isn't invisible.
-    today = db_reader.today_local()
-    cal_year, cal_month, cal_open_day = today.year, today.month, 0
+    (cal_year, cal_month), cal_open_day = _page_month(month), 0
     if highlight:
         hl_date = db_reader.get_charge_local_date(highlight)
         if hl_date:
             cal_year, cal_month, cal_open_day = hl_date.year, hl_date.month, hl_date.day
     return templates.TemplateResponse(request, "charges.html", _ctx(
         page="charges", vehicle=vehicle,
-        stats=stats, total=total, highlight=highlight,
+        stats=stats, total=total, highlight=highlight, back_link=_back_link(back),
         charge_types=db_reader.charge_types_localised(), prices=prices,
-        status=status, ac_dc=db_reader.get_ac_dc_stats(),
+        status=status, live=live, session=session, ac_dc=db_reader.get_ac_dc_stats(),
         unconfirmed=db_reader.unconfirmed_charges_count(),
         unconfirmed_id=db_reader.newest_unconfirmed_charge_id(),   # the banner links to it
         station=station, station_info=station_info,
@@ -1131,7 +1575,7 @@ async def charges_page(request: Request, highlight: int = 0, station: str = ""):
     ))
 
 
-def _charges_calendar_ctx(year: int, month: int, station: str, open_day: int = 0) -> dict:
+def _charges_calendar_ctx(year: int, month: int, station: str, open_day: int = 0, open_to: int = 0) -> dict:
     """The Ricariche calendar's context, WITHOUT a Response around it.
 
     Split out so the Charges page can draw the grid itself on first paint instead of shipping an
@@ -1172,10 +1616,43 @@ def _charges_calendar_ctx(year: int, month: int, station: str, open_day: int = 0
         # it stayed broken across reloads. (#240, found by Silvio pressing Refresh.)
         "currency": db_reader.get_currency(),
     }
-    if open_day and open_day in cal["days"]:
-        ctx["open_day"] = open_day     # so the grid can ring the day the drawer is showing
-        ctx["open_day_charges"] = db_reader.get_charges_calendar_day(year, month, open_day, station=station or None)
-        ctx["open_day_label"] = i18n.fmt_day_month_year(lang, date(year, month, open_day))
+    if open_day:
+        open_day, open_to = _day_span(year, month, open_day, open_to)
+    if open_day and any(d in cal["days"] for d in range(open_day, open_to + 1)):
+        ctx["open_day"] = open_day     # so the grid can ring the days the drawer is showing
+        ctx["open_to"] = open_to
+        # The drawer's own endpoint builds the same context, so both paths print the same heading.
+        ctx["open_drawer"] = _charges_drawer_ctx(lang, year, month, open_day, open_to, station)
+    return ctx
+
+
+def _drawer_query(year: int, month: int, day: int, to_day: int = 0) -> str:
+    """The drawer's days as query parameters a merge or split carries back, so the redraw keeps the
+    same days open; '' outside a drawer (search results reload the page instead)."""
+    if not (year and month and day):
+        return ""
+    return f"&year={year}&month={month}&day={day}" + (f"&to_day={to_day}" if to_day else "")
+
+
+def _charges_drawer_ctx(lang: str, year: int, month: int, day: int, to_day: int = 0, station: str = "") -> dict:
+    """What the day drawer prints for `day`, or for the days from `day` to `to_day`: built here for both
+    routes that render the drawer, so they cannot differ. `drawer_q` is the drawer's own span, which
+    its cards hand to a merge or split so the redraw keeps the same days open."""
+    from datetime import date
+    from itertools import groupby
+    first, last = _day_span(year, month, day, to_day)
+    charges = db_reader.get_charges_calendar_day(year, month, first, station=station or None, to_day=last)
+    ctx = {"charges": charges, "day_totals": db_reader.charges_totals(charges),
+           "drawer_q": _drawer_query(year, month, first, last if last != first else 0)}
+    if first == last:
+        ctx.update(day=first, day_label=i18n.fmt_day_month_year(lang, date(year, month, first)))
+        return ctx
+    # One heading over the range, then each day with charges under its own, newest first like the cards.
+    ctx["range_label"] = i18n.fmt_day_range(lang, date(year, month, first), date(year, month, last))
+    ctx["range_days"] = [
+        {"day": d, "label": i18n.fmt_day_month_year(lang, date(year, month, d)),
+         "charges": cs, "totals": db_reader.charges_totals(cs)}
+        for d, cs in ((d, list(g)) for d, g in groupby(charges, key=lambda c: c["_dt"].day))]
     return ctx
 
 
@@ -1185,10 +1662,10 @@ def _charges_calendar_html(year: int, month: int, station: str, open_day: int = 
         _charges_calendar_ctx(year, month, station, open_day))
 
 
-def _render_charges_calendar(request: Request, year: int, month: int, station: str, open_day: int = 0):
+def _render_charges_calendar(request: Request, year: int, month: int, station: str, open_day: int = 0, open_to: int = 0):
     """Shared by /api/charges/calendar and the search endpoint's empty-filters fallback."""
     return templates.TemplateResponse(request, "partials/charges_calendar_month.html",
-                                      _charges_calendar_ctx(year, month, station, open_day))
+                                      _charges_calendar_ctx(year, month, station, open_day, open_to))
 
 
 def _fuel_calendar_ctx(year: int, month: int, open_day: int = 0) -> dict:
@@ -1259,23 +1736,26 @@ async def fuel_calendar_day(request: Request, year: int, month: int, day: int):
 
 
 @app.get("/api/charges/calendar", response_class=HTMLResponse)
-async def charges_calendar(request: Request, year: int = 0, month: int = 0, station: str = "", open_day: int = 0):
+async def charges_calendar(request: Request, year: int = 0, month: int = 0, station: str = "",
+                           open_day: Annotated[int, Query(ge=0, le=31)] = 0,
+                           open_to: Annotated[int, Query(ge=0, le=31)] = 0):
     """Ricariche 'calendar' Month view (HTMX partial, day totals only) — the day drawer
     loads a day's actual charge cards lazily on click (see charges_calendar_day below),
     so a month never ships more markup than the handful of days the user opens."""
-    return _render_charges_calendar(request, year, month, station, open_day)
+    return _render_charges_calendar(request, year, month, station, open_day, open_to)
 
 
 @app.get("/api/charges/calendar/day", response_class=HTMLResponse)
-async def charges_calendar_day(request: Request, year: int, month: int, day: int, station: str = ""):
-    """One day's charge cards for the Month view's day drawer."""
+async def charges_calendar_day(request: Request, year: int, month: int, day: Annotated[int, Query(ge=1, le=31)],
+                               to_day: Annotated[int, Query(ge=0, le=31)] = 0, station: str = ""):
+    """One day's charge rows for the Month view's day drawer, with that day's own totals.
+    `to_day` opens the days from `day` to it instead: totals over the range, then each day's own."""
     lang = db_reader.get_language()
-    charges = db_reader.get_charges_calendar_day(year, month, day, station=station or None)
-    from datetime import date
     return templates.TemplateResponse(request, "partials/charges_calendar_day.html", {
         "t": i18n.get_t(lang), "charge_types": db_reader.charge_types_localised(), "fmt_dur": _fmt_dur,
-        "charges": charges, "day_label": i18n.fmt_day_month_year(lang, date(year, month, day)),
+        **_charges_drawer_ctx(lang, year, month, day, to_day, station),
         "currency": db_reader.get_currency(),   # the price box is labelled in the reader's money
+        "station": station,   # so a merge/unmerge from here keeps any active station filter
     })
 
 
@@ -1314,7 +1794,7 @@ async def charges_search(request: Request, q: str = "", type: str = "",
         "charges": charges, "station": station,
         # disc #263 — the period's own total, so a custom billing cycle (his is 22nd→21st) can be
         # read off the filtered results instead of added up by hand.
-        "search_total": db_reader.search_results_total_charges(charges),
+        "search_total": db_reader.charges_totals(charges),
         # charge_card.html labels its price box in the reader's own money, and this partial is
         # rendered on its own — it inherits nothing from _ctx. Three routes were missing it.
         "currency": db_reader.get_currency(),
@@ -1336,14 +1816,15 @@ async def statistics(request: Request):
     totals["reev_spend"] = db_reader.reev_actual_spend() if _reev else None
     # …and what the GENERATOR itself drinks while it runs (@michapr, beta #26). Gated on the DATA,
     # not just on the markup: `wallbox_enabled` taught us that hiding a card while the figure is
-    # still computed is not a gate at all. REEV stays capability-gated AND beta-only.
-    totals["reev_fuel"] = (db_reader.reev_fuel_summary()
-                           if (_reev and research.research_enabled()) else None)
+    # still computed is not a gate at all. Capability only since 4.7.0 — the litres were calibrated
+    # against a drive whose figure the owner can read in the official app (@ebagnoli, 29/09/2026:
+    # 77 km / 0.3 kWh / 4.9 L, and the cloud's own record says the same three), so the BetaTester
+    # build has no job left here. A plain electric car still reaches none of it.
+    totals["reev_fuel"] = db_reader.reev_fuel_summary() if _reev else None
     # …and the one number that answers "plug in here, or just burn petrol?" (@ebagnoli, beta #13).
-    # Same gate as the card above — REEV capability AND the BetaTester build — and gated on the
-    # DATA, not the markup: computing it for a car that must not see it is not a gate.
-    totals["reev_breakeven"] = (db_reader.reev_breakeven_kwh_price()
-                                if (_reev and research.research_enabled()) else None)
+    # Same gate as the card above — the car's capability — and gated on the DATA, not the markup:
+    # computing it for a car that must not see it is not a gate.
+    totals["reev_breakeven"] = db_reader.reev_breakeven_kwh_price() if _reev else None
     # …and what all of it COST: every euro spent over every kilometre driven (@michapr's card, on
     # Silvio's basis — a cost is the whole cost, not the driving's share of it). The litres burned
     # are passed only so a car with no tank never reads the fuel table.
@@ -1360,7 +1841,7 @@ async def statistics(request: Request):
     # trips from the elevation enrichment). The petrol half follows the same REEV+research gate as
     # every other fuel figure — computed for nobody else, not merely hidden.
     efftemp = db_reader.get_efficiency_vs_temp(
-        include_fuel=(_reev and research.research_enabled()))
+        include_fuel=_reev)
     return templates.TemplateResponse(request, "statistics.html", _ctx(
         page="statistics", vehicle=vehicle,
         grouped=grouped, totals=totals, efftemp=efftemp,
@@ -1382,13 +1863,29 @@ async def report(request: Request, month: str | None = None):
 
 @app.get("/battery", response_class=HTMLResponse)
 async def battery_page(request: Request):
+    """The shell. Both figures are long sums (3.526 s together on an add-on) and each section
+    fetches its own — see partials/battery_health.html and partials/battery_vampire.html."""
     vehicle, _ = db_reader.get_vehicle()
-    health = db_reader.get_battery_health()
-    vampire = db_reader.get_vampire_drain(
-        min_drop_pct=float(db_reader.get_setting("vampire_min_drop_pct", "0.2") or 0.2),
-        min_hours=float(db_reader.get_setting("vampire_min_hours", "1") or 1))
     return templates.TemplateResponse(request, "battery.html", _ctx(
-        page="battery", vehicle=vehicle, health=health, vampire=vampire,
+        page="battery", vehicle=vehicle,
+    ))
+
+
+@app.get("/api/battery-health", response_class=HTMLResponse)
+async def battery_health_section(request: Request):
+    """State of health: integrates the power samples of every qualifying charge."""
+    return templates.TemplateResponse(request, "partials/battery_health.html", _ctx(
+        health=db_reader.get_battery_health(),
+    ))
+
+
+@app.get("/api/battery-vampire", response_class=HTMLResponse)
+async def battery_vampire_section(request: Request):
+    """Vampire drain: ninety days of position rows grouped into parks."""
+    return templates.TemplateResponse(request, "partials/battery_vampire.html", _ctx(
+        vampire=db_reader.get_vampire_drain(
+            min_drop_pct=float(db_reader.get_setting("vampire_min_drop_pct", "0.2") or 0.2),
+            min_hours=float(db_reader.get_setting("vampire_min_hours", "1") or 1)),
     ))
 
 
@@ -1414,12 +1911,13 @@ async def reev_page(request: Request):
     behaviour is validated against real REEV data. Live signal fetch (no pipeline storage)."""
     import asyncio
     is_research = research.research_enabled()
-    # REEV is capability-gated (is_reev) AND beta-only (research): a BEV owner must NEVER reach any REEV
-    # surface, on any build, and the official build exposes none of it. Redirect anyone who isn't a REEV
-    # car on a research build — the sole exception is the ?demo layout preview (research-only, no car).
+    # REEV is capability-gated (is_reev): a BEV owner must NEVER reach any REEV surface, on any build.
+    # The BetaTester build is no longer part of THIS gate — the fuel figures were calibrated against
+    # the owner's own app on 29/09/2026 — but it still gates the research TOOLS inside the page and
+    # the ?demo layout preview, which invents signals for a car that has none.
     is_reev_car = db_reader.is_reev_car()
     demo = bool(is_research and request.query_params.get("demo"))
-    if not (is_reev_car and is_research) and not demo:
+    if not is_reev_car and not demo:
         return RedirectResponse(request.headers.get("x-ingress-path", "") + "/")
     vehicle, _ = db_reader.get_vehicle()
     # Research-only preview: /reev?demo=1 renders the dashboard with sample REEV values (from a real
@@ -1472,12 +1970,13 @@ async def reev_page(request: Request):
                       "driving_pct": 82.1, "ac_pct": 12.6, "other_pct": 5.3}
     elif reev["has_fuel"]:
         import time as _t
-        if not _energy_cache["data"] or _t.time() - _energy_cache["ts"] >= 6 * 3600:
+        _slot = _car_slot(_energy_cache)     # per-auto: la pagina REEV condivide la cache delle Statistiche
+        if not _slot["data"] or _t.time() - _slot["ts"] >= 6 * 3600:
             eb = await asyncio.get_event_loop().run_in_executor(None, command_client.get_energy_breakdown)
             if eb:
-                _energy_cache["data"] = eb
-                _energy_cache["ts"] = _t.time()
-        energy_abs = _energy_cache["data"]
+                _slot["data"] = eb
+                _slot["ts"] = _t.time()
+        energy_abs = _slot["data"]
     return templates.TemplateResponse(request, "reev.html", _ctx(
         page="reev", vehicle=vehicle, reev=reev, consumption=consumption, signals_ok=bool(signals),
         energy_abs=energy_abs,                        # absolute electric kWh (7-day getEC split)
@@ -1547,23 +2046,65 @@ _RESEARCH_FUEL_FIELDS = (
 )
 
 
+_research_export_lock = threading.Lock()
+
+
 @app.get("/api/research/export")
 async def research_export():
+    if not research.research_enabled():
+        return Response(status_code=404)
+    return await run_in_threadpool(_research_export_worker)
+
+
+def _research_export_worker():
+    # The worker owns the lock until it REALLY finishes, including after a client disconnect.
+    # Repeated clicks/tabs must not queue several expensive cloud probes and archives.
+    if not _research_export_lock.acquire(blocking=False):
+        return Response(status_code=409, headers={"Retry-After": "5"})
+    started = time.perf_counter()
+    try:
+        # The UI can now switch cars while this worker runs. Keep every scoped read (and
+        # the command client's target) on the original car, without changing the sidebar.
+        previous = getattr(db_reader._read_vehicle_scope, "vehicle_id", None)
+        db_reader._read_vehicle_scope.vehicle_id = (db_reader._current_vehicle_id(),)
+        try:
+            return _build_research_export()
+        finally:
+            db_reader._read_vehicle_scope.vehicle_id = previous
+    finally:
+        log.info("Research export total_seconds=%.3f", time.perf_counter() - started)
+        _research_export_lock.release()
+
+
+def _build_research_export():
     """BetaTester only: build an ENCRYPTED bundle (redacted raw-signal history + logbook + trips)
     for the tester to attach to a beta issue. GPS is stripped; the bundle is sealed to our public
     key so only the maintainer's private key can open it."""
     if not research.research_enabled():
         return Response(status_code=404)
     import csv, io, json, time, zipfile
+    timings = {}
+    checkpoint = time.perf_counter()
+
+    def mark(stage):
+        nonlocal checkpoint
+        now = time.perf_counter()
+        timings[stage] = round(now - checkpoint, 3)
+        log.info("Research export stage=%s seconds=%.3f", stage, now - checkpoint)
+        checkpoint = now
+
     rows = research.redact_signal_rows(db_reader.get_raw_signal_rows())
     logbook = db_reader.get_logbook(limit=1000000)
+    mark("signals_and_logbook")
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         s = io.StringIO(); w = csv.writer(s)
         w.writerow(["ts_ms", "sig_key", "value"]); w.writerows(rows)
         z.writestr("raw_signals_log.csv", s.getvalue())
         s = io.StringIO(); w = csv.writer(s)
-        w.writerow(["ts_ms", "note"]); w.writerows([(n["ts"], n["note"]) for n in logbook])
+        # The note is free text a tester types, and this file is the one they send US: same
+        # neutralisation as the exports, for the same reason (see _csv_safe).
+        w.writerow(["ts_ms", "note"]); w.writerows([(n["ts"], _csv_safe(n["note"])) for n in logbook])
         z.writestr("logbook.csv", s.getvalue())
         # The trips themselves — the one thing this bundle could never answer. Raw signals say what
         # the car sent; they do not say what Mate MADE of it, and every open range-extender question
@@ -1580,6 +2121,7 @@ async def research_export():
         w.writeheader()
         w.writerows(trips)
         z.writestr("trips.csv", s.getvalue())
+        mark("signal_archive_and_trips")
         # The refuels behind the fuel numbers on those trips — beta #36. The cost card recomputes the
         # petrol cost from these rows, and the bundle used to leave them out, so a card reading €0 of
         # fuel could not be told apart from a card that simply never saw a refuel. Oldest first.
@@ -1588,6 +2130,19 @@ async def research_export():
         w.writeheader()
         w.writerows(fuels)
         z.writestr("fuel_purchases.csv", s.getvalue())
+        # The cloud's OWN per-trip records, as the history worker staged them. Since 4.5.3 every
+        # install stages these, range-extender accounts included, and each row carries
+        # `driveReevOil` — the fuel that drive burned according to the car's cloud. The bundle
+        # carried the AGGREGATE probes (getEC, the weekly rank, mileage/energy/detail) and never
+        # these, so the field sat in the tester's database and could not be read: whether a REEV
+        # populates it, and in litres or millilitres, is still unmeasured. Columns and order come
+        # from db_reader.RESEARCH_CLOUD_TRIP_FIELDS — one list, so a column cannot drift out.
+        cloud_trips = db_reader.research_cloud_trip_records()
+        s = io.StringIO()
+        w = csv.DictWriter(s, fieldnames=db_reader.RESEARCH_CLOUD_TRIP_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(cloud_trips)
+        z.writestr("cloud_trip_records.csv", s.getvalue())
         # What each PAGE made of those same trips — beta #35/#36. Three pages print three kWh/100km
         # for one month (Statistics AVERAGES the per-trip ratios; Trips divides getEC by its own km;
         # the Report divides getEC by ALL km), and the cost card can drop the fuel. The raw trips are
@@ -1624,6 +2179,7 @@ async def research_export():
         except Exception:  # noqa: BLE001
             _pages["cost_card"] = None
         z.writestr("page_stats.json", json.dumps(_pages, indent=2, default=str))
+        mark("fuel_and_page_statistics")
         # Cloud consumption probe: UNMAPPED raw responses (getEC 24h/7d + 6-week rank), so a REEV's
         # fuel/L-100km field surfaces even though the BEV mapping ignores it. Best-effort: a cloud
         # hiccup must not fail the export.
@@ -1637,6 +2193,7 @@ async def research_export():
             cp = json.dumps(cloud, indent=2, ensure_ascii=False)
             cp = _re.sub(r"LFZ[A-Z0-9]{12,}", "<VIN>", cp)  # defensive: responses carry no VIN, but scrub anyway
             z.writestr("cloud_probes.json", cp)
+        mark("cloud_probes")
         # The charges, and what the behaviour settings are set to — both lifted from the
         # diagnostics bundle, which already writes them redacted (no coordinates, no location name,
         # no free text) and has a test holding that promise.
@@ -1680,6 +2237,7 @@ async def research_export():
             z.writestr("diagnostics.txt", diagnostics.build_bundle(MATE_VERSION, signals=_fresh))
         except Exception:  # noqa: BLE001
             pass
+        mark("diagnostics")
         try:
             _charge_count = len(db_reader.get_charges(limit=1_000_000))
         except Exception:  # noqa: BLE001
@@ -1699,8 +2257,10 @@ async def research_export():
             "trip_fields": list(_RESEARCH_TRIP_FIELDS),
             "fuel_purchases": len(fuels),
             "fuel_fields": list(_RESEARCH_FUEL_FIELDS),
+            "stage_seconds": timings,
         }, indent=2))
     encrypted = research.encrypt_bundle(buf.getvalue())
+    mark("archive_and_encryption")
     fname = f"mate-beta-bundle-{int(time.time())}.matebeta"
     return Response(encrypted, media_type="application/octet-stream",
                     headers={"Content-Disposition": f'attachment; filename="{fname}"'})
@@ -1722,9 +2282,11 @@ async def research_consent_accept(request: Request):
 
 
 def _fuel_blocked() -> bool:
-    """REEV+research gate, mirroring reev_page: a BEV / non-research visitor must never reach fuel data,
-    on any build. Applied to the page AND the write endpoints."""
-    return not (db_reader.is_reev_car() and research.research_enabled())
+    """Capability gate, mirroring reev_page: a car with no tank must never reach fuel data, on any
+    build. Applied to the page AND the nine write endpoints — a gate on the page alone would leave
+    the POSTs open. The BetaTester build was the second half of this test until 4.7.0; it came off
+    when the litres were calibrated against a drive the owner can read in the official app."""
+    return not db_reader.is_reev_car()
 
 
 def _fuel_local_to_utc(ts_str: str) -> str:
@@ -1741,7 +2303,7 @@ def _fuel_local_to_utc(ts_str: str) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
 
-def _fuel_ctx(request: Request):
+def _fuel_ctx(request: Request, month: str = ""):
     """Shared context for the Rifornimenti page + its HTMX partials: the refuel log and the live tank
     state (level from the car's fuel %, blended €/L from the fuel WAC)."""
     from datetime import datetime, timezone
@@ -1772,19 +2334,19 @@ def _fuel_ctx(request: Request):
             "eur_per_l": round(blend, 3) if blend else None,
             "value": round(liters * blend, 2) if (liters and blend) else None}
     now_local = datetime.now(timezone.utc).astimezone(db_reader._local_tz()).strftime("%Y-%m-%dT%H:%M")
-    today = db_reader.today_local()
+    cal_year, cal_month = _page_month(month)
     return _ctx(page="fuel", vehicle=vehicle, purchases=purchases, tank=tank, now_local=now_local,
-                detected=detected,
-                # drawn, not fetched — see _charges_calendar_ctx (#240). The wrapper still listens
-                # for `fuelChanged`, which is what refreshes it after an entry is added or deleted.
-                calendar_html=_fuel_calendar_html(today.year, today.month))
+                detected=detected, cal_year=cal_year, cal_month=cal_month,
+                # drawn, not fetched — see _charges_calendar_ctx (#240). The page still redraws
+                # it on `fuelChanged`, which is what refreshes it after an entry is added or deleted.
+                calendar_html=_fuel_calendar_html(cal_year, cal_month))
 
 
 @app.get("/fuel", response_class=HTMLResponse)
-async def fuel_page(request: Request):
+async def fuel_page(request: Request, month: str = ""):
     if _fuel_blocked():
         return RedirectResponse(request.headers.get("x-ingress-path", "") + "/")
-    return templates.TemplateResponse(request, "fuel.html", _fuel_ctx(request))
+    return templates.TemplateResponse(request, "fuel.html", _fuel_ctx(request, month))
 
 
 @app.post("/api/fuel/add", response_class=HTMLResponse)
@@ -1859,8 +2421,8 @@ async def fuel_detected_dismiss(request: Request):
 async def fuel_generate_auto_note(request: Request, purchase_id: int):
     """🧭 on a refuel: writes where the car was standing into that refuel's note, so the pump
     identifies itself instead of being typed in — asked for by @gm27271 (beta discussion #14).
-    Same shape as the charge button above: a live reverse-geocode, so it only ever runs on a click
-    for THIS one refuel, never as a background sweep. Swaps the whole list back because the note
+    A live reverse-geocode, so it only ever runs on a click for THIS one refuel, never as a
+    background sweep. Swaps the whole list back because the note
     is shown inline on the row rather than in an editable field of its own."""
     if _fuel_blocked():
         return RedirectResponse(request.headers.get("x-ingress-path", "") + "/", status_code=303)
@@ -2033,10 +2595,90 @@ async def map_page(request: Request):
         s["cost_fmt"] = _money(s["cost"]) if s["cost"] is not None else None
         for c in s["recent"]:
             c["cost_fmt"] = _money(c["cost"]) if c["cost"] is not None else None
+    # The car's marker, from the Overview's own builder (D#459). The Map draws routes, not today's
+    # trip under the car, so it keeps the route's key and drops its points: the poll then sends them
+    # only if that route changes.
+    car = _last_position(db_reader.get_latest_status(), i18n.get_t(db_reader.get_language()))
+    car["track"]["segments"] = None
     return templates.TemplateResponse(request, "map.html", _ctx(
         page="map", vehicle=vehicle, track=track, places=places, stations=stations,
-        stations_top_n=stations_top_n, trips_shown=trips_shown,
+        stations_top_n=stations_top_n, trips_shown=trips_shown, last_position=car,
     ))
+
+
+# The pages a "←" may lead back to, by the path of the address the page passed as `back`, and what the
+# link reads. Nothing else is taken, so the parameter cannot lead out of Mate.
+_BACK_PAGES = (
+    (re.compile(r"events"), "back_events"),
+    (re.compile(r"\."), "back_overview"),
+    (re.compile(r"trips/[0-9]+"), "back_to_trip"),
+    (re.compile(r"trips/[0-9]+/similar"), "back_similar"),
+    (re.compile(r"map"), "back_map"),
+    (re.compile(r"trips"), "back_trips"),
+)
+
+
+def _back_link(back: str) -> dict | None:
+    """Where the page's "←" leads when the page it was opened from passed its own address as `back`: that
+    address, under the page's label. None for an address that is not one of the pages above."""
+    path = re.split(r"[?#]", back, maxsplit=1)[0]
+    label = next((label for page, label in _BACK_PAGES if page.fullmatch(path)), None)
+    return {"href": back, "label": label} if label else None
+
+
+def _events_ctx(flt, request: Request, part: int = 0, version: str | None = None) -> dict:
+    """What events.html and its list partials render: the `part` of the list for `flt`, the
+    filter's state so the pills and fields show what the URL asked for, and the list's own URL,
+    without the part, for its links and for loading the next part."""
+    lang = db_reader.get_language()
+    query = urlencode([(k, v) for k, v in request.query_params.multi_items() if k not in ("part", "v")])
+    return {"flt": flt, "back": "events" + (f"?{query}" if query else ""), "query": query,
+            "part_query": f"{query}&" if query else "",
+            "ev": db_reader.get_events_grouped(flt, i18n.get_t(lang), lang, part=part, asked=version),
+            "groups": db_reader.EVENT_GROUPS, "group_icons": db_reader.EVENT_GROUP_ICONS,
+            "group_colors": db_reader.EVENT_GROUP_COLORS, "group_of": db_reader.EVENT_GROUP_OF,
+            "icons": db_reader.EVENT_ICONS, "ranges": db_reader.EVENT_RANGES,
+            "default_range": db_reader.EVENTS_DEFAULT_RANGE, "fmt_dur": _fmt_dur}
+
+
+@app.get("/events", response_class=HTMLResponse)
+async def events_page(request: Request, q: str = "", date_from: str = "", date_to: str = "", f: str = "",
+                      range: str = ""):
+    """What the car did, day by day — the list rendered on the server at once (#240), with the
+    filters read from the URL so a link or a reload shows the same list. `f` marks a submitted
+    form: an unchecked checkbox sends nothing, so without it unchecking every group would look
+    like opening the page with no filter."""
+    vehicle, _ = db_reader.get_vehicle()
+    flt = db_reader.EventFilter.from_query(q=q, group=request.query_params.getlist("group"),
+                                           kind=request.query_params.getlist("kind"),
+                                           date_from=date_from, date_to=date_to, f=f, range=range)
+    return templates.TemplateResponse(request, "events.html",
+                                      _ctx(page="events", vehicle=vehicle, **_events_ctx(flt, request)))
+
+
+@app.get("/api/events/search", response_class=HTMLResponse)
+async def events_search(request: Request, q: str = "", date_from: str = "", date_to: str = "",
+                        f: str = "", range: str = "", part: str = "", v: str = ""):
+    """The Events list for the filters (HTMX partial). The URL follows the filters, relative so it
+    holds under the Home Assistant ingress; an empty date is no filter, never a 422 (#175). A
+    `part` after the first is only its lines, appended to the list as it scrolls; the URL stays. A
+    part of a list that changed since its first (`v`) would not join it: the list comes again whole."""
+    flt = db_reader.EventFilter.from_query(q=q, group=request.query_params.getlist("group"),
+                                           kind=request.query_params.getlist("kind"),
+                                           date_from=date_from, date_to=date_to, f=f, range=range)
+    lang = db_reader.get_language()
+    asked = int(part) if part.isdigit() else 0
+    ctx = {"t": i18n.get_t(lang), **_events_ctx(flt, request, asked, v)}
+    if asked and ctx["ev"]["part"] == asked:
+        return templates.TemplateResponse(request, "partials/events_lines.html", ctx)
+    if asked:
+        response = templates.TemplateResponse(request, "partials/events_list.html", ctx)
+        response.headers.update({"HX-Retarget": "#events-list", "HX-Reswap": "innerHTML"})
+        return response
+    response = templates.TemplateResponse(request, "partials/events_list.html", ctx)
+    # Replaced, not pushed: Back would restore htmx's copy of the page and run its scripts a second time.
+    response.headers["HX-Replace-Url"] = ctx["back"]
+    return response
 
 
 # Comfort tiles to display: (comfort_state key, capability feature that gates it, i18n label, icon).
@@ -2053,11 +2695,10 @@ _COMFORT_ROWS = (
     ("steering_heat",        "steering_heat", "comfort_steering_heat",        "steering",  "heat"),  # last → mirrors stay paired on mobile
 )
 
-# Comfort rows controllable as a simple on/off toggle (steering/mirror — no level on the car).
+# Comfort rows controllable as a simple on/off toggle (mirrors — no level on the car).
 # skey -> (gating command feature, on-command key, off-command key). Both mirror tiles share the
-# single mirror command. Seats are handled separately (level slider).
+# single mirror command. Seats and the steering wheel are handled separately (level sliders).
 _COMFORT_TOGGLE = {
-    "steering_heat":     ("steering_heat_cmd", "steering_heat_on", "steering_heat_off"),
     "mirror_heat_left":  ("mirror_heat_cmd",   "mirror_heat_on",   "mirror_heat_off"),
     "mirror_heat_right": ("mirror_heat_cmd",   "mirror_heat_on",   "mirror_heat_off"),
 }
@@ -2088,6 +2729,11 @@ def _comfort_rows(vin, car_type=""):
             if capability_profile.is_shown(vin, f"seat_{func}_cmd", car_type=car_type):
                 row.update(control="slider", func=func,
                            position=("driver" if side == "driver" else "copilot"))
+        elif skey == "steering_heat":
+            # 1816 on a B10 from software 3.41.30: 0 off, 1 level I, 2 level II, 3 level II switched on remotely.
+            row.update(value=min(v, 2), remote=(v == 3))
+            if capability_profile.is_shown(vin, "steering_heat_cmd", car_type=car_type):
+                row.update(control="steering", cmd_on="steering_heat_on", cmd_off="steering_heat_off")
         elif skey in _COMFORT_TOGGLE:
             cfeat, cmd_on, cmd_off = _COMFORT_TOGGLE[skey]
             if capability_profile.is_shown(vin, cfeat, car_type=car_type):
@@ -2101,7 +2747,7 @@ def _comfort_rows(vin, car_type=""):
 # making them appear to "revert". After a web comfort command we merge the expected sensor values
 # so the refresh shows the action immediately; the next poll overwrites with the real values.
 _COMFORT_CMD_OPTIMISTIC = {
-    "steering_heat_on":  {"steering_heat": 2},
+    "steering_heat_on":  {"steering_heat": 3},   # what 1816 reads after a remote "on" (see _comfort_rows)
     "steering_heat_off": {"steering_heat": 0},
     "mirror_heat_on":    {"mirror_heat_left": 1, "mirror_heat_right": 1},
     "mirror_heat_off":   {"mirror_heat_left": 0, "mirror_heat_right": 0},
@@ -2155,7 +2801,8 @@ async def commands(request: Request):
     status = db_reader.get_latest_status()
     comfort = _comfort_rows(vehicle.get("vin") if vehicle else None, (vehicle or {}).get("car_type", ""))
     return templates.TemplateResponse(request, "commands.html", _ctx(
-        page="commands", vehicle=vehicle, status=status, comfort=comfort, **_wins_ctx(),
+        page="commands", vehicle=vehicle, vin=vehicle.get("vin") if vehicle else None,
+        status=status, comfort=comfort, **_wins_ctx(),
         ac_off_shown=capability_profile.command_shown(vehicle.get("vin") if vehicle else None, "climate_off"),
         is_t03=(vehicle.get("car_type") or "").upper() == "T03" if vehicle else False,
     ))
@@ -2194,13 +2841,14 @@ def _parse_vehicle_status(sig: dict, vin: str | None = None, cmd_pct: int | None
     return {
         # Wheel→signal mapping corrected from a TWO-B10 vs official-app cross-check (GitHub #32:
         # the UK reporter's car + Silvio's IT car, both showing 280 kPa at the rear-right):
-        # pressures map ascending 2646=FL/2653=FR/2660=RL/2667=RR (the leapmotor-api doc order was
-        # wrong); each pressure's paired state signal moves with it (FL=2655/FR=2648/RL=2662/RR=2641).
+        # pressures map ascending 2646=FL/2653=FR/2660=RL/2667=RR (the order older third-party docs gave was
+        # wrong). The alarm flags do NOT move with them: the old SDK, leapmotor-ha and ioBroker all
+        # pair them as 2641=FL/2648=FR/2655=RL/2662=RR; that check did not cover them (no alarm was on).
         "tyres": {
-            "fl": {"bar": bar("2646"), "low": i("2655") == 1},
+            "fl": {"bar": bar("2646"), "low": i("2641") == 1},
             "fr": {"bar": bar("2653"), "low": i("2648") == 1},
-            "rl": {"bar": bar("2660"), "low": i("2662") == 1},
-            "rr": {"bar": bar("2667"), "low": i("2641") == 1},
+            "rl": {"bar": bar("2660"), "low": i("2655") == 1},
+            "rr": {"bar": bar("2667"), "low": i("2662") == 1},
         },
         "doors": {
             "driver":     is_open("1277"), "passenger": is_open("1278"),
@@ -2214,11 +2862,12 @@ def _parse_vehicle_status(sig: dict, vin: str | None = None, cmd_pct: int | None
             # B10 (its sensor is dead) — shown only for windows the flag confirms open.
             "fl_pct": win_pct("1693", "3727"), "fr_pct": win_pct("1694", "3728"),
             "rl_pct": win_pct("1695", "1879"), "rr_pct": win_pct("1696", "1880"),
-            "sunshade": is_open("1724"),
+            "sunshade": is_open("1724"), "sunshade_pct": i("1724"),
         },
         "temps": {"battery": f("1182"), "cabin": f("1349")},  # no ambient-temp signal exists
         # Climate panel — signals validated on-car 2026-06-20: base mode 3713 (0 auto/1 cool/3 heat/
-        # 4 vent), fan level 1941 (acAirVolume 1-7; holds last level when off), recirculation 1943.
+        # 4 vent), fan level 1941 (acAirVolume, up to the car's top speed; holds last level when off),
+        # recirculation 1943.
         "climate": {
             "on": is_open("1938"),
             "mode": {0: "auto", 1: "cool", 3: "heat", 4: "vent"}.get(i("3713")),
@@ -2291,7 +2940,7 @@ async def nav_geocode(address: str = "", city: str = ""):
     return JSONResponse(res)
 
 
-@app.get("/api/nav/current-address", response_class=HTMLResponse)
+@app.get("/api/nav/current-address", response_class=PlainTextResponse)
 async def nav_current_address():
     import asyncio
     status = db_reader.get_latest_status() or {}
@@ -2305,7 +2954,9 @@ async def nav_current_address():
             None, geocode.reverse_geocode, lat, lon, provider, key)
     except Exception:  # noqa: BLE001
         addr = None
-    return HTMLResponse(addr or "—")
+    # The address is OpenStreetMap's (or another geocoder's) text, which anyone can edit: plain
+    # text, so the page puts it in as text and a direct visit to this URL renders nothing.
+    return PlainTextResponse(addr or "—")
 
 
 @app.post("/api/nav/send", response_class=HTMLResponse)
@@ -2415,6 +3066,31 @@ async def settings_page(request: Request):
                 "default_drive_mode": db_reader.get_setting("default_drive_mode", ""),
                 "default_one_pedal": db_reader.get_setting("default_one_pedal", ""),
                 "db_size_mb": round(db_reader.get_db_size_bytes() / 1048576, 1)}
+    from datetime import date
+    from cloud_import_policy import import_from, past_months, trips_enabled
+    settings["cloud_import_available"] = True
+    settings["cloud_import_trips"] = trips_enabled(db_reader._get())
+    # The earlier months on offer: September 2026 to last month (cloud_import_policy.FIRST_MONTH).
+    # Each says what it adds, on a line under the menu: the count does not fit inside it — at
+    # 1024 px the closed menu has 138 px and "Da settembre 2026 (6 mesi)" needs 182.
+    lang = db_reader.get_language()
+    t = i18n.get_t(lang)
+    offered = [(y, m, i18n.fmt_month_year(lang, date(y, m, 1)))
+               for y, m in past_months(db_reader.today_local())]
+
+    def span(i):
+        n, first, last = len(offered) - i, offered[i][2], offered[-1][2]
+        return (t("cloud_import_span_one").format(first=first) if n == 1
+                else t("cloud_import_span_many").format(n=n, first=first, last=last))
+
+    settings["cloud_import_months"] = [(f"{y:04d}-{m:02d}", label, span(i))
+                                       for i, (y, m, label) in enumerate(offered)]
+    chosen = import_from(db_reader._get())
+    settings["cloud_import_from"] = f"{chosen[0]:04d}-{chosen[1]:02d}" if chosen else ""
+    settings["cloud_import_span"] = next((sp for value, _, sp in settings["cloud_import_months"]
+                                          if value == settings["cloud_import_from"]),
+                                         t("cloud_import_span_none"))
+    settings["cloud_import_span_none"] = t("cloud_import_span_none")
     # Per-card open/collapsed state for the settings accordion — saved in the DB (shared
     # across devices). Cards start collapsed so the page stays compact, EXCEPT 'vehicle': it's
     # tiny (model + VIN + the Logout/change-account button) and keeping it open makes the logout
@@ -2443,7 +3119,6 @@ async def settings_page(request: Request):
         timezones=db_reader.timezone_options(),
         timezone_code=db_reader.get_timezone(),
         diag=diagnostics.build_system_info(MATE_VERSION),
-        measured_capacity=db_reader.get_battery_health().get("latest_capacity_kwh"),
         # The capacity actually in use, and the SoH reference. The form used to carry its own
         # default (67.1) while the code read another (65.0) — two defaults for one value, and
         # whichever got written first decided the reference for ever (@danielvilhena, #221).
@@ -2454,7 +3129,7 @@ async def settings_page(request: Request):
         # The charge-detection floor set above what the car draws — the detector switched
         # off by a slider, which shows up as half a charge rather than none (#250).
         charge_floor_peak=db_reader.charge_threshold_too_high(),
-        capacity_nominal=db_reader.get_setting("battery_capacity_nominal_kwh", ""),
+        capacity_nominal=db_reader.get_soh_reference_kwh() or "",
         # Written by the poller when it hears another Mate on our own topic prefix (BetaTester #13).
         # Shown beside the prefix field, which is where the fix lives.
         mqtt_collision=_mqtt_collision(),
@@ -2495,27 +3170,75 @@ async def costs_page(request: Request):
     cfg = db_reader.get_cost_config()
     return templates.TemplateResponse(request, "costs.html", _ctx(
         page="costs", vehicle=vehicle,
+        **db_reader.charging_places_context(),
         settings={**settings, **prices},
         charge_types=db_reader.charge_types_localised(),
         cost_mode=cfg["mode"], cost_modes=cfg["modes"], tou_method=cfg["method"],
-        tou_bands_json=json.dumps(cfg["bands"]), cost_modes_json=json.dumps(cfg["modes"]),
+        tou_bands_json=_script_json(cfg["bands"]), cost_modes_json=_script_json(cfg["modes"]),
     ))
 
 
+@app.post("/api/settings/charging-places", response_class=HTMLResponse)
+async def save_charging_place(request: Request):
+    form = await request.form()
+    try:
+        db_reader.save_charging_place(form)
+    except ValueError as exc:
+        return HTMLResponse(i18n.get_t(db_reader.get_language())(str(exc)), status_code=400)
+    return RedirectResponse(request.headers.get("x-ingress-path", "") + "/costs#charging-places", status_code=303)
+
+
+@app.get("/api/charges/{charge_id}/place", response_class=HTMLResponse)
+async def charge_place_picker(request: Request, charge_id: int):
+    row = db_reader._get().execute("SELECT * FROM charges WHERE id=? AND vehicle_id=?",
+                                  (charge_id, db_reader._current_vehicle_id())).fetchone()
+    if not row:
+        return HTMLResponse("", status_code=404)
+    return templates.TemplateResponse(request, "partials/charge_place_picker.html", _ctx(
+        charge=dict(row), charge_types=db_reader.charge_types_localised(),
+        **db_reader.charging_places_context()))
+
+
+@app.post("/api/charges/{charge_id}/place", response_class=HTMLResponse)
+async def set_charge_place(request: Request, charge_id: int):
+    """Assigning (or clearing) a place used to answer with `HX-Refresh` — a full page reload that
+    lost whatever day/tab the owner had open, just to update a few kB of HTML. It changes the same
+    things a badge click does (type + cost) plus the place line beside it, so it now redraws
+    exactly those, the same way /type, /cost and /free already do: the place line is this
+    request's own target, the badge and the 📍 line (a place names the charge first) are passengers
+    swapped out-of-band."""
+    form = await request.form()
+    try:
+        charge = db_reader.assign_charging_place(charge_id, int(form.get("place_id") or 0))
+    except ValueError as exc:
+        key = str(exc) if str(exc).startswith('place_') else 'place_invalid'
+        return HTMLResponse(i18n.get_t(db_reader.get_language())(key), status_code=400)
+    t = i18n.get_t(db_reader.get_language())
+    cost_title = t("cost_basis_ac") if (charge.get("location_type") == "HOME" and charge.get("ac_energy_kwh")) \
+        else t("cost_basis_dc")
+    place_html = templates.env.get_template("partials/charge_place_line.html").render(charge=charge, t=t)
+    badge_html = templates.env.get_template("partials/charge_type_badge.html").render(
+        charge=charge, charge_types=db_reader.charge_types_localised(),
+        currency=db_reader.get_currency(), t=t, cost_oob=True, cost_title=cost_title, badge_oob=True)
+    db_reader.charge_places([charge])
+    loc_html = templates.env.get_template("partials/charge_location.html").render(charge=charge, t=t, loc_oob=True)
+    return HTMLResponse(place_html + badge_html + loc_html)
+
+
 @app.get("/wallbox", response_class=HTMLResponse)
-async def wallbox_page(request: Request):
+async def wallbox_page(request: Request, month: str = ""):
     """Wallbox page — only reachable when enabled in Settings. Data wiring to
     Home Assistant comes next; for now this previews the intended layout."""
     if db_reader.get_setting("wallbox_enabled", "0") != "1":
         return RedirectResponse(request.headers.get("x-ingress-path", "") + "/settings")
     vehicle, _ = db_reader.get_vehicle()
-    today = db_reader.today_local()
+    cal_year, cal_month = _page_month(month)
     return templates.TemplateResponse(request, "wallbox.html", _ctx(
         page="wallbox", vehicle=vehicle,
         configured=ha_client.is_configured() and bool(ha_client.get_mapping()),
-        cal_year=today.year, cal_month=today.month,
+        cal_year=cal_year, cal_month=cal_month,
         cal_years=db_reader.get_wallbox_years(),
-        calendar_html=_wallbox_calendar_html(today.year, today.month),   # drawn, not fetched
+        calendar_html=_wallbox_calendar_html(cal_year, cal_month),   # drawn, not fetched
     ))
 
 
@@ -2530,7 +3253,12 @@ async def save_wallbox(request: Request):
 
 
 def _ha_test_html() -> str:
-    """Small inline status snippet for the HA connection test."""
+    """Small inline status snippet for the HA connection test.
+
+    htmx swaps this into Settings on every load once a token is saved, and it carries text that
+    came back from whatever answers at the configured URL — so that text is escaped, always. A
+    raw page here once replaced the whole Settings view with HA's own shell (#294)."""
+    from html import escape as _esc
     if os.environ.get("SUPERVISOR_TOKEN"):
         src = "Supervisor (add-on)"
     else:
@@ -2538,11 +3266,11 @@ def _ha_test_html() -> str:
     res = ha_client.test_connection()
     if res.get("ok"):
         return (f'<span style="color:#22c55e;font-size:13px">✓ Connected via {src}'
-                f' — {res.get("message", "API running")}</span>')
+                f' — {_esc(str(res.get("message", "API running")))}</span>')
     err = res.get("error", "unknown")
     if err == "not_configured":
         return '<span style="color:#64748b;font-size:13px">Enter the HA URL and token, then test</span>'
-    return f'<span style="color:#f87171;font-size:13px">✗ {err}</span>'
+    return f'<span style="color:#f87171;font-size:13px">✗ {_esc(str(err))}</span>'
 
 
 @app.post("/api/settings/ha", response_class=HTMLResponse)
@@ -2691,6 +3419,18 @@ async def save_outside_temp(request: Request):
     return HTMLResponse(f'<span style="color:#22c55e;font-size:13px">{t("retention_saved")}</span>')
 
 
+@app.post("/api/settings/elevation", response_class=HTMLResponse)
+async def save_elevation(request: Request):
+    """The switch for the lookup of a trip's elevation and temperature (elevation_enrich): a few
+    minutes after a trip ends its GPS track goes to Open-Meteo. On unless switched off here; the
+    'Calculate elevation' button on a trip's page looks that one trip up either way."""
+    form = await request.form()
+    val = "1" if form.get("elevation_enabled") in ("1", "on", "true") else "0"
+    db_reader.set_setting("elevation_enabled", val)
+    t = i18n.get_t(db_reader.get_language())
+    return HTMLResponse(f'<span style="color:#22c55e;font-size:13px">{t("retention_saved")}</span>')
+
+
 # ── Wallbox saved profiles ───────────────────────────────────────────────────
 
 def _get_wallbox_profiles() -> list:
@@ -2764,10 +3504,9 @@ async def wallbox_profile_load(request: Request, profile_id: str):
     """Restore a saved wallbox profile as the active configuration and reload the page."""
     t = i18n.get_t(db_reader.get_language())
     profiles = _get_wallbox_profiles()
-    # Guard: refuse to switch while a charge is active (switching mid-charge would blend
+    # Guard: refuse to switch while a charge session is open (switching mid-charge would blend
     # two physical wallboxes into the same session's energy counter).
-    status = db_reader.get_latest_status()
-    if status and status.get("charging"):
+    if db_reader.open_charge():
         return templates.TemplateResponse(request, "partials/wallbox_profiles.html", _ctx(
             profiles=profiles,
             wb_profile_error=t("wb_profile_charging_blocked"),
@@ -2821,7 +3560,7 @@ async def wallbox_live(request: Request):
     status = db_reader.get_latest_status()
     # Session metrics only make sense when THIS car is on the wallbox — otherwise the
     # live reading could be another vehicle charging on the same wallbox.
-    car_plugged = bool(status and status.get("plug_connected"))
+    car_plugged = bool(status and status.get("cable_connected"))
     # …and the warning that says so has to name the car the owner actually has. It said "B10" to
     # everyone until #248 (@Ng-EY, a C10 owner): a line about WHICH vehicle the numbers belong to
     # is the worst place to get the vehicle wrong. Empty before the poller has seen the car.
@@ -2957,10 +3696,10 @@ async def wallbox_compare_chart(request: Request):
     except (TypeError, ValueError):
         return HTMLResponse('<div class="text-sm text-slate-500 py-2">—</div>')
     curve = db_reader.get_charge_power_curve(cid)
+    home = db_reader.is_home_charge(cid)
+    wb_power = _wallbox_overlay(curve, home)
     return templates.TemplateResponse(request, "partials/charge_power_chart.html", _ctx(
-        cid=cid, labels=curve["labels"], power=curve["power"], soc=curve["soc"],
-        wb_power=_wallbox_overlay(curve, cid),
-    ))
+        cid=cid, wb_power=wb_power, **curve))
 
 
 @app.get("/api/wallbox/control", response_class=HTMLResponse)
@@ -3017,28 +3756,17 @@ async def wallbox_set_max_current(request: Request):
 
 @app.post("/api/charges/{charge_id}/type", response_class=HTMLResponse)
 async def set_charge_type(request: Request, charge_id: int):
+    """Re-tag a charge's physical type. What it costs is a SEPARATE question now — see
+    /api/charges/{id}/cost — so this never touches a manually-typed price, on purpose:
+    `update_charge_type` preserves it by itself whenever the charge is already cost_manual."""
     form = await request.form()
     location_type = form.get("location_type", "HOME")
-    # MANUAL = the user types the real total paid; it overrides the automatic cost (the
-    # public-charging jungle can't be modelled by a per-kWh tariff). Everything else is computed in
-    # update_charge_type: a HOME charge is billed on the wallbox energy the poller measured at charge
-    # start/stop (the counter delta — exact), if available, else on the battery (DC/SoC) energy.
-    manual_cost = None
-    if location_type == "MANUAL":
-        try:
-            manual_cost = float(str(form.get("cost", "")).strip().replace(",", "."))
-        except (ValueError, TypeError):
-            manual_cost = None
     # The charger's own kWh (#222) is NOT read here: it has its own endpoint below, so re-tagging a
     # charge can never touch a number the owner typed, and typing that number can never re-tag it.
-    charge = db_reader.update_charge_type(charge_id, location_type, manual_cost=manual_cost)
+    charge = db_reader.update_charge_type(charge_id, location_type)
     t = i18n.get_t(db_reader.get_language())
-    if location_type == "MANUAL":
-        cost_title = t("cost_basis_manual")
-    elif location_type == "HOME" and charge.get("ac_energy_kwh"):
-        cost_title = t("cost_basis_ac")
-    else:
-        cost_title = t("cost_basis_dc")
+    cost_title = t("cost_basis_ac") if (location_type == "HOME" and charge.get("ac_energy_kwh")) \
+        else t("cost_basis_dc")
     return templates.TemplateResponse(request, "partials/charge_type_badge.html", {
         "charge": charge,
         "charge_types": db_reader.charge_types_localised(),
@@ -3046,6 +3774,43 @@ async def set_charge_type(request: Request, charge_id: int):
         "t": t,                   # the partial's #120 free toggle (HOME) needs the translator
         "cost_oob": True,         # also refresh the cost cell (it changes with the type/basis)
         "cost_title": cost_title,
+        "badge_oob": False,       # this route's own div IS the primary target, not a passenger
+    })
+
+
+@app.post("/api/charges/{charge_id}/cost", response_class=HTMLResponse)
+async def set_charge_cost(request: Request, charge_id: int):
+    """The pencil-cost field: the REAL total paid, independent of the charge's type — what the
+    'Manual' badge used to conflate. Unlike gross-kwh/solar-kwh below, the box opens PRE-FILLED
+    with the current effective cost, so a genuinely empty submission is a deliberate CLEAR (back to
+    the computed default), not "leave it alone". See `set_charge_cost`'s docstring in db_reader.
+
+    ⚠️ Empty and UNPARSEABLE are not the same thing, and must not collapse into it: typing "18,45€"
+    (a stray currency symbol, a typo) is not a clear, and reading it as one silently deleted a price
+    the owner had already typed, replacing it with the computed estimate — found in review. Only a
+    field that is empty after stripping is a clear; anything else that fails to parse is REJECTED —
+    the charge is re-rendered exactly as it already was, nothing written."""
+    form = await request.form()
+    raw = str(form.get("cost", "")).strip()
+    if not raw:
+        charge = db_reader.set_charge_cost(charge_id, None)          # deliberate clear
+    else:
+        try:
+            cost = max(0.0, float(raw.replace(",", ".")))
+        except (ValueError, TypeError):
+            charge = db_reader.get_charge(charge_id)                 # reject: leave it alone
+        else:
+            charge = db_reader.set_charge_cost(charge_id, cost)
+    t = i18n.get_t(db_reader.get_language())
+    # The WHOLE type selector — pencil, badge and menu — not the pencil alone: a price typed on a
+    # charge with no type turns it "✎ Manual" (add-on #2), and the menu's Manual row posts here too.
+    return templates.TemplateResponse(request, "partials/charge_type_badge.html", {
+        "charge": charge,
+        "charge_types": db_reader.charge_types_localised(),
+        "t": t,
+        "currency": db_reader.get_currency(),
+        "cost_oob": True,   # the cost cell's default/billed indicator changes with this
+        "badge_oob": False,
     })
 
 
@@ -3075,6 +3840,36 @@ async def set_charge_gross_kwh(request: Request, charge_id: int):
     })
 
 
+@app.post("/api/charges/{charge_id}/solar-kwh", response_class=HTMLResponse)
+async def set_charge_solar_kwh(request: Request, charge_id: int):
+    """#272 @kingean93 — the kWh of this charge that came off the owner's own roof.
+
+    Same reading rules as its twin above: an empty box means "leave it alone", a zero is the
+    deliberate way to take a wrong figure back, and anything unparseable is treated as empty rather
+    than as a zero so a typo cannot wipe a good number.
+
+    A figure larger than the energy the wallbox measured comes back as a refusal, not a clamp — the
+    reader hands the partial `error`/`max` and the box stays open with the reason showing. That is
+    the mistake this field exists to catch: typing what you BOUGHT where the solar goes."""
+    form = await request.form()
+    solar_kwh = None
+    _s = str(form.get("solar_kwh", "")).strip().replace(",", ".")
+    if _s:
+        try:
+            solar_kwh = max(0.0, min(float(_s), 500.0))
+        except (ValueError, TypeError):
+            solar_kwh = None
+    charge = db_reader.set_charge_solar_kwh(charge_id, solar_kwh)
+    t = i18n.get_t(db_reader.get_language())
+    return templates.TemplateResponse(request, "partials/charge_solar_kwh.html", {
+        "charge": charge,
+        "t": t,
+        # Not on a refusal: nothing was written, so the cost cell has nothing new to say and
+        # swapping it would suggest the number went in.
+        "cost_oob": charge.get("error") is None,
+    })
+
+
 @app.post("/api/charges/{charge_id}/free", response_class=HTMLResponse)
 async def set_charge_free(request: Request, charge_id: int):
     """#120: toggle the FREE mark on a HOME charge (e.g. self-produced solar, or any free home
@@ -3092,7 +3887,28 @@ async def set_charge_free(request: Request, charge_id: int):
         "t": t,                   # the partial's #120 free toggle needs the translator
         "cost_oob": True,         # free flips the cost to 0 → refresh the cost cell too
         "cost_title": cost_title,
+        "badge_oob": False,
     })
+
+
+def _charge_location_line(request: Request, charge: dict, t, **state):
+    """The 📍 line of a charge, named from what the charge holds once the route has written to it."""
+    db_reader.charge_places([charge])
+    return templates.TemplateResponse(request, "partials/charge_location.html", {"charge": charge, "t": t, **state})
+
+
+@app.post("/api/charges/{charge_id}/address", response_class=HTMLResponse)
+async def charge_look_up_address(request: Request, charge_id: int):
+    """🧭 on a charge's 📍 line: the address of its point is looked up now, whatever the switch in Address
+    lookup says and however old the charge; then the line is drawn again, saying why when none came."""
+    import asyncio
+    charge = db_reader.get_charge_location(charge_id)
+    if not charge:
+        return HTMLResponse("", status_code=404)
+    lookup = await asyncio.get_event_loop().run_in_executor(
+        None, place_lookup.look_up_now, [(charge["latitude"], charge["longitude"])])
+    t = i18n.get_t(db_reader.get_language())
+    return _charge_location_line(request, charge, t, lookup=lookup)
 
 
 @app.post("/api/charges/{charge_id}/locate", response_class=HTMLResponse)
@@ -3105,13 +3921,11 @@ async def relocate_charge(request: Request, charge_id: int):
     charge = db_reader.get_charge_location(charge_id)
     t = i18n.get_t(db_reader.get_language())
     if not charge or not charge.get("latitude") or not charge.get("longitude"):
-        return templates.TemplateResponse(request, "partials/charge_location.html",
-                                          {"charge": charge or {"id": charge_id}, "t": t, "error": True})
+        return _charge_location_line(request, charge or {"id": charge_id}, t, error=True)
     options, ok = await asyncio.get_event_loop().run_in_executor(
         None, charger_locator.find_station_candidates, charge["latitude"], charge["longitude"])
     if not ok:
-        return templates.TemplateResponse(request, "partials/charge_location.html",
-                                          {"charge": charge, "t": t, "error": True})
+        return _charge_location_line(request, charge, t, error=True)
     if not options:
         # Nothing found — but this charge may already carry a name, from a source that has
         # since dropped the station, or from a keyed source (Open Charge Map) whose key the
@@ -3120,14 +3934,12 @@ async def relocate_charge(request: Request, charge_id: int):
         # looked up again. A button that quietly destroys what it was asked to refresh is worse
         # than one that says it found nothing. On a charge with no name either, writing nothing
         # simply leaves it to the ongoing sweep, exactly as if the button had never been pressed.
-        return templates.TemplateResponse(request, "partials/charge_location.html",
-                                          {"charge": charge, "t": t, "not_found": True})
+        return _charge_location_line(request, charge, t, not_found=True)
     if len(options) == 1:
         name, url = options[0].get("name") or "", options[0].get("url")
         db_reader.set_charge_location_name(charge_id, name, url)
         charge["location_name"], charge["location_url"] = name, url
-        return templates.TemplateResponse(request, "partials/charge_location.html",
-                                          {"charge": charge, "t": t})
+        return _charge_location_line(request, charge, t)
     return templates.TemplateResponse(request, "partials/charge_location_choices.html",
                                       {"charge": charge, "options": options, "t": t})
 
@@ -3145,8 +3957,7 @@ async def confirm_charge_location(request: Request, charge_id: int):
     db_reader.set_charge_location_name(charge_id, name, url)
     charge["location_name"], charge["location_url"] = name, url
     t = i18n.get_t(db_reader.get_language())
-    return templates.TemplateResponse(request, "partials/charge_location.html",
-                                      {"charge": charge, "t": t})
+    return _charge_location_line(request, charge, t)
 
 
 @app.get("/api/charges/{charge_id}/locate/cancel", response_class=HTMLResponse)
@@ -3154,8 +3965,7 @@ async def cancel_charge_location(request: Request, charge_id: int):
     """Dismiss the ambiguity popup without changing anything already saved."""
     charge = db_reader.get_charge_location(charge_id)
     t = i18n.get_t(db_reader.get_language())
-    return templates.TemplateResponse(request, "partials/charge_location.html",
-                                      {"charge": charge or {"id": charge_id}, "t": t})
+    return _charge_location_line(request, charge or {"id": charge_id}, t)
 
 
 @app.post("/api/charges/{charge_id}/locate/manual", response_class=HTMLResponse)
@@ -3166,44 +3976,48 @@ async def set_manual_charge_location(request: Request, charge_id: int):
     set_charge_location_name exactly like a picked candidate would — location_name
     IS NOT NULL either way, so the background sweep (_LOCATION_CANDIDATES_WHERE) never
     revisits this charge. An empty submission changes nothing (closes the input with
-    whatever was already saved, same as clicking away)."""
+    whatever was already saved, same as clicking away).
+    #301: an Open Charge Map identifier in the field — a pasted OCM link, "OCM-280221", or
+    the bare number — is not a name: that exact POI is fetched by id and saved with its own
+    name and link, same as a pick from 🔄. Nothing is searched, so nothing can be guessed
+    wrong. Its coordinates are NOT written: a charge without them is how a hand-typed one is
+    recognised, and the station's position is not where the car was. When the fetch fails
+    nothing is written either — the id is not a label, and saving it as one would bury it."""
+    import asyncio
     form = await request.form()
     name = (form.get("name") or "").strip()[:200]
     charge = db_reader.get_charge_location(charge_id)
     if not charge:
         return HTMLResponse("", status_code=404)
+    t = i18n.get_t(db_reader.get_language())
+    poi_id = charger_locator.parse_ocm_id(name)
+    if poi_id:
+        st, reason = await asyncio.get_event_loop().run_in_executor(
+            None, charger_locator.ocm_station_by_id, poi_id)
+        if reason:
+            return _charge_location_line(request, charge, t, ocm_error=reason)
+        db_reader.set_charge_location_name(charge_id, st["name"][:200], st["url"])
+        charge["location_name"], charge["location_url"] = st["name"][:200], st["url"]
+        return _charge_location_line(request, charge, t)
     if name:
         db_reader.set_charge_location_name(charge_id, name, None)
         charge["location_name"], charge["location_url"] = name, None
-    t = i18n.get_t(db_reader.get_language())
-    return templates.TemplateResponse(request, "partials/charge_location.html",
-                                      {"charge": charge, "t": t})
+    return _charge_location_line(request, charge, t)
 
 
-def _wallbox_overlay(curve: dict, charge_id: int) -> list | None:
-    """Wallbox power (from HA history) resampled onto the car curve's timestamps,
-    so it overlays the car's DC power on the same axis. None when unavailable.
-    Only HOME charges get the overlay — on a public/away charge the home wallbox
-    is irrelevant (and could even be charging another car)."""
+def _wallbox_overlay(curve: dict, home: bool) -> list | None:
+    """Wallbox power as Mate kept it, held onto the car curve's timestamps,
+    so it overlays the car's DC power on the same axis. None when none was kept.
+    Only a charge at home gets the overlay — on a public/away charge the home wallbox
+    is irrelevant (and could even be charging another car); the caller says which it is."""
     times = curve.get("times") or []
-    mapping = ha_client.get_mapping()
     wallbox_on = db_reader.get_setting("wallbox_enabled", "0") == "1"
-    if (not wallbox_on or not times or not ha_client.is_configured()
-            or not mapping.get("power") or not db_reader.is_home_charge(charge_id)):
+    if not wallbox_on or not times or not home:
         return None
-    hist = ha_client.get_history(mapping["power"], times[0], times[-1])
+    hist = db_reader.wallbox_power_samples(times[0], times[-1])
     if not hist:
         return None
-    out, j, last = [], 0, None
-    for t in times:
-        e = ha_client.epoch(t)
-        if e is None:
-            out.append(None)
-            continue
-        while j < len(hist) and hist[j][0] <= e:   # step-hold: last known wallbox value ≤ sample time
-            last = hist[j][1]
-            j += 1
-        out.append(round(last, 3) if last is not None else None)
+    out = ha_client.step_hold(times, hist)
     return out if any(v is not None for v in out) else None
 
 
@@ -3353,14 +4167,32 @@ async def charges_import_api(request: Request):
 
 @app.get("/api/charge/{charge_id}/power-chart", response_class=HTMLResponse)
 async def charge_power_chart(request: Request, charge_id: int):
-    """Lazy-loaded power-over-time chart for one charge session (expandable in the list).
-    When a wallbox is configured, overlays its delivered AC power vs the car's DC power."""
+    """Lazy-loaded chart in bands for one charge session (expandable in the list): the power, the
+    SoC, the temperatures and the rest of the readings over time. When a wallbox is configured,
+    its delivered AC power is drawn beside the car's DC power."""
     curve = db_reader.get_charge_power_curve(charge_id)
+    home = db_reader.is_home_charge(charge_id)
+    wb_power = _wallbox_overlay(curve, home)
     return templates.TemplateResponse(request, "partials/charge_power_chart.html", _ctx(
-        cid=charge_id,
-        labels=curve["labels"], power=curve["power"], soc=curve["soc"],
-        wb_power=_wallbox_overlay(curve, charge_id),
-    ))
+        cid=charge_id, wb_power=wb_power, facts=_charge_facts(curve), **curve))
+
+
+def _charge_facts(curve: dict) -> dict:
+    """The line above a charge's chart, from the chart's own readings: the battery's temperature at the
+    first and the last reading, the outside temperature's lowest and highest, and the average of the power
+    readings, weighted by time, along the stretches the chart draws its power line (a merged charge's over
+    all its pieces): energy and time come from the same readings, so neither a pause nor a stretch without
+    readings counts."""
+    from itertools import pairwise
+    battery = [v for v in curve.get("battery_temp") or [] if v is not None]
+    outside = [v for v in curve.get("outside_temp") or [] if v is not None]
+    runs = _curve_runs(curve.get("times") or [], [p or None for p in curve.get("power") or []])
+    steps = [step for run in runs for step in pairwise(run)]
+    secs = sum(b[0] - a[0] for a, b in steps)
+    kw_secs = sum((b[0] - a[0]) * (a[1] + b[1]) / 2 for a, b in steps)
+    return {"battery_temp": (battery[0], battery[-1]) if battery else None,
+            "outside_temp": (min(outside), max(outside)) if outside else None,
+            "avg_kw": kw_secs / secs if secs > 0 else None}
 
 
 @app.post("/api/settings/prices", response_class=HTMLResponse)
@@ -3479,6 +4311,21 @@ async def save_cost_dynamic(request: Request):
     return HTMLResponse(f'<span style="color:#22c55e;font-size:13px">{t("costs_saved")}</span>')
 
 
+@app.post("/api/settings/cloud-import", response_class=HTMLResponse)
+async def save_cloud_import(request: Request):
+    from cloud_import_policy import FROM_KEY, KEY, past_months
+    form = await request.form()
+    db_reader.set_setting(KEY, "1" if form.get("cloud_import_trips") == "1" else "0")
+    # Only a month the card offers, or "" for the current month only. Absent when the card had no
+    # earlier month to offer (September 2026 itself): the setting is then left as it is.
+    chosen = form.get("cloud_import_from")
+    offered = {f"{y:04d}-{m:02d}" for y, m in past_months(db_reader.today_local())}
+    if chosen == "" or chosen in offered:
+        db_reader.set_setting(FROM_KEY, chosen)
+    t = i18n.get_t(db_reader.get_language())
+    return HTMLResponse(f'<span style="color:#22c55e">{t("cloud_import_saved")}</span>')
+
+
 @app.post("/api/settings/abrp", response_class=HTMLResponse)
 async def save_abrp(request: Request):
     """Enable/disable ABRP live telemetry and store the user's personal token."""
@@ -3501,17 +4348,14 @@ async def save_abrp(request: Request):
 
 @app.post("/api/settings/geocoder", response_class=HTMLResponse)
 async def save_geocoder(request: Request):
-    """Store the optional TomTom API key used for better address/house-number
-    coverage on the Navigation page. Empty = keyless Photon/Nominatim."""
+    """Store the geocoding provider and its optional API key, used for better address/house-number
+    coverage on the Navigation page and for where trips start and end and charges happen, and the switch
+    for the latter (place_lookup). Empty = keyless Photon/Nominatim."""
     form = await request.form()
     if "geocoder_provider" in form:
         db_reader.set_setting("geocoder_provider", (form.get("geocoder_provider") or "").strip())
-    # The automatic 🧭 note, which is the only thing here that reaches out on its own initiative
-    # — the rest of this card is consulted when the user asks for an address. Guarded by the
-    # marker rather than by the checkbox alone, because an unticked box submits nothing at all
-    # and would otherwise read as "turn it off" on any form that never showed it.
-    if "auto_note_present" in form:
-        db_reader.set_setting("auto_note", "1" if form.get("auto_note") else "0")
+    if "place_lookup_present" in form:      # the marker, not the box: unticked, it submits nothing, like a form without it
+        db_reader.set_setting("place_lookup", "1" if form.get("place_lookup") else "0")
     gkey = (form.get("geocoder_key") or "").strip()
     if gkey:  # masked field: only overwrite on a non-empty submit
         db_reader.set_secret("geocoder_key", gkey)
@@ -3680,7 +4524,7 @@ def _csv_response(rows: list, filename: str) -> Response:
             for k in r:
                 if k not in fieldnames and k not in drop:
                     fieldnames.append(k)
-        clean_rows = [{k: v for k, v in r.items() if k in fieldnames} for r in rows]
+        clean_rows = [{k: _csv_safe(v) for k, v in r.items() if k in fieldnames} for r in rows]
         w = csv.DictWriter(buf, fieldnames=fieldnames)
         w.writeheader()
         w.writerows(clean_rows)
@@ -3688,14 +4532,39 @@ def _csv_response(rows: list, filename: str) -> Response:
                     headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
+def _csv_safe(v):
+    """Neutralise a spreadsheet formula in a TEXT cell, leaving everything else untouched.
+
+    A cell beginning `=`, `+`, `-` or `@` is a formula to Excel, LibreOffice and Sheets, so opening
+    an export can run what the text says. Not merely the owner's own notes: `location_name` comes
+    from OpenStreetMap and Open Charge Map, which anybody can edit, and an export is exactly the
+    file that gets mailed to somebody else when a charge looks wrong.
+
+    Strings only. A numeric column may legitimately start with a minus, and prefixing that would
+    turn a number into text in every spreadsheet that opens it — trading a rare attack for a
+    certain defect. The apostrophe is the standard neutralisation: the text itself survives intact
+    and displays unchanged, it just stops being executable."""
+    return f"'{v}" if isinstance(v, str) and v[:1] in ("=", "+", "-", "@") else v
+
+
 @app.get("/api/export/trips.csv")
 async def export_trips_csv():
-    return _csv_response(db_reader.get_trips(limit=1_000_000), "leapmotor-mate-trips.csv")
+    trips = db_reader.get_trips(limit=1_000_000)
+    db_reader.trip_places(trips)                     # start_place, end_place: the note no longer holds them
+    for t in trips:
+        for key in ("search_text", "start_place_osm", "end_place_osm", "start_place_charging", "end_place_charging"):
+            t.pop(key, None)
+    return _csv_response(trips, "leapmotor-mate-trips.csv")
 
 
 @app.get("/api/export/charges.csv")
 async def export_charges_csv():
-    return _csv_response(db_reader.get_charges(limit=1_000_000), "leapmotor-mate-charges.csv")
+    charges = db_reader.get_charges(limit=1_000_000)
+    db_reader.charge_places(charges)                 # place as its card names it; the address, also beside a station
+    for c in charges:
+        for key in ("search_text", "place_osm", "place_charging", "address_osm", "gps_fix", "address_found"):
+            c.pop(key, None)
+    return _csv_response(charges, "leapmotor-mate-charges.csv")
 
 
 @app.get("/trips/{trip_id}/route.gpx")
@@ -3749,12 +4618,13 @@ async def import_database(request: Request):
         return HTMLResponse("<div class='text-sm text-red-400'>⚠️ " + t("restore_db_nofile") + "</div>",
                             status_code=400)
     blob = await up.read()
+    from html import escape as _esc   # the text of an exception can quote the uploaded file
     try:
         res = db_reader.restore_database(blob)
     except ValueError as e:
-        return HTMLResponse("<div class='text-sm text-red-400'>⚠️ " + str(e) + "</div>", status_code=400)
+        return HTMLResponse("<div class='text-sm text-red-400'>⚠️ " + _esc(str(e)) + "</div>", status_code=400)
     except Exception as e:  # noqa: BLE001
-        return HTMLResponse("<div class='text-sm text-red-400'>⚠️ " + str(e) + "</div>", status_code=500)
+        return HTMLResponse("<div class='text-sm text-red-400'>⚠️ " + _esc(str(e)) + "</div>", status_code=500)
     _restart_container()   # exit 42 → run.sh relaunches poller + web → both reopen the restored DB
     n = res["counts"]
     return HTMLResponse(
@@ -3813,12 +4683,13 @@ async def test_mqtt(request: Request):
     t = i18n.get_t(db_reader.get_language())
     if ok:
         return HTMLResponse(f'<span style="color:#22c55e;font-size:13px">🟢 {t("mqtt_connected")}</span>')
-    return HTMLResponse(f'<span style="color:#ef4444;font-size:13px">🔴 {t("mqtt_failed")}: {reason}</span>')
+    from html import escape as _esc   # the reason can be the broker's or the resolver's own words
+    return HTMLResponse(f'<span style="color:#ef4444;font-size:13px">🔴 {t("mqtt_failed")}: {_esc(str(reason))}</span>')
 
 
 # Every collapsible card on the Settings accordion. Used both to build the initial
 # open/collapsed map and as the allowlist for the ui-state save endpoint.
-_UI_CARD_KEYS = {"locale", "vehicle", "battery", "polling", "charge_detect", "trips", "advanced",
+_UI_CARD_KEYS = {"cloud_import", "locale", "vehicle", "battery", "polling", "charge_detect", "trips", "advanced",
                  "abrp", "geocoder", "charger_locator", "wallbox", "mqtt",
                  "database", "export", "diagnostics"}
 
@@ -3866,11 +4737,9 @@ async def set_operation_pin(request: Request):
     Typed twice, like the access password (#214 @rop12770): a PIN stored with a typo fails at the
     car, hours later, with an error that says nothing about which digit was wrong.
 
-    ⚠️ Nothing else has to be poked. The stored secret beats `LEAPMOTOR_PIN` in both readers, the web
-    command session is dropped here so the next command re-authenticates, and the poller already
-    compares (user, pass, PIN) against the ones it started with on every cycle and exits with 42 for
-    run.sh to relaunch it. That watcher was written for the account switch; a PIN change is the same
-    shape and it was already covered."""
+    The PIN is set on the car, so it is always one car's: the form names the car, the one the
+    Vehicle card shows unless a second car is picked. Both processes read a car's PIN at each
+    command; the web command session is dropped here too."""
     form = await request.form()
     pin = ((form.get("pin") or "") if isinstance(form.get("pin"), str) else "").strip()
     pin2 = ((form.get("pin2") or "") if isinstance(form.get("pin2"), str) else "").strip()
@@ -3879,21 +4748,16 @@ async def set_operation_pin(request: Request):
         return Response("empty", status_code=422)
     if pin2 != pin:
         return Response("mismatch", status_code=422)
-    # A `vin` means "this car's own PIN" (#186, @cookingeek): two Leapmotors on one account can want
-    # different four digits, and the commands are the only thing that would notice. A VIN we do not
-    # have is refused rather than stored, so a stale form cannot mint a secret for a phantom car.
-    if vin:
-        if not any(v.get("vin") == vin for v in db_reader.get_vehicles()):
-            return Response("unknown vin", status_code=422)
-        db_reader.set_operate_pin(pin, vin)
-        # Giving a car its own PIN is somebody looking at that car, so it answers the "never set up"
-        # strip too. It matters for a car whose model default happens to be right: there is nothing
-        # to change in the capacity box, and without this the strip could not be cleared at all
-        # except by walking the wizard again (@cookingeek set a separate PIN and kept the strip).
-        db_reader.mark_vehicle_configured(vin)
-        command_client._session._reset()
-        return Response(status_code=204, headers={"HX-Refresh": "true"})
-    db_reader.set_secret("leapmotor_pin", pin)
+    # Two Leapmotors on one account can want different four digits (#186, @cookingeek). A missing or
+    # unknown VIN is refused rather than guessed, so a stale form cannot store a PIN on the wrong car.
+    if not any(v.get("vin") == vin for v in db_reader.get_vehicles()):
+        return Response("unknown vin", status_code=422)
+    db_reader.set_operate_pin(pin, vin)
+    # Giving a car its PIN is somebody looking at that car, so it answers the "never set up" strip
+    # too. It matters for a car whose model default happens to be right: there is nothing to change
+    # in the capacity box, and without this the strip could not be cleared at all except by walking
+    # the wizard again (@cookingeek set a separate PIN and kept the strip).
+    db_reader.mark_vehicle_configured(vin)
     command_client._session._reset()
     return Response(status_code=204, headers={"HX-Refresh": "true"})
 
@@ -3907,7 +4771,9 @@ async def account_logout(request: Request):
     container restart); history is keyed by VIN, so the same car's records carry over."""
     db_reader.set_setting("leapmotor_user", "")
     db_reader.set_secret("leapmotor_pass", "")
-    db_reader.set_secret("leapmotor_pin", "")
+    for v in db_reader.get_vehicles():
+        db_reader.set_operate_pin("", v.get("vin") or "")
+    db_reader.set_secret("leapmotor_pin", "")    # one still waiting for its car
     db_reader.set_setting("setup_complete", "0")
     command_client._session._reset()          # drop the web command session too
     resp = Response(status_code=204)
@@ -3994,7 +4860,7 @@ async def set_language(request: Request):
     (HX-Refresh) so every server-rendered string switches to the new language."""
     form = await request.form()
     lang = form.get("language", "en")
-    db_reader.set_setting("language", lang if lang in ("en", "it", "fr", "de", "pl", "pt-PT", "nl", "es") else "en")
+    db_reader.set_setting("language", lang if lang in ("en", "it", "fr", "de", "pl", "pt-PT", "nl", "es", "cs") else "en")
     return Response(status_code=204, headers={"HX-Refresh": "true"})
 
 
@@ -4172,13 +5038,74 @@ async def clear_ui_password(request: Request):
 @app.get("/api/charging-live", response_class=HTMLResponse)
 async def charging_live(request: Request):
     status = db_reader.get_latest_status()
-    return templates.TemplateResponse(request, "partials/charging_live.html", _ctx(status=status))
+    return templates.TemplateResponse(request, "partials/charging_live.html",
+                                      _ctx(status=status, session=db_reader.open_charge()))
 
 
 @app.get("/api/battery-card", response_class=HTMLResponse)
 async def battery_card(request: Request):
     status = db_reader.get_latest_status()
     return templates.TemplateResponse(request, "partials/battery_card.html", _ctx(status=status))
+
+
+def _charging_chart() -> dict | None:
+    """The chart of the charge in progress: None while the car is not charging or it has one reading."""
+    # The car's word, as the charging status panel reads it: an open row alone is not a charge.
+    status = db_reader.get_latest_status()
+    if not (status and status.get("charging")):
+        return None
+    ch = db_reader.open_charge()
+    if not ch:
+        return None
+    curve = db_reader.get_charge_power_curve(ch["id"])
+    if len(curve["power"]) < 2:
+        return None
+    socs = [s for s in curve["soc"] if s is not None]
+    # At home while it runs: a type set at its start (a place recognised by GPS, or the
+    # always-at-home setting) decides; untyped, the wallbox delivering power to the plugged-in car does.
+    if ch["location_type"]:
+        home = ch["location_type"] == "HOME"
+    else:
+        home = bool(status.get("plug_connected")) and (ha_client.get_live().get("power_kw") or 0) > 0
+    return dict(ch, cid=ch["id"], soc_now=socs[-1] if socs else None, wb_power=_wallbox_overlay(curve, home),
+                **_live_age(status), **curve)
+
+
+def _live_age(status: dict) -> dict:
+    """What a card of a session in progress says in place of LIVE (partials/_live_badge.html): the age of the
+    last reading once the car is out of touch, and whether the frame lags the row, so the cloud can be named."""
+    # Out of touch: the frame lags the row (the cloud re-serving an old frame), or the rows stopped.
+    if status.get("data_age"):
+        age_s = status["data_age_s"]
+    else:
+        age_s = status["last_seen_s"] if (status.get("last_seen_s") or 0) >= db_reader.DATA_AGE_STALE_S else None
+    return {"data_age_s": age_s, "frame_lags": bool(status.get("data_age"))}
+
+
+@app.get("/api/charging-chart", response_class=HTMLResponse)
+async def charging_chart(request: Request):
+    """The Charges page polls this for the chart of the charge in progress; empty while none runs."""
+    live = await run_in_threadpool(_charging_chart)   # it may read Home Assistant: not on the event loop
+    return templates.TemplateResponse(request, "partials/charging_chart.html", _ctx(live=live))
+
+
+def _trip_live_chart() -> dict | None:
+    """The trip in progress and what its card says, or None while none runs; the card shows once it has two readings."""
+    trip = db_reader.open_trip()
+    if not trip:
+        return None
+    status = db_reader.get_latest_status() or {}
+    socs = [p["soc"] for p in trip["points"] if p["soc"] is not None]
+    # The odometer reads whole kilometres; a missing reading is stored as 0.
+    odo, start = status.get("odometer_km"), trip["start_odometer_km"]
+    km = odo - start if odo and start and odo >= start else None
+    return dict(trip, soc_now=socs[-1] if socs else None, distance_km=km, **_live_age(status))
+
+
+@app.get("/api/trip-live-chart", response_class=HTMLResponse)
+async def trip_live_chart(request: Request):
+    """The Trips page polls this for the chart of the trip in progress; empty while none runs."""
+    return templates.TemplateResponse(request, "partials/trip_live_chart.html", _ctx(live=_trip_live_chart()))
 
 
 @app.get("/api/status-card", response_class=HTMLResponse)
@@ -4192,32 +5119,51 @@ async def status_card(request: Request):
     ))
 
 
+@app.get("/api/measured-capacity", response_class=HTMLResponse)
+async def measured_capacity(request: Request):
+    """The pack's measured capacity hint, fetched by the Settings page instead of built into it:
+    the estimate integrates every qualifying charge and was 927 ms of a 1.36 s page."""
+    return templates.TemplateResponse(request, "partials/measured_capacity.html", _ctx(
+        measured_capacity=db_reader.get_battery_health().get("latest_capacity_kwh"),
+    ))
+
+
+@app.get("/api/polling-card", response_class=HTMLResponse)
+async def polling_card(request: Request):
+    """The Cloud link card's body, fetched when the card is opened. It was built inside
+    settings_page for every load of the page, open or not, and that cost was the whole of the
+    slowness reported hours after 4.5.0 went out."""
+    return templates.TemplateResponse(request, "partials/polling_card.html", _ctx(
+        polling=db_reader.polling_summary(),
+    ))
+
+
+@app.get("/api/link-pill", response_class=HTMLResponse)
+async def link_pill(request: Request):
+    """The data-link tile beside the Overview heading, on its own 30-second refresh."""
+    if _IS_DEMO:
+        return HTMLResponse("")            # demo runs no poller: a silent heartbeat is not an outage
+    return templates.TemplateResponse(request, "partials/link_pill.html", _ctx(
+        data_link=db_reader.data_link(db_reader.get_latest_status()),
+    ))
+
+
+@app.get("/api/last-position", response_class=JSONResponse)
+async def last_position(track: str | None = None):
+    """The Overview map's marker, polled by the map itself. It was drawn once, at page load, and
+    never moved: the status card beside it refreshes every 30 s, so "last seen 6 s ago" stood next
+    to a marker left wherever the car was when the page was opened. Local data only — see
+    _last_position."""
+    pos = _last_position(db_reader.get_latest_status(), i18n.get_t(db_reader.get_language()), have=track)
+    return JSONResponse(pos, headers={"Cache-Control": "no-store"})
+
+
 @app.get("/api/v2l-card", response_class=HTMLResponse)
 async def v2l_card(request: Request):
     """The Overview's V2L block, refreshed live (every 10 s, matching the V2L poll cadence) so the
     instantaneous power tracks the load during a session — the parent "Last charge" card is static."""
     return templates.TemplateResponse(request, "partials/v2l_card.html",
                                       _ctx(v2l=db_reader.get_v2l_status()))
-
-
-def _configured_charge_limit(vin: str = "") -> int | None:
-    """The car's REAL max-charge limit — the SoC it will actually stop at — for the Overview hero's
-    "to X%" ETA label. It is `config["3"]["percent"]` exactly as the CAR reports it, captured by the
-    poll loop on every change (it tracks the app's slider "even when the limit is changed from the
-    official app", poller/main.py) and stored under the per-VIN key. So set the limit to 75 or 80 on
-    the car and the hero reads exactly that.
-
-    🔒 It is NEVER a value typed into Mate. The poll loop only ever writes the per-VIN key from the
-    car's own report; the shared (non-VIN) `charge_limit_percent` key is what Mate's Set-limit button
-    writes — a typed value — and is deliberately NOT consulted here. When the car hasn't reported a
-    limit yet, this is None → the template shows the remaining time with no target, never a guessed
-    100. → #33 (@pdifeo)."""
-    if not vin:
-        return None
-    try:
-        return int(db_reader.get_setting(f"charge_limit_percent_{vin.lower()}", "") or 0) or None
-    except (TypeError, ValueError):
-        return None
 
 
 def _charge_window() -> str:
@@ -4245,7 +5191,7 @@ async def overview_hero(request: Request):
     status = db_reader.get_latest_status()
     vehicle, _ = db_reader.get_vehicle()
     return templates.TemplateResponse(request, "partials/overview_hero.html", _ctx(
-        status=status, vehicle=vehicle, charge_limit=_configured_charge_limit((vehicle or {}).get("vin") or ""),
+        status=status, vehicle=vehicle, charge_limit=db_reader.configured_charge_limit((vehicle or {}).get("vin") or ""),
     ))
 
 
@@ -4256,9 +5202,12 @@ async def refresh_now(request: Request):
     status card. Mate still reads PASSIVELY, so this won't wake a sleeping car — it only skips the
     wait when the car is already awake (e.g. while charging or just used)."""
     import asyncio
-    signals = await asyncio.get_event_loop().run_in_executor(None, command_client.get_fresh_signals)
+    # One car for the read AND the write: the picker can move while the cloud answers (#338).
+    vin = (db_reader.get_vehicle()[0] or {}).get("vin")
+    signals = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: command_client.get_fresh_signals(vin))
     if signals:
-        db_reader.save_fresh_signals(signals)
+        db_reader.save_fresh_signals(signals, vin)
     # Global button (sidebar) → reload the current page so the fresh state shows wherever the user is.
     return Response(status_code=200, headers={"HX-Refresh": "true"})
 
@@ -4271,22 +5220,22 @@ async def debug_signals():
     wrong sign. `gps_signals` isolates the GPS ids so a west-longitude user can paste just those;
     `all_signals` is the full dict for spotting an unmapped sign/hemisphere field."""
     import asyncio
-    sig = await asyncio.get_event_loop().run_in_executor(None, command_client.get_fresh_signals)
+    vin = (db_reader.get_vehicle()[0] or {}).get("vin")
+    sig = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: command_client.get_fresh_signals(vin))
     if not sig:
         return JSONResponse(
             {"error": "no live signals (car asleep or unreachable) — retry right after using the car"},
             status_code=503)
     # 2/3 are the SIGNED pair, 3724/3725 the unsigned magnitudes (2190/2191 fallbacks). The signed
     # ids were missing from this list — the one endpoint written to debug a sign bug didn't show
-    # the sign (#158). `parsed` now goes through the same resolver that writes the position row,
-    # so what you read here is what Mate would store.
+    # the sign (#158). `parsed` goes through the same resolver that writes the position row, with
+    # this car's own sign, so what you read here is what Mate would store.
     gps_ids = ("2", "3", "3724", "3725", "2190", "2191")
     return JSONResponse({
         "gps_signals": {k: sig.get(k) for k in gps_ids if k in sig},
-        "parsed": {"latitude":  db_reader._coord_from_signals(sig, "lat"),
-                   "longitude": db_reader._coord_from_signals(sig, "lon")},
-        "remembered_sign": {"lat": db_reader.get_setting("gps_lat_sign", "unknown"),
-                            "lon": db_reader.get_setting("gps_lon_sign", "unknown")},
+        "parsed": dict(zip(("latitude", "longitude"), db_reader.position_from_signals(sig, vin))),
+        "remembered_sign": db_reader.remembered_signs(vin),
         "all_signals": sig,
     })
 
@@ -4334,11 +5283,15 @@ async def diagnostics_bundle(parts: str = "info,poller,web,signals"):
     coordinates stripped → the whole bundle is safe to share publicly. When 'signals' is selected
     we do one live fetch (same as the Refresh button) so the dump reflects the car's current state."""
     sel = [p.strip() for p in parts.split(",") if p.strip()]
-    signals = None
+    signals = vin = None
     if "signals" in sel:
         import asyncio
-        signals = await asyncio.get_event_loop().run_in_executor(None, command_client.get_fresh_signals)
-    body = diagnostics.build_bundle(MATE_VERSION, parts=sel, signals=signals)
+        # One car for the read and for the sign it is read with: the picker can move while the
+        # cloud answers (#338).
+        vin = (db_reader.get_vehicle()[0] or {}).get("vin")
+        signals = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: command_client.get_fresh_signals(vin))
+    body = diagnostics.build_bundle(MATE_VERSION, parts=sel, signals=signals, vin=vin)
     # The bundle is now days of logs; ship it zipped (plain text → ~10× smaller) so it stays a small
     # attachment on a GitHub issue. One entry, same redaction already applied to `body`.
     import io, zipfile
@@ -4427,7 +5380,7 @@ _COMMANDS = {
     "seat_vent_driver_off": command_client.seat_vent_driver_off,
     # Staged but NOT surfaced in any UI — the B10 accepts these yet doesn't actuate
     # them (like the old A/C-off). Kept wired so they can be exposed instantly if a
-    # future leapmotor-api / vehicle update makes them work.
+    # future cloud / vehicle update makes them work.
     "battery_preheat_off": command_client.battery_preheat_off,
     "sentry_on":         command_client.sentry_on,
     "sentry_off":        command_client.sentry_off,
@@ -4440,7 +5393,7 @@ async def cmd_grid(request: Request):
     vin = vehicle.get("vin") if vehicle else None
     comfort = _comfort_rows(vin, (vehicle or {}).get("car_type", ""))
     return templates.TemplateResponse(request, "partials/cmd_grid.html", _ctx(
-        status=status, comfort=comfort, **_wins_ctx(),
+        vin=vin, status=status, comfort=comfort, **_wins_ctx(),
         ac_off_shown=capability_profile.command_shown(vin, "climate_off"),
         is_t03=(vehicle.get("car_type") or "").upper() == "T03" if vehicle else False,
     ))
@@ -4509,10 +5462,13 @@ async def set_climate_temp_api(request: Request):
 
 @app.post("/api/climate-fan", response_class=HTMLResponse)
 async def set_fan_level_api(request: Request):
-    """Set the A/C fan level 1-7 (signal 1941), preserving the current mode / recirc / temp."""
+    """Set the A/C fan to one of the car's speeds (signal 1941), preserving the current mode / recirc / temp."""
     form = await request.form()
+    from ui_command_access import fan_top
+    vehicle, settings = db_reader.get_vehicle()
+    top = fan_top((vehicle or {}).get("vin"), settings.get)
     try:
-        level = max(1, min(int(form.get("level", 0)), 7))
+        level = max(1, min(int(form.get("level", 0)), top))
     except (TypeError, ValueError):
         return HTMLResponse('<span style="color:#ef4444">✗</span>', status_code=400)
     import asyncio
@@ -4521,7 +5477,7 @@ async def set_fan_level_api(request: Request):
     if ok:
         import time
         db_reader.boost_selected_car(60)   # re-poll THIS car within seconds, not 30s
-        return HTMLResponse(f'<span style="color:#22c55e">✓ {level}/7</span>')
+        return HTMLResponse(f'<span style="color:#22c55e">✓ {level}/{top}</span>')
     return HTMLResponse(_cmd_error_html(msg))
 
 
@@ -4547,8 +5503,10 @@ async def poll_settings(request: Request):
     these up live on its next cycle."""
     form = await request.form()
     try:
-        parked = max(10, min(int(form.get("poll_parked", 30)), 600))
-        driving = max(10, min(int(form.get("poll_driving", 10)), 60))
+        lo, hi = db_reader.POLL_PARKED_RANGE_S
+        parked = max(lo, min(int(form.get("poll_parked", db_reader.POLL_PARKED_DEFAULT_S)), hi))
+        lo, hi = db_reader.POLL_DRIVING_RANGE_S
+        driving = max(lo, min(int(form.get("poll_driving", db_reader.POLL_DRIVING_DEFAULT_S)), hi))
     except (ValueError, TypeError):
         return HTMLResponse('<span style="color:#ef4444">Invalid value</span>', status_code=400)
     db_reader.set_setting("poll_parked", str(parked))
@@ -4624,17 +5582,16 @@ async def capacity_settings(request: Request):
         nominal = max(10.0, min(float(_typed), 200.0)) if _typed else None
     except (ValueError, TypeError):
         return HTMLResponse('<span style="color:#ef4444">Invalid value</span>', status_code=400)
-    if nominal is not None:
+    if nominal is None:
+        # Sent empty: keep the car's reference, or snapshot the capacity being replaced, its own.
+        nominal = db_reader.get_soh_reference_kwh() or db_reader.get_battery_capacity_kwh()
+    # The install-wide values predate the per-car columns and are the first car's fallback. Written
+    # from another car they became every car's SoH reference (#472, a B10 and a B03X).
+    if db_reader.selected_is_first_vehicle():
         db_reader.set_setting("battery_capacity_nominal_kwh", str(nominal))
-    elif not db_reader.get_setting("battery_capacity_nominal_kwh", ""):
-        db_reader.set_setting("battery_capacity_nominal_kwh",
-                              db_reader.get_setting("battery_capacity_kwh", str(kwh)))
-    db_reader.set_setting("battery_capacity_kwh", str(kwh))
-    # Mirror onto the car's own row so the poller's per-vehicle energy math honours the override
-    # (it reads vehicles.capacity_kwh, not the global setting). No-op on single-car beyond keeping
-    # the two in sync; multi-car will target the selected vehicle.
-    _nom = db_reader.get_setting("battery_capacity_nominal_kwh", "")
-    db_reader.set_vehicle_capacity_current(kwh, float(_nom) if _nom else None)
+        db_reader.set_setting("battery_capacity_kwh", str(kwh))
+    # The car's own row is what the poller's energy math and the health page read.
+    db_reader.set_vehicle_capacity_current(kwh, nominal)
     # Somebody has now chosen this car's pack, which is the question the "never set up" strip asks.
     # Before v3.14.1 only the wizard could answer it, so a car corrected properly from here went on
     # being accused — @cookingeek, on the first install with two real cars.
@@ -4650,11 +5607,9 @@ async def boost(seconds: int = _BOOST_DEFAULT_S):
     """Trigger fast (10s) polling for a window, so the poller catches a trip start that
     would otherwise be missed during deep sleep. Meant to be called when you get in the
     car (e.g. an iPhone Bluetooth shortcut, relayed by HA on the LAN — Mate stays local).
-    Coordinated with the poller via settings['boost_until']."""
-    import time
+    It can't tell which car you got into, so every car is sped up (db_reader.boost_every_car)."""
     seconds = max(30, min(int(seconds or _BOOST_DEFAULT_S), 1800))
-    until = time.time() + seconds
-    db_reader.set_setting("boost_until", str(until))
+    db_reader.boost_every_car(seconds)
     return {"status": "boost on", "seconds": seconds}
 
 
@@ -4665,7 +5620,21 @@ async def get_charge_plan():
     return plan or {}
 
 
-_energy_cache: dict = {"data": None, "ts": 0.0}
+def _car_slot(cache: dict) -> dict:
+    """Il posto di QUESTA auto dentro una cache a slot lungo (6 h).
+
+    `_energy_cache`, `_rank_cache` e `_cum_cache` tenevano un `data` solo per tutto l'account: la
+    rastrellata della #253 ha messo l'auto davanti alle nove chiavi di `_period_cache` e non ha
+    raccolto queste tre, che stanno venti righe più sotto e hanno una forma diversa. Il danno è lo
+    stesso — apri le Statistiche della C10, passi alla T03 e leggi i chilowattora e i chilometri di
+    tutta la vita della C10 sotto il nome della T03 — ma dura **sei ore** invece di trenta minuti.
+
+    Stessa chiave di `_pcache_key`, così l'auto la nomina un posto solo.
+    → [[feedback-gate-a-feature-find-every-copy]]"""
+    return cache.setdefault(_pcache_key("slot"), {"data": None, "ts": 0.0})
+
+
+_energy_cache: dict = {}
 
 
 @app.get("/api/energy-breakdown", response_class=HTMLResponse)
@@ -4673,30 +5642,32 @@ async def energy_breakdown(request: Request, refresh: int = 0):
     """Last-week energy split (driving / A/C / other) as an HTML partial. Cached 6h
     (weekly data changes slowly) to avoid an API call on every Statistics page load."""
     import time, asyncio
-    if refresh or not _energy_cache["data"] or time.time() - _energy_cache["ts"] >= 6 * 3600:
+    slot = _car_slot(_energy_cache)
+    if refresh or not slot["data"] or time.time() - slot["ts"] >= 6 * 3600:
         data = await asyncio.get_event_loop().run_in_executor(None, command_client.get_energy_breakdown)
         if data:
-            _energy_cache["data"] = data
-            _energy_cache["ts"] = time.time()
-    return templates.TemplateResponse(request, "partials/energy_breakdown.html", _ctx(eb=_energy_cache["data"]))
+            slot["data"] = data
+            slot["ts"] = time.time()
+    return templates.TemplateResponse(request, "partials/energy_breakdown.html", _ctx(eb=slot["data"]))
 
 
-_rank_cache: dict = {"data": None, "ts": 0.0}
+_rank_cache: dict = {}
 
 
 @app.get("/api/consumption-rank", response_class=HTMLResponse)
 async def consumption_rank(request: Request, refresh: int = 0):
     """6-week consumption trend (kWh/100km) + driver ranking, as an HTML partial. Cached 6h."""
     import time, asyncio
-    if refresh or not _rank_cache["data"] or time.time() - _rank_cache["ts"] >= 6 * 3600:
+    slot = _car_slot(_rank_cache)
+    if refresh or not slot["data"] or time.time() - slot["ts"] >= 6 * 3600:
         data = await asyncio.get_event_loop().run_in_executor(None, command_client.get_consumption_rank)
         if data:
-            _rank_cache["data"] = data
-            _rank_cache["ts"] = time.time()
-    return templates.TemplateResponse(request, "partials/consumption_rank.html", _ctx(cr=_rank_cache["data"]))
+            slot["data"] = data
+            slot["ts"] = time.time()
+    return templates.TemplateResponse(request, "partials/consumption_rank.html", _ctx(cr=slot["data"]))
 
 
-_cum_cache: dict = {"data": None, "ts": 0.0}
+_cum_cache: dict = {}
 
 
 @app.get("/api/cumulative-summary", response_class=HTMLResponse)
@@ -4704,12 +5675,13 @@ async def cumulative_summary(request: Request, refresh: int = 0):
     """Since-delivery cumulative totals from the cloud (total energy incl. parked, mileage, lifetime
     kWh/100km, driving vs parked split), as an HTML partial. Lifetime data → cached 6h."""
     import time, asyncio
-    if refresh or not _cum_cache["data"] or time.time() - _cum_cache["ts"] >= 6 * 3600:
+    slot = _car_slot(_cum_cache)
+    if refresh or not slot["data"] or time.time() - slot["ts"] >= 6 * 3600:
         data = await asyncio.get_event_loop().run_in_executor(None, command_client.get_cumulative_summary)
         if data is not None:
-            _cum_cache["data"] = data
-            _cum_cache["ts"] = time.time()
-    return templates.TemplateResponse(request, "partials/cumulative_summary.html", _ctx(cs=_cum_cache["data"]))
+            slot["data"] = data
+            slot["ts"] = time.time()
+    return templates.TemplateResponse(request, "partials/cumulative_summary.html", _ctx(cs=slot["data"]))
 
 
 _period_cache: dict = {}
@@ -4758,10 +5730,12 @@ async def plugin_consumption(request: Request, refresh: int = 0):
     return templates.TemplateResponse(request, "partials/plugin_consumption.html", _ctx(pc=pc))
 
 
-def _enrich_eb_with_trip_totals(eb: "dict | None", begin_ts: int, end_ts: int) -> "dict | None":
+def _enrich_eb_with_trip_totals(eb: "dict | None", begin_ts: int, end_ts: int,
+                                battery_only: bool = False) -> "dict | None":
     """Add local distance/duration/average-kWh-per-100km to a getEC breakdown, computed from
     trips in the SAME window — mirrors the car's own "since last charge" screen (Distanza/Durata/
-    Media shown next to the same Guida/AC/Altro split). No-op when there's no energy to average.
+    Media shown next to the same Guida/AC/Altro split). No-op when the cloud gave no answer; a
+    total of 0.0 is an answer, and goes through the same check against Mate's own trips.
 
     Guard (GitHub #105): the cloud getEC total covers the car's WHOLE life, Mate's trips table
     only starts at install. A window that begins before the first recorded trip would pair
@@ -4769,7 +5743,7 @@ def _enrich_eb_with_trip_totals(eb: "dict | None", begin_ts: int, end_ts: int) -
     in the report). For such windows the split is returned WITHOUT distance/duration/average;
     `trips_since` carries the first-trip date so the template can say why. 1 day of slack keeps
     the Trips-page all-time card (window begins at the first trip's local midnight) enriched."""
-    if not eb or not eb.get("total_kwh"):
+    if not eb:
         return eb
     first_ts = db_reader.get_first_trip_ts()
     if first_ts is not None and begin_ts < first_ts - 86400:
@@ -4779,8 +5753,75 @@ def _enrich_eb_with_trip_totals(eb: "dict | None", begin_ts: int, end_ts: int) -
     tot = db_reader.get_trip_totals_between(begin_ts, end_ts)
     dist_km = tot.get("distance_km") or 0
     eb = {**eb, "distance_km": dist_km, "duration_min": tot.get("duration_min") or 0}
-    if dist_km > 0:
-        eb["avg_kwh100"] = round(eb["total_kwh"] / dist_km * 100, 1)
+    # The average divides by the kilometres the ENERGY speaks for, not by every kilometre driven
+    # (beta #40 @michapr). getEC covers only the trips the cloud saw: on his two months, 992 km of
+    # 1172, so 106.20 kWh came out as 9.1 kWh/100 km — BELOW both of the months it averages, which
+    # divide by their own covered distance and say so ("over 395 km of 416"). His bundle also
+    # settles the obvious worry about mixing sources: the cloud's window total is exactly the sum of
+    # the months' getEC, so only the denominator ever differed.
+    #
+    # Falls back to the whole distance when nothing carries a cloud figure: dividing by zero prints
+    # nothing at all, and a card with a distance and no average is worse than one whose average is
+    # the only basis available.
+    #
+    # ⚠️ On a RANGE-EXTENDER neither of those is the right pair, and the card said so out loud for a
+    # day: getEC measures the energy that LEAVES THE BATTERY, never what the generator sends past
+    # the pack to the wheels. A mixed trip therefore HAS a getEC figure — it lands inside `ec_km`
+    # — while an engine moved most of it. Measured on three owners' bundles, the trips with the
+    # generator running read 4.8 (@michapr) and 6.5 (@pdifeo) kWh/100 km against 14.3 and 16.1 on
+    # the same cars without it; no car does 4.8. Diluted, this card printed 10.7 over 992 km where
+    # Statistics printed 14.3 over 625 — two numbers for one month, 33 % apart, and the same
+    # complaint @michapr has now made three times (beta #11, #24, #41). So the STATISTICS card
+    # divides Mate's OWN battery-only pair, exactly as the rest of that page does: `energy_kwh`
+    # over `eff_km`, the trips carrying an efficiency, which Mate blanks for every generator trip.
+    #
+    # ⚠️ ONLY when the caller asks (`battery_only`, the Statistics route). v3.15.4 put that pair on
+    # every copy of this card for a day, and on the Trips page it sat under a month strip that
+    # divides by the getEC kilometres (beta #24 → #40, @michapr's own design: "the Trips page should
+    # focus solely on the recorded trips") — 14.1 over 252 km printed above 10.1 over 395, two
+    # numbers under one word on one page (beta #41, 02/09). The Trips and Report copies stay on the
+    # beta #40 basis, the one their own strips and tiles use. `avg_kwh100_basis` tells the template
+    # which wording is true for the figure it is printing. A full-electric car carries an
+    # efficiency on every trip, so both pairs agree there.
+    #
+    # ⚠️ And the pair is the MEASURED one: `efficiency_kwh_100km` is written from ΔSoC at trip end
+    # and only overwritten by the cloud's getEC when it arrives, so the plain pair carries an
+    # estimate for every trip the cloud missed — the card would call that "measured" (beta #43
+    # @michapr). When nothing here was measured the branch is simply not taken and the getEC/
+    # distance basis below answers, with its own wording, rather than a battery-only claim about
+    # numbers the cloud never saw.
+    #
+    # ⚠️ And the energy divided is the one THOSE kilometres carry, not the window's (#303
+    # @arzthilfe). beta #40 moved the denominator to `ec_km` while the numerator stayed the cloud's
+    # total for the whole window — an endpoint that answers on DATES and knows nothing about Mate's
+    # trips. The two agreed on his bundle (the window total was exactly the sum of his months'
+    # getEC) and part ways as soon as coverage thins: a trip keeps its kilometres in `distance_km`
+    # but carries no `ec_kwh` when it started before the feature's cutoff, missed the 6-hour
+    # re-fetch window, was never reached by the 4-trips-per-sweep batch, or had its reading refused
+    # as implausible (`get_trips_needing_ec`, `ec_enrich._ec_implausible`). His C10: 30.3 kWh over
+    # the 54 km of 156 that carried a figure — 56.1 kWh/100 km printed for a car doing 20.3, beside
+    # a Distance of 156 km. The error scales as 1/coverage with no ceiling: on this same code, 100
+    # trips with 2 covered print 900.0.
+    # So the pair is `SUM(ec_kwh)` over `ec_km`, one set of trips above and below the line — what
+    # the month and day strips have always divided (`_totals_seal`). Where coverage is whole the
+    # two numerators are the same number, so beta #40 still reads 10.7.
+    ec_km = tot.get("ec_km") or 0
+    ec_kwh = tot.get("ec_kwh_sum") or 0
+    eff_km = tot.get("measured_eff_km") or 0
+    if battery_only and db_reader.is_reev_car() and eff_km > 0:
+        eb["avg_kwh100"] = round(tot["measured_energy_kwh"] / eff_km * 100, 1)
+        eb["avg_kwh100_km"] = eff_km
+        eb["avg_kwh100_basis"] = "battery"
+    else:
+        # ONE guard: `ec_km` and `ec_kwh` are summed under the SAME predicate (a getEC figure, a 0.0
+        # the battery vouches for included), so a covered distance always comes with the energy the
+        # cloud gave for it. A second `ec_kwh > 0` here said nothing — a mutation removing it
+        # survived every test, which is how a guard announces it has no behaviour of its own.
+        basis_kwh, basis_km = (ec_kwh, ec_km) if ec_km > 0 else (eb["total_kwh"], dist_km)
+        if basis_km > 0:
+            eb["avg_kwh100"] = round(basis_kwh / basis_km * 100, 1)
+            eb["avg_kwh100_km"] = basis_km
+            eb["avg_kwh100_basis"] = "getec"
     # The petrol half of the SAME window (@michapr, beta #11). getPlugIn gives both energies
     # measured by the car but only over its own six weeks; a period the reader picked has to be
     # answered from the trips. L/100 km over the generator-on distance, not the whole window —
@@ -4878,7 +5919,7 @@ async def energy_period(request: Request, period: str = "", start: str = "", end
         eb = c["data"]
     eb = _enrich_eb_with_trip_totals(eb, begin_ts, end_ts)
     return templates.TemplateResponse(request, "partials/energy_breakdown.html",
-                                      _ctx(eb=eb, eb_label=label))
+                                      _ctx(eb=eb, eb_label=label, is_reev=db_reader.is_reev_car()))
 
 
 @app.get("/api/energy-since-charge", response_class=HTMLResponse)
@@ -4908,9 +5949,9 @@ async def energy_since_charge(request: Request, refresh: int = 0):
         eb = data if data is not None else (c["data"] if c else None)
     else:
         eb = c["data"]
-    eb = _enrich_eb_with_trip_totals(eb, begin_ts, end_ts)
+    eb = _enrich_eb_with_trip_totals(eb, begin_ts, end_ts, battery_only=True)
     return templates.TemplateResponse(request, "partials/energy_breakdown.html",
-                                      _ctx(eb=eb, eb_label=label))
+                                      _ctx(eb=eb, eb_label=label, is_reev=db_reader.is_reev_car()))
 
 
 def _report_month_bounds(month: str, now: "datetime") -> "tuple[int, int]":
@@ -4956,6 +5997,7 @@ async def report_driving(request: Request, month: str, refresh: int = 0):
     else:
         eb = c["data"]
     eb = _enrich_eb_with_trip_totals(eb, begin_ts, end_ts)
+    # report_driving_energy.html does not carry the coverage line, so it needs no is_reev.
     return templates.TemplateResponse(request, "partials/report_driving_energy.html", _ctx(eb=eb))
 
 
@@ -5017,16 +6059,37 @@ _CAR_PIC_RETRY_S = 600.0
 _car_pic_retry_after = 0.0
 
 
+def _download_car_picture_package(pkg_path: str) -> bytes | None:
+    """The package fresh from the cloud, written over the copy on disk; None when the cloud gave none."""
+    pkg = command_client.get_car_picture_package()
+    if pkg:
+        try:
+            with open(pkg_path + ".tmp", "wb") as f:
+                f.write(pkg)
+            os.replace(pkg_path + ".tmp", pkg_path)     # a request reading it meanwhile gets a whole file
+        except OSError:
+            pass
+        _car_image_memo.clear()
+        car_image.clear_cache()
+    return pkg
+
+
 @app.get("/api/car-picture")
-async def car_picture(refresh: int = 0):
+async def car_picture(refresh: int = 0, still: int = 0):
     """Serve the owner's vehicle image — composed LIVE from the per-vehicle layer package to reflect
     the current state (charge cable, charging animation, trunk), like the official app. The package
     ZIP is cached to disk; a manual ?refresh=1 OR the first request after each restart re-downloads it,
-    so a colour changed on the car gets picked up (#143). Falls back to the cached package, then its
-    static render, then the legacy PNG, on any problem — so the Overview never breaks."""
+    so a colour changed on the car gets picked up (#143) — the latter alongside, when there is a copy to
+    show. Falls back to the cached package, then its static render, then the legacy PNG, on any
+    problem — so the Overview never breaks. ?still=1 leaves out the charging animation, which takes
+    seconds to compose, so the page has a picture meanwhile."""
     global _car_pic_boot_refresh, _car_pic_retry_after
     import asyncio
     pkg_path = _car_picture_pkg_path()
+    if _car_pic_boot_refresh and not refresh and os.path.exists(pkg_path):
+        # With a package on disk the boot refresh runs alongside: the picture shows now, a new colour on a later load.
+        _car_pic_boot_refresh = False
+        asyncio.get_event_loop().run_in_executor(None, _download_car_picture_package, pkg_path)
     # Re-download from the cloud on a manual ?refresh=1, OR once after each (re)start (#143 — the car's
     # colour may have changed since the package was first cached). Every other request serves the disk
     # cache, so this is NOT a continuous refresh: at most one cloud fetch per boot.
@@ -5041,7 +6104,7 @@ async def car_picture(refresh: int = 0):
     if pkg is None:
         fresh_pkg = None
         if refresh or time.monotonic() >= _car_pic_retry_after:      # see _CAR_PIC_RETRY_S above
-            fresh_pkg = await asyncio.get_event_loop().run_in_executor(None, command_client.get_car_picture_package)
+            fresh_pkg = await asyncio.get_event_loop().run_in_executor(None, _download_car_picture_package, pkg_path)
             _car_pic_retry_after = 0.0 if fresh_pkg else time.monotonic() + _CAR_PIC_RETRY_S
         if want_fresh:
             # Attempted the once-per-boot refresh (success or not) → don't re-poll a down cloud on
@@ -5049,13 +6112,6 @@ async def car_picture(refresh: int = 0):
             _car_pic_boot_refresh = False
         if fresh_pkg:
             pkg = fresh_pkg
-            try:
-                with open(pkg_path, "wb") as f:
-                    f.write(pkg)
-            except OSError:
-                pass
-            _car_image_memo.clear()
-            car_image.clear_cache()
         elif want_fresh and os.path.exists(pkg_path):
             # Forced/boot refresh but the cloud is unreachable → keep the cached image, don't go blank.
             try:
@@ -5070,10 +6126,13 @@ async def car_picture(refresh: int = 0):
         return Response(status_code=404)
 
     status = db_reader.get_latest_status() or {}
+    if still and status.get("charging"):
+        status = {**status, "charging": False, "cable_connected": True}    # the cable without its animation
     # The VIN is part of the key, not decoration: two cars parked with everything shut share a body
     # state, so a memo keyed on the state alone served the second car the first one's picture.
-    sig = (_selected_vin_for_assets(),) + tuple(bool(status.get(k)) for k in (
-        "plug_connected", "charging", "trunk_open",
+    # The package is in it too: a picture composed from the old one while a new one arrives must not stay.
+    sig = (_selected_vin_for_assets(), len(pkg), hash(pkg)) + tuple(bool(status.get(k)) for k in (
+        "cable_connected", "charging", "trunk_open",
         "door_driver_open", "door_passenger_open", "door_rear_left_open", "door_rear_right_open",
         "window_fl_open", "window_rl_open"))
     if not refresh and sig in _car_image_memo:
@@ -5094,6 +6153,15 @@ async def car_picture(refresh: int = 0):
         return Response(status_code=404)
 
 
+def _simple_charge_scheduler() -> bool:
+    """Whether the car has the simple charge scheduler (a start time and a target: the T03). Its
+    declared abilities decide, as they decide which form the Charges page shows (#146, #380); a car
+    that declared none is not taken for one."""
+    veh, _ = db_reader.get_vehicle()
+    return not capability_profile.charge_schedule_advanced(
+        capability_profile.parse_abilities((veh or {}).get("abilities")))
+
+
 @app.post("/api/charge-limit", response_class=HTMLResponse)
 async def set_charge_limit(request: Request):
     form = await request.form()
@@ -5104,8 +6172,9 @@ async def set_charge_limit(request: Request):
     if not (50 <= percent <= 100):
         return HTMLResponse('<span style="color:#ef4444">Must be 50–100%</span>', status_code=400)
     import asyncio
+    simple = _simple_charge_scheduler()
     ok, msg = await asyncio.get_event_loop().run_in_executor(
-        None, lambda: command_client.set_charge_limit(percent)
+        None, lambda: command_client.set_charge_limit(percent, simple=simple)
     )
     if ok:
         # Mirror the new limit into settings so the Overview hero shows the right "to X%" at once,
@@ -5146,16 +6215,15 @@ async def save_charge_schedule_api(request: Request):
         return HTMLResponse(f'<span style="color:#ef4444">✗ {t("sched_bad_time")}</span>', status_code=400)
     if not (50 <= soc <= 100):
         return HTMLResponse('<span style="color:#ef4444">✗ 50–100%</span>', status_code=400)
+    simple = _simple_charge_scheduler()
     ok, msg = await asyncio.get_event_loop().run_in_executor(
         None, lambda: command_client.save_charge_schedule(
-            enabled=enabled, soc_limit=soc, start_time=start, end_time=end, cycles=cycles))
+            enabled=enabled, soc_limit=soc, start_time=start, end_time=end, cycles=cycles, simple=simple))
     if ok:
         # Refresh the Overview's cached window straight away (#173). The poller re-reads it from the
         # car only every 30 min; without this the chip would keep showing the OLD times right after
         # you changed them here, which reads as a bug rather than as a cache.
-        db_reader.set_setting("charge_sched_enabled", "1" if enabled else "0")
-        db_reader.set_setting("charge_sched_start", start)
-        db_reader.set_setting("charge_sched_end", end)
+        db_reader.set_charge_schedule_window(enabled, start, end)
         return HTMLResponse(f'<span style="color:#22c55e">✓ {t("sched_saved")}</span>',
                             headers={"HX-Trigger": "chargeScheduleSaved"})
     return HTMLResponse(_cmd_error_html(msg))
@@ -5346,8 +6414,8 @@ _OPTIMISTIC = {
     # closed — the Overview "Finestrini aperti N" badge flips with the state instead of lagging.
     "open_windows":  {"windows_open": 1, "windows_open_count": 4, "window_fl_open": 1, "window_rl_open": 1},
     "close_windows": {"windows_open": 0, "windows_open_count": 0, "window_fl_open": 0, "window_rl_open": 0},
-    "open_sunshade": {"sunshade_open": 1},
-    "close_sunshade":{"sunshade_open": 0},
+    "open_sunshade": {"sunshade_pct": 100},
+    "close_sunshade":{"sunshade_pct": 0},
 }
 
 # Climate tiles: a tile that's ON is turned off by sending ac_switch (best-effort —
@@ -5379,7 +6447,7 @@ _FIELD_CHECK = {
     "is_locked":       lambda sig: int(sig.get("1298") or 0) == 1,
     "trunk_open":      lambda sig: int(sig.get("1281") or 0) != 0,
     "windows_open":    _windows_open_now,
-    "sunshade_open":   lambda sig: int(sig.get("1724") or 0) != 0,   # 1724 = shade opening % (0 = closed)
+    "sunshade_pct":    lambda sig: int(sig.get("1724") or 0),   # 1724 = shade opening % (0 = closed)
     "climate_on":      lambda sig: int(sig.get("1938") or 0) == 1,
     "climate_cooling": lambda sig: int(sig.get("2669") or 0) == 2,
     "climate_heating": lambda sig: int(sig.get("2681") or 0) == 2,
@@ -5408,19 +6476,27 @@ def _cmd_error_html(msg: str) -> str:
         return f'<span data-warn="1" style="color:#fbbf24">⏱️ {t("cmd_timeout_car")}</span>'
     if outcome == "cloud_unreachable":
         return f'<span data-warn="1" style="color:#fbbf24">📡 {t("cmd_cloud_unreach")}</span>'
-    return f'<span style="color:#ef4444">✗ {msg}</span>'
+    # The message is the cloud's answer or an exception's text, and htmx puts this into the page:
+    # escaped, it is shown as written and never run.
+    from html import escape as _esc
+    return f'<span style="color:#ef4444">✗ {_esc(str(msg))}</span>'
 
 
 def _command_confirmed(expected: dict, signals: dict) -> bool:
-    """True when the live signals match every expected field (empty expected → True)."""
+    """True when the live signals match every expected field (empty expected → True). A flag matches
+    as on/off; a level (the sunshade's percent) only once it reaches the value asked for."""
     for field, want in expected.items():
         checker = _FIELD_CHECK.get(field)
-        if checker and bool(checker(signals)) != bool(want):
+        if checker is None:
+            continue
+        got = checker(signals)
+        if (bool(got) != bool(want)) if isinstance(got, bool) else got != want:
             return False
     return True
 
 
-def _post_command_refresh(expected: dict, epoch: int, delay: int = 3, deadline_s: int = 30):
+def _post_command_refresh(expected: dict, epoch: int, delay: int = 3, deadline_s: int = 30,
+                          vin: str | None = None):
     """Verify a command against the car, polling until it confirms or we give up.
 
     The Leapmotor cloud often hasn't ingested the new state a few seconds after a
@@ -5431,22 +6507,25 @@ def _post_command_refresh(expected: dict, epoch: int, delay: int = 3, deadline_s
     stale, 2nd/3rd tap "fixing" it). Instead we keep the optimistic overlay alive and
     retry until the cloud agrees, only persisting a sample once it confirms — or, on
     timeout, accept reality (the command most likely didn't take).
+
+    `vin` is the car the command went to: every read and every write here is that car's, wherever
+    the picker goes in the meantime (#338).
     """
     start = time.time()
     time.sleep(delay)
     while True:
         if _command_epoch != epoch:          # a newer command owns the state now
             return
-        signals = command_client.get_fresh_signals()
+        signals = command_client.get_fresh_signals(vin)
         if signals and _command_confirmed(expected, signals):
-            db_reader.save_fresh_signals(signals)     # truth matches the expectation
+            db_reader.save_fresh_signals(signals, vin)     # truth matches the expectation
             return
         if time.time() - start >= deadline_s:
             # Gave up waiting: show reality rather than a stuck optimistic overlay.
             if _command_epoch == epoch:
                 db_reader.clear_optimistic_status()
                 if signals:
-                    db_reader.save_fresh_signals(signals)
+                    db_reader.save_fresh_signals(signals, vin)
             return
         db_reader.extend_optimistic_status()  # keep the overlay alive across the wait
         time.sleep(4)
@@ -5502,20 +6581,20 @@ async def run_command(name: str, request: Request, background_tasks: BackgroundT
                              payload={"ok": False, "error": "unknown_command"})
 
     # Ability gate (defence in depth, mirrors the hidden button): refuse a command the car doesn't
-    # declare it can do — e.g. unlock-charge-cable on a T03, which never declares code 53 (#142) —
-    # instead of bouncing a no-op off the car. Only the ability-gated commands (COMMAND_ABILITY keys)
-    # look up the vehicle, so every other command's path is untouched. None abilities → allowed.
-    if name in capability_profile.COMMAND_ABILITY:
-        _veh, _ = db_reader.get_vehicle()
-        if not capability_profile.command_shown(
-                (_veh or {}).get("vin", ""), name,
-                abilities=capability_profile.parse_abilities((_veh or {}).get("abilities"))):
-            _msg = {"it": "Non supportato su questo modello", "fr": "Non pris en charge sur ce modèle",
-                    "de": "Von diesem Modell nicht unterstützt"}.get(
-                        db_reader.get_language(), "Not supported on this model")
-            return _cmd_response(request, status=400,
-                                 payload={"ok": False, "error": _msg, "unsupported": True},
-                                 html=f'<span data-warn="1" style="color:#fbbf24">⚠️ {_msg}</span>')
+    # declare it can do — e.g. unlock-charge-cable on a T03, which never declares code 48 (#142) —
+    # instead of bouncing a no-op off the car. Every command looks the vehicle up: the cloud's own
+    # per-vehicle data decides what is shown and what is sent. None abilities → allowed.
+    _veh, _ = db_reader.get_vehicle()
+    if not capability_profile.command_shown(
+            (_veh or {}).get("vin", ""), name,
+            abilities=capability_profile.parse_abilities((_veh or {}).get("abilities")),
+            car_type=(_veh or {}).get("car_type", "")):
+        _msg = {"it": "Non supportato su questo modello", "fr": "Non pris en charge sur ce modèle",
+                "de": "Von diesem Modell nicht unterstützt"}.get(
+                    db_reader.get_language(), "Not supported on this model")
+        return _cmd_response(request, status=400,
+                             payload={"ok": False, "error": _msg, "unsupported": True},
+                             html=f'<span data-warn="1" style="color:#fbbf24">⚠️ {_msg}</span>')
 
     # The car locks some controls (sunshade, trunk, windows, lock) while moving —
     # intercept the press and show the same notice the official app does, instead of
@@ -5549,7 +6628,7 @@ async def run_command(name: str, request: Request, background_tasks: BackgroundT
     _last_command_at = time.time()
     # Boost the poller so the car's REAL state is re-polled within a few seconds (not up to 30s).
     # We no longer fake an optimistic state, so the UI must catch up to reality quickly.
-    db_reader.set_setting("boost_until", str(time.time() + 60))
+    db_reader.boost_selected_car(60)
     global _command_epoch
     _command_epoch += 1
     epoch = _command_epoch
@@ -5591,7 +6670,7 @@ async def run_command(name: str, request: Request, background_tasks: BackgroundT
             _veh, _ = db_reader.get_vehicle()
             _optimistic_comfort(_veh.get("vin") if _veh else None, _COMFORT_CMD_OPTIMISTIC[name])
         return _cmd_response(request, payload={"ok": True, "status": "done"},
-                             html='<span style="color:#22c55e">✓ Done</span>')
+                             html='<span data-ok="1" style="color:#22c55e">✓ Done</span>')
 
     import asyncio
     ok, msg = await asyncio.get_event_loop().run_in_executor(None, fn)
@@ -5604,12 +6683,29 @@ async def run_command(name: str, request: Request, background_tasks: BackgroundT
         # Climate commands take several seconds to reflect in signals → show the
         # spinner and refresh from real signals after a delay (like slow commands).
         slow = name in _SLOW_COMMANDS or field is not None
-        background_tasks.add_task(_post_command_refresh, expected, epoch, 12 if slow else 3)
+        refresh_delay = 2
+        background_tasks.add_task(_post_command_refresh, expected, epoch, refresh_delay,
+                                  vin=(_veh or {}).get("vin"))
+        if "cloud accepted" in msg.lower():
+            from html import escape
+            message = i18n.get_t(db_reader.get_language())("command_accepted_unconfirmed")
+            return _cmd_response(request,
+                payload={"ok": True, "status": "accepted_unconfirmed", "message": message},
+                html='<span data-warn="1" data-accepted="1" style="color:#fbbf24">' + escape(message) + '</span>')
         if slow:
             return _cmd_response(request, payload={"ok": True, "status": "pending"},
                 html='<span data-slow="1" style="color:#60a5fa;display:inline-flex;align-items:center;gap:4px"><svg style="animation:spin 1s linear infinite;width:14px;height:14px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg></span><style>@keyframes spin{to{transform:rotate(360deg)}}</style>')
         return _cmd_response(request, payload={"ok": True, "status": "done"},
-                             html='<span style="color:#22c55e">✓ Done</span>')
+                             html='<span data-ok="1" style="color:#22c55e">✓ Done</span>')
+    # The cloud is the authority on what a model has. A refusal with code 40 means this car
+    # has not got this command, so stop offering it — the button would fail every time.
+    refusal = command_client.last_cloud_refusal()
+    if refusal:
+        import ui_command_access
+        refused_vin, code = refusal
+        ui_command_access.remember_refusal(
+            refused_vin, ui_command_access.account_username(db_reader.get_setting),
+            name, code, get_setting=db_reader.get_setting, set_setting=db_reader.set_setting)
     return _cmd_response(request, payload={"ok": False, "error": msg},
                          html=_cmd_error_html(msg))
 
@@ -5622,32 +6718,31 @@ _EU_BATTERY_MAP = battery_packs.EU_BATTERY_MAP
 
 
 def battery_options_for_build() -> dict[str, list[dict]]:
-    """The wizard's battery list, as the build that is serving it is allowed to show it.
+    """The wizard's battery list — every pack, range-extenders included, since 4.7.0.
 
-    REEV packs belong to MateBetaTesterOnly ONLY. The official Mate has no REEV support — its energy
-    pipeline assumes SoC-down = energy-used, which a generator refilling the pack mid-drive breaks —
-    so offering the pack would promise a support that isn't there, and whoever picked it would end up
-    with statistics that quietly don't add up. Both builds ship from this one image, so the split is
-    made here, at runtime, and NOT by removing the packs (that would blind the beta too).
+    ⛔ This used to hide the REEV packs on the official build, because the official Mate had no REEV
+    support: its energy pipeline assumes SoC-down = energy-used, which a generator refilling the pack
+    mid-drive breaks. It has that support now, so hiding the pack no longer protects anybody — it
+    stops a range-extender owner from finishing the wizard at all, which is a worse silence than the
+    one the filter was written to prevent.
 
-    Single source of truth on purpose: the wizard page and the detect-vehicle endpoint both render
-    from this. They used to keep separate copies, which is exactly how the REEV packs stayed in the
-    official wizard for ten days after the gate that was supposed to remove them (#141)."""
-    if research.research_enabled():
-        return _EU_BATTERY_MAP
-    return {ct: [o for o in opts if not o.get("reev")] for ct, opts in _EU_BATTERY_MAP.items()}
+    🔑 Why this function still exists rather than reading the map directly: the wizard page and the
+    detect-vehicle endpoint both render from it. They used to keep separate copies, which is exactly
+    how the REEV packs stayed in the official wizard for ten days after the gate that was supposed to
+    remove them (#141) — and a single source of truth is worth keeping whichever way the answer goes.
+    """
+    return _EU_BATTERY_MAP
 
 
 # ── Setup wizard ─────────────────────────────────────────────────────────────
 
 @app.get("/setup", response_class=HTMLResponse)
 async def setup_page(request: Request):
-    # The battery list is rendered from the server's map (already filtered for this build), so the
-    # official wizard's HTML never even contains the REEV packs — and the page can't drift from what
-    # detect-vehicle answers, since both read battery_options_for_build().
+    # The battery list is rendered from the server's map, range-extender packs included, and the page
+    # draws all of it — so it can't drift from what detect-vehicle answers, since both read
+    # battery_options_for_build().
     return templates.TemplateResponse(request, "setup.html", {
         "battery_options": battery_options_for_build(),
-        "research": research.research_enabled(),
         # Asked here, pre-filled with what Mate detected — see the note in setup_submit. The full
         # grouped list is the same one Settings uses, so the two pickers can never diverge.
         "tz_options": db_reader.timezone_options(),
@@ -5692,50 +6787,31 @@ async def demo_status():
     return JSONResponse({"demo": _IS_DEMO})
 
 
-_DATA_CERT_DIR = os.environ.get("DATA_CERT_DIR", "/data/certs")
+@app.post("/api/setup/application-bundle")
+async def setup_application_bundle(request: Request):
+    from application_bundle import install_bundle, MAX_BYTES
+    form = await request.form()
+    upload = form.get("bundle")
+    if upload is None or not hasattr(upload, "read"):
+        return JSONResponse({"error": "Application bundle required"}, status_code=400)
+    payload = await upload.read(MAX_BYTES + 1)
+    try:
+        from runtime_paths import paths
+        result = await run_in_threadpool(install_bundle, payload, paths().data)
+    except Exception:
+        return JSONResponse({"error": "Invalid application bundle; existing material preserved"}, status_code=400)
+    command_client._session._reset()
+    return JSONResponse({"ok": True, "state": result["state"]})
 
 
 @app.get("/api/setup/cert-status")
 async def cert_status_api():
-    """Whether the app certificate is already available (wizard can skip the cert step)."""
-    return JSONResponse({"present": command_client.certs_present()})
+    """Whether the application material is in place, so the wizard can go to the account step.
 
-
-@app.post("/api/setup/cert")
-async def setup_cert_api(request: Request):
-    """Receive the Leapmotor app certificate + key (file upload or pasted PEM) and store
-    them in the persistent /data/certs dir. The cert is the same for everyone — users get
-    it from github.com/markoceri/leapmotor-certs (documented in the wizard/README)."""
-    form = await request.form()
-
-    async def _read(field_file: str, field_text: str) -> str:
-        f = form.get(field_file)
-        if f is not None and hasattr(f, "read"):
-            return (await f.read()).decode("utf-8", "replace").strip()
-        return (form.get(field_text) or "").strip()
-
-    crt = await _read("crt_file", "crt_pem")
-    key = await _read("key_file", "key_pem")
-
-    if not crt or not key:
-        return JSONResponse({"error": "Both the certificate and the key are required."}, status_code=400)
-    if "-----BEGIN CERTIFICATE-----" not in crt:
-        return JSONResponse({"error": "The certificate file is not a valid PEM (app.crt)."}, status_code=400)
-    if "-----BEGIN" not in key or "PRIVATE KEY" not in key:
-        return JSONResponse({"error": "The key file is not a valid PEM private key (app.key)."}, status_code=400)
-
-    try:
-        os.makedirs(_DATA_CERT_DIR, exist_ok=True)
-        with open(os.path.join(_DATA_CERT_DIR, "app.crt"), "w") as fh:
-            fh.write(crt + "\n")
-        with open(os.path.join(_DATA_CERT_DIR, "app.key"), "w") as fh:
-            fh.write(key + "\n")
-    except OSError as e:
-        return JSONResponse({"error": f"Could not save the certificate: {e}"}, status_code=500)
-
-    # Drop any half-built session so the next call picks up the new cert
-    command_client._session._reset()
-    return JSONResponse({"ok": True})
+    It is installed at startup from the build itself; the user is never asked for a certificate."""
+    from setup_readiness import readiness
+    from runtime_paths import paths
+    return JSONResponse(readiness(command_client.cert_dir(), parameters_directory=paths().data / 'api-v2-private'))
 
 
 @app.post("/api/setup/detect-vehicle")
@@ -5792,7 +6868,7 @@ def apply_setup_vehicles(cars: list[dict]) -> int:
             db_reader.set_vehicle_capacity(vin, kwh)
         pin = (car.get("pin") or "").strip()
         if pin:
-            db_reader.set_secret(f"leapmotor_pin_{key}", pin)
+            db_reader.set_operate_pin(pin, vin)
         db_reader.set_setting(f"is_reev_{key}",
                               "1" if str(car.get("is_reev")) in ("1", "on", "true") else "0")
         db_reader.set_setting(f"vehicle_setup_done_{key}", "1")
@@ -5837,20 +6913,19 @@ async def setup_submit(request: Request):
 
     db_reader.set_setting("leapmotor_user", user)
     db_reader.set_secret("leapmotor_pass", pwd)
-    db_reader.set_secret("leapmotor_pin", pin)
     db_reader.set_setting("battery_capacity_kwh", str(battery_kwh))
     db_reader.set_setting("is_reev", is_reev)   # REEV variant selected in the wizard → gates fuel features
-    db_reader.set_setting("language", lang if lang in ("en", "it", "fr", "de", "pl", "pt-PT", "nl", "es") else "en")
+    db_reader.set_setting("language", lang if lang in ("en", "it", "fr", "de", "pl", "pt-PT", "nl", "es", "cs") else "en")
     # set_timezone validates against the tz database and falls back to Auto on anything unknown, so
     # a tampered field cannot wedge every date render. Marked as pinned either way, so the startup
     # migration never comes back and overwrites a fresh answer with the container's clock.
     db_reader.set_timezone(tz or db_reader.detected_tz_name())
     db_reader.set_setting(db_reader.TZ_PINNED_KEY, "1")
 
-    # Every car the wizard found, each with its OWN pack, range-extender answer and PIN. The
-    # account-wide values written above stay for the single-car install and as the fallback the rest
-    # of the code already knows; these are what a two-car account needs, and what it never had —
-    # before this, car number two was left to the poller and took its model's default.
+    # Every car the wizard found, each with its OWN pack, range-extender answer and PIN (the PIN is
+    # set on the car, so it is only ever stored per car). The account-wide pack and range-extender
+    # values written above stay for the single-car install and as the fallback the rest of the code
+    # already knows; before this, car number two was left to the poller and took its model's default.
     try:
         _cars = json.loads(form.get("vehicles_json") or "[]")
     except (TypeError, ValueError):
@@ -5859,6 +6934,9 @@ async def setup_submit(request: Request):
         _cars = [{"vin": vin, "car_type": car_type, "battery": str(battery_kwh),
                   "is_reev": is_reev, "pin": pin}]
     apply_setup_vehicles(_cars)
+    # Only the cars found take a PIN (with none, the page has said to set it in Settings → Vehicle),
+    # and an older install-wide PIN must never come back to a car after this.
+    db_reader.set_secret("leapmotor_pin", "")
 
     # Completing setup cancels any pending factory reset: the user has intentionally configured
     # this install, so a stray marker (e.g. if a reset's relaunch never fired) must never wipe it.
@@ -5871,7 +6949,17 @@ async def setup_submit(request: Request):
     return RedirectResponse(request.headers.get("x-ingress-path", "") + "/", status_code=303)
 
 
+def _web_listen_host() -> str:
+    """Desktop is local-only; containers must remain reachable through their port mapping."""
+    return "127.0.0.1" if os.environ.get("MATE_DESKTOP") == "1" else "0.0.0.0"
+
+
+# The Supervisor proxies Ingress over a pooled aiohttp client that reuses an idle connection for 15 s;
+# uvicorn's default drops one after 5 s, and a request landing on that mark met a closing socket: 502,
+# command lost. The server has to outlive the client's pool.
+_KEEP_ALIVE_S = 30
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("WEB_PORT", 4000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("main:app", host=_web_listen_host(), port=port, reload=False, timeout_keep_alive=_KEEP_ALIVE_S)

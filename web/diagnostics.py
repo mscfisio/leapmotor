@@ -11,15 +11,21 @@ import json
 import os
 import re
 import sqlite3
+import time
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import db_reader
+import mate_api  # noqa: F401 — the runtime read below (abilities, the account's rights) is on its path
 
 # Coordinate signal IDs stripped from the raw-signal dump before it leaves the box, so the
 # bundle can be shared publicly without revealing where the car (home) is. 3724/3725 = lon/lat,
 # 2190/2191 = fallbacks, 2/3 = the signed pair. Everything else in the dict is non-locating.
 _GPS_SIGNAL_IDS = {"2", "3", "2190", "2191", "3724", "3725"}
+# …and a T03 can send the same coordinates by NAME (its signal map is named, #368): a 4.7.11 bundle
+# posted in public carried a car's exact position under these two keys.
+_GPS_SIGNAL_NAMES = {"latitude", "longitude"}
 
 
 def data_dir() -> Path:
@@ -87,7 +93,28 @@ def _redact(text: str, vin: str | None = None) -> str:
     return text
 
 
-# ── system snapshot ──────────────────────────────────────────────────────────
+def _journal_line(mode) -> str:
+    """The journal mode, and for anything but WAL what it costs — the word alone means nothing to
+    the owner reading their own bundle. Outside WAL, readers block writers, which is how a busy
+    moment becomes `database is locked` and a poller stops storing frames (#338)."""
+    if mode is None:
+        return "unknown (could not be read)"
+    if str(mode).lower() == "wal":
+        return "wal"
+    return (f"⚠️ {mode} — NOT WAL: readers block writers here, so contention surfaces as "
+            "'database is locked'. The filesystem under the database cannot honour WAL "
+            "(a network share usually cannot).")
+
+
+def _car_value(read, default):
+    """A per-car figure for the bundle, or `default` when it is unset or cannot be read."""
+    try:
+        value = read()
+    except Exception:  # noqa: BLE001 — a bundle is taken when things are broken
+        return default
+    return default if value is None else value
+
+
 def build_system_info(version: str) -> dict:
     """Cheap (no live cloud call) support snapshot for the card + the bundle header."""
     vehicle, settings = db_reader.get_vehicle()
@@ -139,16 +166,19 @@ def build_system_info(version: str) -> dict:
         "model": (vehicle or {}).get("car_type") or "—",
         "year": (vehicle or {}).get("year") or "—",
         "vin_masked": mask_vin((vehicle or {}).get("vin")),
-        "battery_kwh": settings.get("battery_capacity_kwh", "—"),
+        "journal_mode": db_reader.journal_mode(),
+        # The selected car's own values, the ones its pages compute with (#472: the install-wide
+        # settings are only the first car's fallback).
+        "battery_kwh": _car_value(db_reader.get_battery_capacity_kwh, "—"),
         # The SoH denominator, snapshotted the first time the capacity is saved. Without it a
         # bundle cannot answer "why is my battery health above 100%" — the number that decides it
         # was simply not in the file (@danielvilhena, #221). Absent means never snapshotted, in
         # which case the health page falls back to the capacity above.
-        "battery_nominal_kwh": settings.get("battery_capacity_nominal_kwh", "— (not set)"),
+        "battery_nominal_kwh": _car_value(db_reader.get_soh_reference_kwh, "— (not set)"),
         "language": settings.get("language", "en"),
         "db_size_mb": round(db_reader.get_db_size_bytes() / 1048576, 1),
         "counts": {"trips": _count("trips"), "charges": _count("charges"),
-                   "positions": _count("positions")},
+                   "positions": _count("positions"), "ha_samples": _count("ha_samples")},
         "poll_parked": settings.get("poll_parked", "30"),
         "poll_driving": settings.get("poll_driving", "10"),
         "retention_days": settings.get("positions_retention_days", "0"),
@@ -234,7 +264,7 @@ def read_full_log(which: str) -> str:
 _BUNDLE_PARTS = ("info", "poller", "web", "signals")   # user-selectable sections
 
 
-def _gps_shape_line(signals: dict) -> str:
+def _gps_shape_line(signals: dict, vin: str | None = None) -> str:
     """Which coordinate signals the car sends, and the hemisphere sign — no coordinates.
 
     Stripping all six GPS ids protects the user's address, but it also blinded triage on the one
@@ -263,11 +293,11 @@ def _gps_shape_line(signals: dict) -> str:
     shapes = ", ".join(f"{i}:{_shape(signals.get(i))}"
                        for i in sorted(_GPS_SIGNAL_IDS, key=int)
                        if signals.get(i) not in (None, ""))
+    signs = db_reader.remembered_signs(vin)
     return (f"signals present : {shapes or 'none'} "
             f"(2/3 = signed · 3724/3725 + 2190/2191 = unsigned magnitudes · "
             f"zero = arrives but says nothing)\n"
-            f"remembered sign : lat={db_reader.get_setting('gps_lat_sign') or 'unknown'} "
-            f"lon={db_reader.get_setting('gps_lon_sign') or 'unknown'} "
+            f"remembered sign : lat={signs['lat']} lon={signs['lon']} "
             f"(learned from a signed poll; unknown = never seen one)")
 
 
@@ -277,7 +307,8 @@ def _signals_section(signals: dict | None, vin: str | None) -> str:
     if not signals:
         return ("(no live signals — car asleep or unreachable; use the car briefly, then download "
                 "again)")
-    clean = {k: v for k, v in signals.items() if k not in _GPS_SIGNAL_IDS}
+    clean = {k: v for k, v in signals.items()
+             if k not in _GPS_SIGNAL_IDS and str(k).lower() not in _GPS_SIGNAL_NAMES}
     return _redact(json.dumps(clean, indent=2, sort_keys=True), vin)
 
 
@@ -366,22 +397,45 @@ def _vampire_section() -> str:
     return "\n".join(out)
 
 
+# A reading farther than this from the day's median odometer is not the car's own: no car drives
+# that far in a day. Before 4.14.1 a reading of the other car on an account could be filed under
+# this one (#338).
+_ODO_DAY_SPREAD_KM = 1500
+
+
 def _soc_daily_section() -> str:
     """Per-day SoC hi→lo + km driven for the last 14 days — reveals the parked-drain pattern and
-    any data gaps behind a 'my history vanished' report (#63)."""
+    any data gaps behind a 'my history vanished' report (#63).
+
+    The km are the spread of the day's readings that carry an odometer (one without is stored as
+    0). A reading farther than _ODO_DAY_SPREAD_KM from the day's median odometer is left out of the
+    day's km and SoC and counted apart, so it still shows: a T03's day read "drove 9228 km", and
+    another "8573 km" with its A10's 96.8 %, on days it drove a dozen (#338)."""
     try:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
         rows = db_reader._get().execute(
-            "SELECT substr(recorded_at,1,10) d, COUNT(*) n, MIN(soc) lo, MAX(soc) hi, "
-            "MIN(odometer_km) o0, MAX(odometer_km) o1 FROM positions "
+            "SELECT substr(recorded_at,1,10) d, soc, odometer_km FROM positions "
             "WHERE vehicle_id = COALESCE(?, vehicle_id) AND soc IS NOT NULL AND recorded_at >= ? "
-            "GROUP BY d ORDER BY d", (db_reader._current_vehicle_id(), cutoff)).fetchall()
+            "ORDER BY recorded_at", (db_reader._current_vehicle_id(), cutoff)).fetchall()
     except Exception as e:  # noqa: BLE001
         return f"(soc-daily failed: {e})"
-    out = []
+    days: dict = {}
     for r in rows:
-        drove = (r["o1"] or 0) - (r["o0"] or 0)
-        out.append(f"  {r['d']}  n={str(r['n']):<5} soc {r['hi']:.1f}→{r['lo']:.1f}  drove {drove:.0f} km")
+        days.setdefault(r["d"], []).append((r["soc"], r["odometer_km"] or 0))
+    out = []
+    for d, readings in days.items():
+        odos = sorted(o for _, o in readings if o > 0)
+        mid = odos[len(odos) // 2] if odos else 0
+        own = [(s, o) for s, o in readings if o <= 0 or abs(o - mid) <= _ODO_DAY_SPREAD_KM]
+        kept = [o for _, o in own if o > 0]
+        drove = max(kept) - min(kept) if kept else 0
+        socs = [s for s, _ in own]
+        line = (f"  {d}  n={str(len(readings)):<5} soc {max(socs):.1f}→{min(socs):.1f}"
+                f"  drove {drove:.0f} km")
+        if len(own) < len(readings):
+            line += (f"  ⚠ {len(readings) - len(own)} reading(s) over {_ODO_DAY_SPREAD_KM} km off the"
+                     " day's odometer, left out (another car's?)")
+        out.append(line)
     return "\n".join(out) or "(no SoC samples in the last 14 days)"
 
 
@@ -518,7 +572,8 @@ def _charges_section() -> str:
         rows = db.execute(
             "SELECT started_at, ended_at, start_soc, end_soc, energy_added_kwh, ac_energy_kwh,"
             "       gross_kwh, cost, charge_type, location_type, max_power_kw, duration_min,"
-            "       reconstructed, wb_stuck_kwh, manual_entry, is_free, id, merged_into_id"
+            "       reconstructed, close_reason, wb_stuck_kwh, wb_dark_min, manual_entry, is_free, id,"
+            "       merged_into_id"
             "  FROM charges WHERE vehicle_id = COALESCE(?, vehicle_id)"
             " ORDER BY started_at DESC LIMIT ?",
             (db_reader._current_vehicle_id(), max(_CHARGES_FLOOR, 400))).fetchall()
@@ -530,7 +585,9 @@ def _charges_section() -> str:
     if len(keep) < _CHARGES_FLOOR:
         keep = rows[:_CHARGES_FLOOR]        # the floor: a fortnight can hold two charges
     out = [f"last {_ROWS_DAYS}d (at least {_CHARGES_FLOOR} rows) · {len(keep)} of {len(rows)} · "
-           "DC=battery AC=meter gross=typed-in · recon/stuck/manual = the three known-defect marks"]
+           "DC=battery AC=meter gross=typed-in · recon/stuck/dark/manual = the known-defect "
+           "marks (dark = minutes the meter went unread, #295) · close = why the charge "
+           "stopped (#289)"]
     for r in keep:
         out.append(
             f"  {(r['started_at'] or '')[:16]} → {_end_hhmm(r['started_at'], r['ended_at']):8} "
@@ -538,7 +595,8 @@ def _charges_section() -> str:
             f"DC={_n(r['energy_added_kwh'])} AC={_n(r['ac_energy_kwh'])} gross={_n(r['gross_kwh'])} "
             f"cost={_n(r['cost'])}  {(r['charge_type'] or '-'):4}/{(r['location_type'] or '-'):6} "
             f"max={_n(r['max_power_kw'], 1)}kW {str(r['duration_min'] or '—'):>4}min  "
-            f"recon={r['reconstructed'] or 0} stuck={_n(r['wb_stuck_kwh'])} "
+            f"recon={r['reconstructed'] or 0} close={r['close_reason'] or '—'} "
+            f"stuck={_n(r['wb_stuck_kwh'])} dark={_n(r['wb_dark_min'], 0)} "
             f"manual={r['manual_entry'] or 0} free={r['is_free'] or 0} "
             # The bundle shows the PIECES, never the composed group: it exists to
             # investigate, and the rows the car reported are the evidence. The marker says
@@ -739,11 +797,37 @@ def _missed_charges_section() -> str:
 
 
 def _abilities_section() -> str:
-    """The car's DECLARED ability codes (leapmotor_api VehicleAbility) — the ground truth for what
+    vehicle, settings = db_reader.get_vehicle()
+    return "\n".join([_declared_abilities(vehicle)] + _account_rights(vehicle, settings))
+
+
+def _account_rights(vehicle, settings) -> list[str]:
+    """What the ACCOUNT may do with this car, as the cloud's vehicle list last gave it (#400). A
+    command needs the account's right beside the car's ability, and an account the car is shared
+    with can hold fewer; with the abilities alone a refused command could not be told from a right
+    the account lacks. Parsed by the client's own reader; the account's hash stays out.
+    The entry's `funcConfig` (the fan's and the temperature's range for remote climate) follows as sent."""
+    try:
+        from ui_command_access import snapshot_key
+        from leapmotor_cloud.mate_compat import Vehicle
+        listed = settings.get(snapshot_key((vehicle or {}).get("vin")))
+        if not listed:
+            return ["rights : (not listed yet — Mate reads them from the cloud's vehicle list at login)"]
+        snapshot = json.loads(listed)
+        car = Vehicle.from_dict(snapshot["vehicle"], is_shared=snapshot["shared"])
+    except Exception as exc:  # noqa: BLE001 — never let a bad snapshot break the diagnostic
+        return [f"rights : (unreadable access snapshot: {type(exc).__name__})"]
+    return [f"rights : {','.join(map(str, sorted(car.rights))) or '(none)'}",
+            f"modules: {','.join(map(str, sorted(car.module_rights))) or '(none)'}",
+            f"shared : {'yes' if car.is_shared else 'no'}",
+            f"funcConfig: {json.dumps(snapshot['vehicle'].get('funcConfig'))}"]
+
+
+def _declared_abilities(vehicle) -> str:
+    """The car's DECLARED ability codes (the cloud's VehicleAbility codes) — the ground truth for what
     THIS model actually supports, so we stop assuming every car has the same commands (#67). Shows the
     raw codes + names and calls out the climate/seat features that differ across models (the T03 lacks
     several the B10/C10 have; also lets us learn a new model like the B05 the moment it connects)."""
-    vehicle, _ = db_reader.get_vehicle()
     raw = (vehicle or {}).get("abilities")
     if not raw:
         return ("(not reported yet — restart the add-on once on this version so the poller stores the "
@@ -754,7 +838,7 @@ def _abilities_section() -> str:
         return f"(unparseable abilities value: {raw!r})"
     known = None
     try:
-        from leapmotor_api.models import VehicleAbility
+        from mate_vehicle_abilities import VehicleAbility
         known = {int(m) for m in VehicleAbility}     # the codes the library can actually name
 
         def _name(c: int) -> str:
@@ -791,11 +875,115 @@ def _abilities_section() -> str:
     return "\n".join(out)
 
 
-def build_bundle(version: str, parts=_BUNDLE_PARTS, lines: int = 300, signals: dict | None = None) -> str:
+def _polling_section() -> str:
+    """Seven days of what the poller got, and the link state as it stands — the figures #300 was
+    answered with by counting log lines. The stored error is cut to its class: it is a message
+    from the cloud, and a message may quote what was sent."""
+    try:
+        p = db_reader.polling_summary()
+    except Exception as exc:  # noqa: BLE001
+        return f"(unavailable: {exc})"
+    head = ("day         polls  current  old  noclock  empty  failed  refused  no-poll-min  "
+            "logins ok p/w  refused p/w")
+    lines = [head]
+    for d in p["days"]:
+        lines.append(f"{d['day']}  {d['polls']:5d}  {d['current']:7d}  {d['old']:3d}  {d['noclock']:7d}  "
+                     f"{d['empty']:5d}  {d['failed']:6d}  {d['refused']:7d}  {d['no_poll_min']:11d}  "
+                     f"{d['login_ok_poller']:6d} / {d['login_ok_web']:<4d}  "
+                     f"{d['login_refused_poller']:4d} / {d['login_refused_web']}")
+    lines.append(f"history from : {p['first_at'] or '—'} (local)")
+    try:
+        link = json.loads(db_reader.get_setting("poll_link", "") or "{}")
+    except ValueError:
+        link = {}
+    reason = str(link.get("reason") or "").split(":")[0][:40] or "—"
+    lines.append(f"link         : {link.get('state') or '—'} since {link.get('since') or '—'} · "
+                 f"{reason} · bad_creds={bool(link.get('bad_creds'))}")
+    try:
+        beat = float(db_reader.get_setting("last_loop_ts", "0") or 0)
+        lines.append(f"heartbeat    : {int(time.time() - beat)} s ago" if beat else "heartbeat    : never")
+    except (TypeError, ValueError):
+        lines.append("heartbeat    : ?")
+    return "\n".join(lines)
+
+
+_CLOUD_LINES = 200   # the list of answers keeps its newest lines, and says how many it left out
+
+
+def _cloud_answers_section() -> str:
+    """What the cloud answered Mate's last requests, from the bridge's record of each answer: time,
+    endpoint, HTTP status and the cloud's code, never a parameter, a VIN or a token. Logins and
+    renewals are listed with the refusals, so the end of a session reads against its start."""
+    from api_v2_bridge import LOGIN_PATH, REFRESH_PATH, recorded_answer_accepted
+    try:
+        db = db_reader._get()
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                          "AND name = 'api_v2_http_log'").fetchone():
+            return "(none recorded)"
+        rows = db.execute("SELECT at, method, path, http_status, api_code "
+                          "FROM api_v2_http_log ORDER BY id").fetchall()
+    except sqlite3.Error as e:
+        return f"(unavailable: {e})"
+    if not rows:
+        return "(none recorded)"
+    answers = defaultdict(Counter)
+    listed = []
+    for r in rows:
+        answer = (r["http_status"], str(r["api_code"]))
+        answers[(r["method"], r["path"])][answer] += 1
+        if r["path"] in (LOGIN_PATH, REFRESH_PATH) or not recorded_answer_accepted(*answer):
+            listed.append(r)
+    width = max(len(path) for _, path in answers)
+    out = [(f"{len(rows)} requests · {(rows[0]['at'] or '')[:19]} → {(rows[-1]['at'] or '')[:19]} · "
+            "per endpoint: HTTP status, cloud code ×times")]
+    for (method, path), seen in sorted(answers.items(), key=lambda item: -item[1].total()):
+        out.append(f"  {seen.total():5d}  {method:4} {path:{width}}  "
+                   + " · ".join(f"{status} {code} ×{n}" for (status, code), n in seen.most_common()))
+    out.append(f"logins, renewals and every answer that was not a success (oldest first, at most {_CLOUD_LINES}):")
+    if len(listed) > _CLOUD_LINES:
+        out.append(f"  … {len(listed) - _CLOUD_LINES} earlier not shown")
+    out += [f"  {(r['at'] or '')[:19]}  {r['method']:4} {r['path']}  {r['http_status']} {r['api_code']}"
+            for r in listed[-_CLOUD_LINES:]]
+    return "\n".join(out)
+
+
+def _cloud_history_section() -> str:
+    """Did the cloud's own trip history arrive, and did it carry fuel? Counts only — this text is
+    attached to public issues. Since 4.5.3 every install stages these records, range-extender
+    accounts included; each one carries `driveReevOil`, the fuel the car's cloud says that drive
+    burned. A report that "the petrol figures are wrong" splits in two here, and the halves have
+    opposite answers: Mate read the field and got it wrong, or the cloud never sent one."""
+    try:
+        s = db_reader.cloud_history_state()
+    except Exception as exc:  # noqa: BLE001
+        return f"(unavailable: {exc})"
+    if not s["staged"]:
+        return ("staged drives : none — the cloud history worker has not stored anything on this "
+                "install\n"
+                f"cloud-linked  : {s['promoted_trips']} trips · import setting "
+                f"{s['import_setting'] if s['import_setting'] is not None else 'unset'}")
+    oil_max = "—" if s["oil_max"] is None else _n(s["oil_max"], 3)
+    return "\n".join([
+        f"staged drives : {s['mileage']} (plus {s['charge']} charge records)",
+        f"window        : {s['first_at'] or '—'} → {s['last_at'] or '—'} (UTC)",
+        # Present-and-zero vs absent: a BEV reports the field on every drive with value 0.0, and
+        # that must not read like a cloud that sent nothing.
+        f"driveReevOil  : {s['oil_present']} of {s['mileage']} carry the field · "
+        f"{s['oil_positive']} of {s['mileage']} above zero · max {oil_max} (unit unverified)",
+        f"cloud-linked  : {s['promoted_trips']} trips · import setting "
+        f"{s['import_setting'] if s['import_setting'] is not None else 'unset'}",
+        f"last sync     : {(s['last_sync'] or '—')[:200]}",
+    ])
+
+
+def build_bundle(version: str, parts=_BUNDLE_PARTS, lines: int = 300, signals: dict | None = None,
+                 vin: str | None = None) -> str:
     """One redacted text blob to attach to an issue. `parts` selects which sections to include
     (any of 'info', 'poller', 'web', 'signals'); a one-line version header is always present. The
     'signals' section dumps the car's raw signals with GPS coordinates stripped (caller passes a
-    freshly-fetched signal dict) so the whole bundle stays safe to share publicly."""
+    freshly-fetched signal dict and `vin`, the car it read them from, so the picker moving during
+    the fetch cannot pair one car's signals with another's sign) so the whole bundle stays safe to
+    share publicly."""
     want = {p for p in parts if p in _BUNDLE_PARTS} or set(_BUNDLE_PARTS)
     out = [f"===== LeapMotor Mate {version} — diagnostics ====="]
 
@@ -807,9 +995,19 @@ def build_bundle(version: str, parts=_BUNDLE_PARTS, lines: int = 300, signals: d
             f"VIN          : {info['vin_masked']}",
             f"Battery kWh  : {info['battery_kwh']}  (SoH reference: {info['battery_nominal_kwh']})",
             f"Language     : {info['language']}",
+            # Mate's own client, the only one since 01/10/2026 (#327 and #338 lived on the other).
+            "Cloud client : independent (mate-api)",
+            # The last sign-in the cloud did not grant, as the bridge recorded it: the stage it failed
+            # at and, since mate-api 0.1.0a15, why the transport failed (dns_failure, timeout…). An
+            # install that could not resolve the cloud's name wrote 9,049 lines no bundle explained
+            # (#381, #384). Absent until a sign-in has failed.
+            *([f"Last sign-in failure : {failure}"]
+              if (failure := db_reader.get_setting("api_v2_login_failure", "")) else []),
             f"DB size (MB) : {info['db_size_mb']}",
+            f"Journal mode : {_journal_line(info['journal_mode'])}",
             f"Rows         : trips={info['counts']['trips']} "
-            f"charges={info['counts']['charges']} positions={info['counts']['positions']}",
+            f"charges={info['counts']['charges']} positions={info['counts']['positions']} "
+            f"ha_samples={info['counts']['ha_samples']}",
             f"Poll (s)     : parked={info['poll_parked']} driving={info['poll_driving']}",
             # 🔴 The floor a charge has to clear to be SEEN. Default 2.0 A; a home AC charge moves
             # the pack at 11-12 A, so anything above that silently stops every charge from being
@@ -848,15 +1046,18 @@ def build_bundle(version: str, parts=_BUNDLE_PARTS, lines: int = 300, signals: d
         out += ["", "----- charges the car took, and what Mate had in hand -----",
                 _missed_charges_section()]
         out += ["", "----- vehicle abilities (what the car DECLARES it can do) -----", _abilities_section()]
+        out += ["", "----- polling (last 7 days, local days) -----", _polling_section()]
+        out += ["", "----- cloud answers (Mate's last requests, UTC) -----", _cloud_answers_section()]
+        out += ["", "----- cloud trip history (staged from Leapmotor) -----",
+                _cloud_history_section()]
     if "poller" in want:
         out += ["", "----- poller log (full retained window) -----", read_full_log("poller")]
     if "web" in want:
         out += ["", "----- web log (full retained window) -----", read_full_log("web")]
     if "signals" in want:
-        vehicle, _ = db_reader.get_vehicle()
+        vin = vin or ((db_reader.get_vehicle()[0] or {}).get("vin"))
         if signals:
-            out += ["", "----- GPS shape (no coordinates) -----", _gps_shape_line(signals)]
-        out += ["", "----- raw signals (GPS removed) -----",
-                _signals_section(signals, (vehicle or {}).get("vin"))]
+            out += ["", "----- GPS shape (no coordinates) -----", _gps_shape_line(signals, vin)]
+        out += ["", "----- raw signals (GPS removed) -----", _signals_section(signals, vin)]
     out += ["", "===== end ====="]
     return "\n".join(out)

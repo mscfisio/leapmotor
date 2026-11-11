@@ -3,7 +3,7 @@
 A `text` entity that takes a JSON plan: {"start","stop","soc","active","days"} — every key optional.
 Whatever you omit KEEPS its current value (read-modify-write), so an automation can send just
 {"start":"23:00"} without disturbing the rest. It never goes through the library's set_charge_limit,
-which wipes start-time-only plans (leapmotor-api #18 — see test_mqtt_charge_limit.py).
+which wipes start-time-only plans (see test_mqtt_charge_limit.py).
 
 The target SoC is the one field we won't invent: when the payload omits it we use the limit the
 poller last read from the car, and if even that is unknown the command is refused.
@@ -17,6 +17,7 @@ import pytest
 
 pytest.importorskip("paho.mqtt.client", reason="poller MQTT bridge needs paho (absent in minimal CI)")
 import mqtt as M
+from cloud_access_fixture import settings
 
 
 class _FakeClient:
@@ -28,7 +29,7 @@ class _FakeClient:
 
 
 def _service(prefix="leapmotor"):
-    svc = M.MqttService("broker", 1883, topic_prefix=prefix, get_setting=lambda k, d="": d)
+    svc = M.MqttService("broker", 1883, topic_prefix=prefix, get_setting=settings("VINTEST"))
     svc.client = _FakeClient()
     return svc
 
@@ -50,7 +51,7 @@ def test_set_topic_routes_to_on_command():
     svc = _service()
     seen = []
     svc.on_command = lambda vin, cmd, val: seen.append((vin, cmd, val))
-    msg = types.SimpleNamespace(topic="leapmotor/VIN9/charge_schedule/set", payload=b'{"soc":90}')
+    msg = types.SimpleNamespace(topic="leapmotor/VIN9/charge_schedule/set", payload=b'{"soc":90}', retain=False)
     svc._on_message(None, None, msg)
     assert seen == [("VIN9", "charge_schedule", '{"soc":90}')]
 

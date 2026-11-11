@@ -50,8 +50,14 @@ def _env():
                              undefined=_Quiet)
     env.filters["money"] = lambda v: f"{v:.2f}"
     env.filters["dec"] = lambda v, n=1: "—" if v is None else f"{float(v):.{n}f}"
+    env.filters["end_time"] = lambda end, start: end[11:16]
     env.filters["dist"] = lambda v, n=1: "—" if v is None else f"{float(v):.{n}f} km"
     env.globals["gross_kwh_ok"] = lambda: True
+    env.globals["charge_energy"] = db_reader.charge_energy_view
+    env.globals["billed_kwh"] = db_reader._billed_kwh
+    env.globals["billed_basis"] = db_reader.billed_basis
+    env.globals["solar_kwh_ok"] = lambda: True
+    env.globals["solar_mode_on"] = lambda: False
     env.globals["dist_unit"] = lambda: "km"
     env.globals["dist_val"] = lambda v, n=1: None if v is None else round(float(v), n)
     return env

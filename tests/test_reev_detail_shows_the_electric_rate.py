@@ -23,6 +23,11 @@ generator drives the wheels without passing through the pack, so 1.8 here and 13
 electric trip are different quantities. Printed under one label they would invite the comparison —
 so it is marked instead (blue, ⚡, beside the litres), which is his own suggestion: *"in brackets or
 in other color to show that it is a calculated value only"*.
+
+📍 18/09/2026 (beta D #31): the card is boxes now — ⚡ and ⛽ side by side — and there is no labelled
+AVG CONSUMPTION tile any more: the ⚡ box prints one consumption line. The rule is unchanged: the
+ordinary line reads only `efficiency_kwh_100km`, and this rate is its own line, blue and marked,
+on the beta build only.
 """
 import pathlib
 import re
@@ -65,9 +70,14 @@ def _render_tile(trip, *, is_reev=True, research=True):
     same note in test_reev_trip_energy_tile_is_getec."""
     jinja2 = pytest.importorskip("jinja2", reason="needs jinja2 to render the partial")
     src = TEMPLATE.read_text()
-    start = src.index("{% if is_reev %}")
-    end = src.index("{% endif %}\n        </div>", start) + len("{% endif %}")
+    # The ⚡ box from its energy figure down to its consumption line — both, because "the kWh is
+    # not reprinted" is a statement about the pair.
+    start = src.index("{% if is_reev %}", src.index("⚡ {{ t('trip_area_electric') }}"))
+    end = src.index("{# The electric half of the money", start)
+    assert "reev_elec_kwh_100km" in src[start:end], "the slice missed the rate line"
     env = jinja2.Environment()
+    env.globals["eff_val"] = lambda v, n=1: v
+    env.globals["eff_unit"] = lambda: "kWh/100km"
     env.filters["dec"] = lambda v, n=1: "—" if v is None else f"{float(v):.{n}f}"
     # The app's `nice`: at most 2 decimals, trailing zeros stripped (web/main._nice). Restated here
     # rather than imported — `web/main` and `poller/main` share a name, and reaching for one of them
@@ -96,9 +106,18 @@ def test_the_two_pages_agree(tmp_path, monkeypatch):
 
 
 def test_the_litres_are_still_printed_beside_it(tmp_path, monkeypatch):
-    """The pair is the answer — the electric half alone would be the same half-story in reverse."""
+    """The pair is the answer — the electric half alone would be the same half-story in reverse.
+
+    📍 "Beside" stopped meaning "in the same 130px cell" with the three-area card (@gm27271, beta
+    #31): the rate is in the ⚡ section and the litres in the ⛽ one, a few lines apart on the same
+    screen. What must not happen is one of them disappearing, so both are still asserted — each
+    where it now lives."""
     visible = _render_tile(_trip(tmp_path, monkeypatch))
-    assert "1.8 kWh/100km" in visible and "L/100km" in visible, visible
+    assert "1.8 kWh/100km" in visible, visible
+    src = TEMPLATE.read_text()
+    fuel = src[src.index("⛽ {{ t('trip_area_fuel') }}"):src.index("{# The generator's distance")]
+    assert "trip.fuel_l_100km" in fuel and "trip.fuel_used_l|nice" in fuel, \
+        "the petrol half of the pair is no longer printed anywhere"
 
 
 # ── and what it must NOT become ───────────────────────────────────────────────
@@ -107,10 +126,18 @@ def test_it_never_lands_in_the_avg_consumption_tile(tmp_path, monkeypatch):
     """⚠️ getEC is what left the BATTERY; the generator's feed to the wheels never passes through
     the pack. Under the AVG CONSUMPTION label this 1.8 would sit where a pure electric trip prints
     13.1 — two quantities, one word. That tile keeps reading `efficiency_kwh_100km`, which the
-    poller withholds on purpose for a generator trip, so it still shows a dash."""
+    poller withholds on purpose for a generator trip, so it still shows a dash.
+
+    📍 Since 18/09 there is no labelled tile: the ⚡ box has ONE consumption line, and the two
+    quantities are the two branches of it — the ordinary one reading only the efficiency, the
+    research one blue and marked, never the other way round."""
     src = TEMPLATE.read_text()
-    tile = src[src.index("{{ t('avg_efficiency') }}"):src.index("{% if is_reev %}")]
-    assert "reev_elec" not in tile, "the electric rate leaked into the AVG CONSUMPTION tile"
+    block = src[src.index("{# The consumption"):src.index("{# The electric half of the money")]
+    ordinary = block[block.index("{% if not (is_reev and trip.engine_ran)"):block.index("{% elif")]
+    research = block[block.index("{% elif"):]
+    assert "reev_elec" not in ordinary, "the electric rate leaked into the ordinary consumption line"
+    assert "reev_elec_kwh_100km" in research and "text-blue-400" in research and "⚡" in research, \
+        "the research rate lost the colour and the mark that set it apart"
     assert _trip(tmp_path, monkeypatch)["efficiency_kwh_100km"] is None
 
 
@@ -123,11 +150,27 @@ def test_the_kwh_total_is_not_reprinted(tmp_path, monkeypatch):
 
 def test_the_official_build_is_left_alone(tmp_path, monkeypatch):
     """`research`-gated to match the trips list exactly. Gating one page and not the other would
-    just move the disagreement to the other build — which is the bug this closes."""
+    just move the disagreement to the other build — which is the bug this closes.
+
+    4.7.0 took the beta gate off the REEV surfaces, and this ⚡ rate was the one figure it did
+    NOT take it off: the litres were calibrated against the owner's own app, this was not. So the
+    row keeps its own `{% if research %}` around the rate while the ⛽ litres beside it ship — and
+    the assertion below reads THAT, not the block gate it used to share.
+
+    ⚠️ It used to end in `or "research" in LIST_ROW.read_text()`, which the word in the partial's
+    own header comment satisfies on its own: after the ungating the test passed while the rate
+    was live on every build."""
     trip = _trip(tmp_path, monkeypatch)
     assert "kWh/100km" not in _render_tile(trip, research=False)
-    assert "{% if is_reev and research and trip.engine_ran %}" in LIST_ROW.read_text() \
-        or "research" in LIST_ROW.read_text(), "the list lost its research gate"
+    row = LIST_ROW.read_text()
+    assert "{% if research %}" in row, \
+        "the list row has no research gate left at all — the electric rate is live on every build"
+    gate = row.index("{% if research %}")
+    rate = row.index("trip.reev_elec_kwh_100km | nice")
+    close = row.index("{% endif %}", row.index("reev_elec_pending"))
+    assert gate < rate < close, "the list lost its research gate on the electric rate"
+    assert row.index("t('reev_engine_ran')") > close, \
+        "the ⛽ litres were swept behind the research gate with it"
 
 
 def test_a_pure_electric_drive_on_a_reev_prints_no_rate(tmp_path, monkeypatch):
@@ -140,12 +183,11 @@ def test_a_pure_electric_drive_on_a_reev_prints_no_rate(tmp_path, monkeypatch):
 
 
 def test_a_car_with_no_tank_never_reaches_the_line(tmp_path, monkeypatch):
-    """The whole addition lives inside the tile's `{% if is_reev %}` branch. Checked by slicing the
-    branch out, not by counting braces."""
+    """The line is gated on the car having a tank as well as on the research build and on the
+    generator having run — read on the gate itself, not by counting braces."""
     src = TEMPLATE.read_text()
-    i = src.index("{% if is_reev %}")
-    branch = src[i:src.index("{% elif", i)]
-    assert "reev_elec_kwh_100km" in branch, "the rate is printed outside the range-extender branch"
+    assert "{% elif is_reev and research and trip.engine_ran and trip.reev_elec_kwh_100km is not none %}" \
+        in src, "the rate is printed outside a range-extender gate"
     assert "kWh/100km" not in _render_tile(_trip(tmp_path, monkeypatch), is_reev=False)
 
 

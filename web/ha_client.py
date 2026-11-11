@@ -71,6 +71,29 @@ def is_configured() -> bool:
     return bool(base and token)
 
 
+def _tls_context(base: str) -> ssl.SSLContext:
+    """A Home Assistant on the LAN often has a self-signed certificate, so on a private address or a
+    home-network name the certificate is not checked. On a public name it is: the request carries a
+    long-lived Home Assistant token, and an unchecked connection hands it to anyone on the path."""
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    import security
+    ctx = ssl.create_default_context()
+    host = urlsplit(base).hostname or ""
+    try:
+        ip = ipaddress.ip_address(host)
+        # 100.64.0.0/10 is shared address space (RFC 6598), not public: Tailscale gives its devices these.
+        tolerate = (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip in ipaddress.ip_network("100.64.0.0/10"))
+    except ValueError:
+        tolerate = security.is_home_name(host)
+    if tolerate:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 def _request(path: str, method: str = "GET", payload: object | None = None) -> tuple[int, object]:
     """base+path with bearer auth. Returns (status, parsed_json_or_text)."""
     base, token = _creds()
@@ -81,11 +104,7 @@ def _request(path: str, method: str = "GET", payload: object | None = None) -> t
         base + path, data=data, method=method,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
     )
-    # Local HA over https often uses a self-signed cert → don't hard-fail on it.
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    with urllib.request.urlopen(req, timeout=_TIMEOUT, context=ctx) as resp:
+    with urllib.request.urlopen(req, timeout=_TIMEOUT, context=_tls_context(base)) as resp:
         raw = resp.read().decode("utf-8", "replace")
         try:
             return resp.status, json.loads(raw)
@@ -100,8 +119,15 @@ def test_connection() -> dict:
     try:
         status, body = _request("/api/")
         if status == 200:
-            msg = body.get("message") if isinstance(body, dict) else str(body)
-            return {"ok": True, "message": msg or "API running"}
+            if not isinstance(body, dict):
+                # HA's /api/ always answers JSON. A page here means the URL is not the API root —
+                # typically a dashboard link, whose `/api/` falls through to the frontend's
+                # catch-all and gets HA's own HTML shell back (#294). Never a success, and never
+                # the page itself as the message: that text goes straight into Settings.
+                return {"ok": False, "error": "not the Home Assistant API — the URL answered with "
+                                              "a web page; use the base address, e.g. "
+                                              "http://192.168.1.10:8123"}
+            return {"ok": True, "message": body.get("message") or "API running"}
         return {"ok": False, "error": f"HTTP {status}"}
     except urllib.error.HTTPError as e:
         # 401 = bad/expired token, the most common real-world failure
@@ -385,7 +411,7 @@ def get_live() -> dict:
            "max_current_a": None, "charging": False, "speed": None, "speed_unit": "",
            "max_power": None, "max_power_unit": ""}
     # The switch in Settings, honoured HERE because this is the only door wallbox data comes
-    # through — the web tile calls it, and so does the poller (recorder._read_wallbox_energy).
+    # through — the web tile calls it, and so does the poller (recorder._read_wallbox).
     # It used to gate the wallbox PAGE, the session-energy line and the chart overlay, and nothing
     # else: with the feature off and a mapping still saved, every poll kept reading the meter into
     # `ac_energy_kwh`, and `poller/db.py` bills a home charge on that column whenever it is set. The
@@ -478,6 +504,22 @@ def set_max_current(value: float) -> bool:
     return call_service("number", "set_value", {"entity_id": eid, "value": value})
 
 
+def step_hold(times: list[str], hist: list[tuple[float, float]]) -> list[float | None]:
+    """A history as sorted (epoch, value) read at each of `times` (ISO): the last value known at or before
+    each instant, None before the first; the shape a chart draws beside the car's own readings."""
+    out, j, last = [], 0, None
+    for t in times:
+        e = epoch(t)
+        if e is None:
+            out.append(None)
+            continue
+        while j < len(hist) and hist[j][0] <= e:
+            last = hist[j][1]
+            j += 1
+        out.append(round(last, 3) if last is not None else None)
+    return out
+
+
 def epoch(iso: str) -> float | None:
     """ISO-8601 (with offset) → epoch seconds, or None."""
     try:
@@ -487,12 +529,19 @@ def epoch(iso: str) -> float | None:
 
 
 def get_history(entity_id: str, start_iso: str, end_iso: str) -> list[tuple[float, float]]:
-    """Numeric history of one entity over [start, end] as sorted (epoch, value).
+    """Numeric history of one entity over [start, end] as sorted (epoch, value); [] whether Home Assistant
+    had none or did not answer. See read_history for a caller that must tell the two apart."""
+    return read_history(entity_id, start_iso, end_iso) or []
 
-    Uses HA's /api/history/period — no need to store wallbox samples ourselves;
-    HA's recorder already has them (default retention ~10 days)."""
+
+def read_history(entity_id: str, start_iso: str, end_iso: str) -> list[tuple[float, float]] | None:
+    """Numeric history of one entity over [start, end] as sorted (epoch, value): [] when Home Assistant has
+    none (purged, or nothing recorded), None when it did not answer, or answered other than 200, or is not
+    configured: not a reading, so a caller that records what it read does not record that.
+
+    Uses HA's /api/history/period."""
     if not entity_id or not is_configured():
-        return []
+        return None
     path = (f"/api/history/period/{quote(start_iso, safe='')}"
             f"?filter_entity_id={quote(entity_id, safe='')}"
             f"&end_time={quote(end_iso, safe='')}"
@@ -500,15 +549,17 @@ def get_history(entity_id: str, start_iso: str, end_iso: str) -> list[tuple[floa
     try:
         status, body = _request(path)
     except Exception:  # noqa: BLE001
+        return None
+    if status != 200 or not isinstance(body, list):
+        return None
+    if not body or not isinstance(body[0], list):
         return []
-    if status != 200 or not isinstance(body, list) or not body or not isinstance(body[0], list):
-        return []
-    # With minimal_response HA sends full attributes only on the FIRST sample, so
-    # read the unit there to normalise W→kW (some wallboxes report power in watts).
+    # With minimal_response HA sends full attributes only on the FIRST sample, so read the unit there
+    # to normalise W→kW and Wh→kWh, as get_live reads the same sensors (some wallboxes report in watts).
     unit = ""
     if isinstance(body[0][0], dict):
         unit = (body[0][0].get("attributes", {}) or {}).get("unit_of_measurement", "")
-    scale = 0.001 if unit.lower() == "w" else 1.0
+    scale = 0.001 if unit.lower() in ("w", "wh") else 1.0
     out: list[tuple[float, float]] = []
     for s in body[0]:
         ts = s.get("last_changed") or s.get("last_updated")

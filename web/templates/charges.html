@@ -1,11 +1,13 @@
 {% extends "base.html" %}
 {% import 'partials/_icons.html' as ico %}
+{% import 'partials/_energy.html' as energy %}
 {% block autorefresh %}0{% endblock %}{# own reload-on-charge-end + live panel poll #}
 {% block title %}{{ t('nav_charges') }} — LeapMotor Mate{% endblock %}
 
 {% block content %}
 <div class="mb-6 flex items-start justify-between gap-4">
   <div>
+    {% if back_link %}<a href="{{ back_link.href }}" class="text-slate-400 hover:text-white text-sm">{{ t(back_link.label) }}</a>{% endif %}
     <h1 class="text-2xl font-bold text-white">{{ t('charges_title') }}</h1>
     <p class="text-slate-400 text-sm mt-1">{{ total }} {{ t('sessions_recorded') }}</p>
   </div>
@@ -22,8 +24,8 @@
 
 {% if unconfirmed %}
 {# The banner takes you TO the charge. It used to only announce it, leaving the reader to guess
-   which day of the calendar to click — which is what #240 was actually about. #}
-<a href="charges{% if unconfirmed_id %}?highlight={{ unconfirmed_id }}{% endif %}"
+   which day of the calendar to click — which is what #240 was actually about. It keeps the page's "←". #}
+<a href="charges{% if unconfirmed_id %}?highlight={{ unconfirmed_id }}{% endif %}{% if back_link %}{{ '&' if unconfirmed_id else '?' }}back={{ back_link.href|urlencode }}{% endif %}"
    class="mb-6 flex items-center gap-2 rounded-xl px-4 py-3 text-sm hover:brightness-125 transition-all"
    style="background:#f59e0b14;border:1px solid #f59e0b44;color:#fbbf24">
   <span>❓</span>
@@ -45,7 +47,7 @@
       {% endif %}
     </span>
   </div>
-  <a href="charges" class="text-xs font-medium text-amber-300 hover:text-amber-200 underline underline-offset-2">
+  <a href="charges{% if back_link %}?back={{ back_link.href|urlencode }}{% endif %}" class="text-xs font-medium text-amber-300 hover:text-amber-200 underline underline-offset-2">
     ✕ {{ t('charges_station_clear') }}
   </a>
 </div>
@@ -70,8 +72,18 @@
     {% include "partials/battery_card.html" %}
   </div>
 
+  <!-- The chart of the charge in progress: after the battery on a phone, a row of its own on a wide
+       screen, no cell while none runs; its chart is destroyed before a swap and drawn anew within it -->
+  <div id="charging-chart-panel" class="contents"
+       hx-get="api/charging-chart"
+       hx-trigger="every 30s"
+       hx-swap="innerHTML settle:0ms"
+       hx-on::before-swap="if (event.detail.shouldSwap) this.querySelectorAll('[id^=pc-]').forEach(function (e) { if (e._c) e._c.destroy(); })">
+    {% include "partials/charging_chart.html" %}
+  </div>
+
   <!-- Charge limit -->
-  <div class="card">
+  <div class="card order-4 lg:order-none">
     <div class="flex items-center gap-2 mb-4">
       <span class="text-xl">🎯</span>
       <span class="font-semibold text-white">{{ t('charge_limit') }}</span>
@@ -79,7 +91,8 @@
         — %
       </span>
     </div>
-    <div class="text-xs text-slate-500 mb-3">{{ t('charge_limit_desc') }}</div>
+    {# On the simple scheduler (T03) the plan's target is the official app's upper limit, measured in #436. #}
+    <div class="text-xs text-slate-500 mb-3">{{ t('charge_limit_desc') if charge_schedule_advanced else t('charge_limit_desc_simple') }}</div>
     <form hx-post="api/charge-limit"
           hx-target="#cl-result"
           hx-swap="innerHTML"
@@ -170,9 +183,12 @@ document.body.addEventListener('htmx:afterSwap', function (e) {
                class="block mt-1 w-24 bg-slate-800 border border-slate-600 text-white text-sm rounded-lg px-2 py-1.5">
       </label>
       <label class="text-xs text-slate-400">{{ t('manual_charge_type') }}
+        {# #309 — the add form offers the same five types as the edit panel; offering two here
+           and five there would let a charge be typed as something it could not be created as. #}
         <select name="charge_type" class="block mt-1 bg-slate-800 border border-slate-600 text-white text-sm rounded-lg px-2 py-1.5">
-          <option value="AC">AC</option>
-          <option value="DC">DC</option>
+          {% for key, meta in charge_types.items() %}
+          <option value="{{ key }}">{{ meta.icon }} {{ meta.label }}</option>
+          {% endfor %}
         </select>
       </label>
       {# #237 — the car's total distance at that charge. It is offered ONLY where the poller has
@@ -214,68 +230,120 @@ document.body.addEventListener('htmx:afterSwap', function (e) {
   </div>
 </div>
 
-<!-- AC vs DC distribution (donut) — global totals, hidden while a station filter narrows the tree below -->
+<!-- AC vs DC distribution, and Home vs Public (a second, independent split of the SAME charges,
+     never a further breakdown of the ring beside it) — two matching cards, same row. Global
+     totals, hidden while a station filter narrows the tree below. -->
 {% if not station and ac_dc and ac_dc.total > 0 %}
-<div class="card mb-6">
-  <h2 class="font-semibold text-white mb-3">{{ t('ac_dc_distribution') }}</h2>
-  <div class="flex flex-col sm:flex-row items-center gap-6">
-    <div id="acdc-chart" class="w-[190px] flex-shrink-0 mx-auto sm:mx-0"></div>
-    <div class="w-full flex-1 grid grid-cols-1 xs:grid-cols-2 gap-4">
-      <div style="background:#0f172a;border:1px solid #1e293b;border-radius:12px;padding:16px">
-        <div class="flex items-center gap-2 mb-2">
-          <span class="w-3 h-3 rounded-full" style="background:#38bdf8"></span>
-          <span class="text-slate-300 text-sm font-medium">{{ t('ac_charge') }}</span>
-        </div>
-        <div class="text-2xl font-bold text-white">{{ ac_dc.ac.count }}
-          <span class="text-sm font-normal text-slate-500">{{ t('sessions_recorded') }}</span>
-        </div>
-        <div class="text-xs text-slate-500 mt-1">{{ ac_dc.ac.kwh | nice }} kWh
-          {% if ac_dc.total %}· {{ (ac_dc.ac.count / ac_dc.total * 100) | round | int }}%{% endif %}
-        </div>
-      </div>
-      <div style="background:#0f172a;border:1px solid #1e293b;border-radius:12px;padding:16px">
-        <div class="flex items-center gap-2 mb-2">
-          <span class="w-3 h-3 rounded-full" style="background:#fb923c"></span>
-          <span class="text-slate-300 text-sm font-medium">{{ t('dc_charge') }}</span>
-        </div>
-        <div class="text-2xl font-bold text-white">{{ ac_dc.dc.count }}
-          <span class="text-sm font-normal text-slate-500">{{ t('sessions_recorded') }}</span>
-        </div>
-        <div class="text-xs text-slate-500 mt-1">{{ ac_dc.dc.kwh | nice }} kWh
-          {% if ac_dc.total %}· {{ (ac_dc.dc.count / ac_dc.total * 100) | round | int }}%{% endif %}
-        </div>
+{# One legend tile for both rings, so every card reads the same: a coloured dot, the number of
+   sessions, the name beside it — and under it the kWh and the share of all charges. No "sessions
+   recorded" (the ring's centre already says what is being counted), and two short lines per
+   tile, so a card never grows with the number of tiles it holds the way the big ones did: the
+   pair, stretched to one height, left one half empty. #}
+{% macro legend_tile(color, label, count, kwh_text, total) %}
+<div class="min-w-0" style="background:#0f172a;border:1px solid #1e293b;border-radius:10px;padding:5px 12px">
+  <div class="flex items-center gap-2">
+    <span class="w-3 h-3 rounded-full flex-shrink-0" style="background:{{ color }}"></span>
+    <span class="text-xl font-bold text-white leading-tight">{{ count }}</span>
+    <span class="text-slate-300 text-sm font-medium truncate">{{ label }}</span>
+  </div>
+  <div class="text-xs text-slate-500 whitespace-nowrap leading-tight">{{ kwh_text }} kWh{% if total %} · {{ (count / total * 100) | round | int }}%{% endif %}</div>
+</div>
+{% endmacro %}
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+  <div class="card">
+    <h2 class="font-semibold text-white mb-3">{{ t('ac_dc_distribution') }}</h2>
+    <div class="flex flex-col sm:flex-row items-center gap-6">
+      <div id="acdc-chart" class="w-[190px] flex-shrink-0 mx-auto sm:mx-0"></div>
+      <div class="w-full flex-1 min-w-0 grid grid-cols-1 gap-2">
+        {{ legend_tile('#38bdf8', t('ac_charge'), ac_dc.ac.count, (ac_dc.ac.kwh | nice), ac_dc.total) }}
+        {{ legend_tile('#fb923c', t('dc_charge'), ac_dc.dc.count, (ac_dc.dc.kwh | nice), ac_dc.total) }}
       </div>
     </div>
   </div>
-  <script>
-  (function () {
-    var el = document.getElementById('acdc-chart');
-    if (!el || typeof ApexCharts === 'undefined') return;
-    if (el._c) { try { el._c.destroy(); } catch (e) {} }
-    el._c = new ApexCharts(el, {
-      chart: { type: 'donut', height: 200, fontFamily: 'inherit', background: 'transparent' },
-      series: [{{ ac_dc.ac.count }}, {{ ac_dc.dc.count }}],
-      labels: ['{{ t('ac_charge') }}', '{{ t('dc_charge') }}'],
-      colors: ['#38bdf8', '#fb923c'],
-      legend: { show: false },
-      stroke: { width: 0 },
-      dataLabels: { enabled: true, formatter: function (v) { return Math.round(v) + '%'; },
-                    style: { fontSize: '12px' } },
-      {# The VALUE in the middle of the ring needs its colour said out loud. ApexCharts styles the
-         label above it (`total.color`) and the % on the segment, but leaves the number itself on its
-         own default — a near-black that vanishes on our dark card: @adoewa's screenshot has the ring,
-         the 100% and both side tiles readable, and the count in the centre all but invisible (#269).
-         → tests/test_the_charges_donut_prints_a_legible_total.py #}
-      plotOptions: { pie: { donut: { size: '62%', labels: { show: true,
-        value: { color: '#f1f5f9', fontSize: '22px', fontWeight: 700 },
-        total: { show: true, label: '{{ t('charges_title') }}', color: '#94a3b8',
-                 formatter: function (w) { return w.globals.seriesTotals.reduce(function (a, b) { return a + b; }, 0); } } } } } },
-      tooltip: { theme: 'dark', y: { formatter: function (v) { return v + ' ⚡'; } } }
-    });
-    el._c.render();
-  })();
-  </script>
+
+  {# Home is a subset of AC (every home wallbox charges on AC) — but PUBLIC here means every
+     CONFIRMED charge that isn't Home, DC included: a DC/HPC session is never a home one (no
+     residential fast charger). Not `total - home_count` — that would also count anything not yet
+     confirmed (location_type NULL, or the legacy 'MANUAL' placeholder) as public by subtraction,
+     which mislabelled a home charge stuck on 'MANUAL' as public (found in review). Computed
+     server-side (get_ac_dc_stats) since it needs the same real-type check the badge itself uses.
+
+     A THIRD, explicit "Da confermare" tile/slice for whatever is neither — home_count + public_count
+     + unconfirmed_count always equals ac_dc.total. Without it the donut (fed only [home, public])
+     normalised its own percentages against just those two numbers while the text beside it divided
+     by the true total: on real data (1 confirmed public charge, 3 still unconfirmed) the ring said
+     "100% Pubblica", the text said 25%, and the 3 unconfirmed charges appeared nowhere in this card
+     at all (found in review, PR #284). #}
+  <div class="card">
+    <h2 class="font-semibold text-white mb-3">{{ t('home_public_distribution') }}</h2>
+    <div class="flex flex-col sm:flex-row items-center gap-6">
+      <div id="homepublic-chart" class="w-[190px] flex-shrink-0 mx-auto sm:mx-0"></div>
+      {# Free (a costless public charger) sits after Public, only when there is one. Priced by hand with
+         no type (db_reader.is_manual_charge): not public — a Manual charge made at home is not — and not
+         waiting either, the owner answered with the price (add-on #2). #}
+      <div class="w-full flex-1 min-w-0 grid grid-cols-1 gap-2">
+        {{ legend_tile('#22c55e', t('report_home'), ac_dc.home_count, (ac_dc.home_kwh | nice), ac_dc.total) }}
+        {{ legend_tile('#7dd3fc', t('ac_charge_public'), ac_dc.public_count, (ac_dc.public_kwh | nice), ac_dc.total) }}
+        {% if ac_dc.free_count %}{{ legend_tile('#a3e635', '🆓 ' ~ t('charge_free'), ac_dc.free_count, (ac_dc.free_kwh | nice), ac_dc.total) }}{% endif %}
+        {% if ac_dc.manual_count %}{{ legend_tile('#94a3b8', '✎ ' ~ t('charge_manual'), ac_dc.manual_count, (ac_dc.manual_kwh | nice), ac_dc.total) }}{% endif %}
+        {% if ac_dc.unconfirmed_count %}{{ legend_tile('#f59e0b', t('charge_unconfirmed'), ac_dc.unconfirmed_count, (ac_dc.unconfirmed_kwh | nice), ac_dc.total) }}{% endif %}
+      </div>
+    </div>
+  </div>
 </div>
+<script>
+(function () {
+  var el = document.getElementById('acdc-chart');
+  if (!el || typeof ApexCharts === 'undefined') return;
+  if (el._c) { try { el._c.destroy(); } catch (e) {} }
+  el._c = new ApexCharts(el, {
+    chart: { type: 'donut', height: 200, fontFamily: 'inherit', background: 'transparent' },
+    series: [{{ ac_dc.ac.count }}, {{ ac_dc.dc.count }}],
+    labels: ['{{ t('ac_charge') }}', '{{ t('dc_charge') }}'],
+    colors: ['#38bdf8', '#fb923c'],
+    legend: { show: false },
+    stroke: { width: 0 },
+    dataLabels: { enabled: true, formatter: function (v) { return Math.round(v) + '%'; },
+                  style: { fontSize: '12px' } },
+    {# The VALUE in the middle of the ring needs its colour said out loud. ApexCharts styles the
+       label above it (`total.color`) and the % on the segment, but leaves the number itself on its
+       own default — a near-black that vanishes on our dark card: @adoewa's screenshot has the ring,
+       the 100% and both side tiles readable, and the count in the centre all but invisible (#269).
+       → tests/test_the_charges_donut_prints_a_legible_total.py #}
+    plotOptions: { pie: { donut: { size: '62%', labels: { show: true,
+      value: { color: '#f1f5f9', fontSize: '22px', fontWeight: 700 },
+      total: { show: true, label: '{{ t('charges_title') }}', color: '#94a3b8',
+               formatter: function (w) { return w.globals.seriesTotals.reduce(function (a, b) { return a + b; }, 0); } } } } } },
+    tooltip: { theme: 'dark', y: { formatter: function (v) { return v + ' ⚡'; } } }
+  });
+  el._c.render();
+})();
+(function () {
+  // Same shape as the AC/DC ring above, for the SAME reason (#269) — the total's own centre
+  // value needs an explicit light colour or it vanishes on this dark card. A THIRD "unconfirmed"
+  // slice keeps this ring's own percentages agreeing with the text tiles beside it — both now
+  // always divide by the same ac_dc.total (found disagreeing in review, PR #284).
+  var el = document.getElementById('homepublic-chart');
+  if (!el || typeof ApexCharts === 'undefined') return;
+  if (el._c) { try { el._c.destroy(); } catch (e) {} }
+  el._c = new ApexCharts(el, {
+    chart: { type: 'donut', height: 200, fontFamily: 'inherit', background: 'transparent' },
+    series: [{{ ac_dc.home_count }}, {{ ac_dc.public_count }}, {{ ac_dc.free_count or 0 }}, {{ ac_dc.manual_count }}, {{ ac_dc.unconfirmed_count }}],
+    labels: ['{{ t('report_home') }}', '{{ t('ac_charge_public') }}', '🆓 {{ t('charge_free') }}', '✎ {{ t('charge_manual') }}', '{{ t('charge_unconfirmed') }}'],
+    colors: ['#22c55e', '#7dd3fc', '#a3e635', '#94a3b8', '#f59e0b'],
+    legend: { show: false },
+    stroke: { width: 0 },
+    dataLabels: { enabled: true, formatter: function (v) { return Math.round(v) + '%'; },
+                  style: { fontSize: '12px' } },
+    plotOptions: { pie: { donut: { size: '62%', labels: { show: true,
+      value: { color: '#f1f5f9', fontSize: '22px', fontWeight: 700 },
+      total: { show: true, label: '{{ t('charges_title') }}', color: '#94a3b8',
+               formatter: function (w) { return w.globals.seriesTotals.reduce(function (a, b) { return a + b; }, 0); } } } } } },
+    tooltip: { theme: 'dark', y: { formatter: function (v) { return v + ' ⚡'; } } }
+  });
+  el._c.render();
+})();
+</script>
 {% endif %}
 
 <!-- Summary cards — 6 columns, compact — global totals, hidden while a station filter narrows the tree below -->
@@ -294,7 +362,11 @@ document.body.addEventListener('htmx:afterSwap', function (e) {
   {% endmacro %}
 
   {{ scard(t('sessions'),     stats.session_count,                        '',    'text-yellow-400') }}
-  {{ scard(t('total_energy'), stats.total_kwh or 0,                       'kWh', 'text-yellow-400') }}
+  {# The billed energy, said so — the month strip below this tile says "delivered" beside the
+     same number, and the battery figure stands beside it the same way. #}
+  {{ scard(t('total_energy'), (stats.total_kwh or 0)|nice, 'kWh', 'text-yellow-400',
+      note=energy.delivered_line(t, stats.total_kwh, stats.battery_kwh),
+      help=t('cal_kwh_delivered_help')) }}
   {# The reconstructed charges are out of this average — their "duration" is the blackout they were
      found across. Said out loud, because the sessions tile beside it still counts them. #}
   {{ scard(t('avg_duration'),
@@ -350,6 +422,8 @@ document.body.addEventListener('htmx:afterSwap', function (e) {
         {% for key, info in charge_types.items() %}
         <option value="{{ key }}">{{ info.icon }} {{ info.label }}</option>
         {% endfor %}
+        {# Not a type any more, still a filter: the charges priced by hand with no type (add-on #2). #}
+        <option value="MANUAL">✎ {{ t('charge_manual') }}</option>
       </select>
       <input type="date" name="date_from" title="{{ t('charges_search_date_from') }}"
              class="bg-slate-800 border border-slate-600 text-white text-xs rounded-lg px-2 py-1.5">
@@ -419,6 +493,7 @@ if (HIGHLIGHT) {
     // element, and a flag would only prove that some earlier, discarded one was marked.
     card.style.border    = '1px solid #fbbf2455';
     card.style.boxShadow = 'inset 3px 0 0 #fbbf24';
+    card.open = true;                                   // the row the link meant, opened
     if (!scrolled) {
       scrolled = true;
       requestAnimationFrame(() => card.scrollIntoView({ behavior: 'smooth', block: 'center' }));
@@ -428,22 +503,119 @@ if (HIGHLIGHT) {
   mark();                                               // the grid the server drew
   document.body.addEventListener('htmx:afterSwap', onBlock);
   document.body.addEventListener('htmx:afterSettle', onBlock);   // after htmx finishes with it
+  // The block's own load may bring a remembered range of days back around the row and move it: go to it once more.
+  document.body.addEventListener('htmx:beforeSwap', function again(e) {
+    if (!e.target || e.target.id !== 'charges-calendar-month-wrap') return;
+    scrolled = false;
+    document.body.removeEventListener('htmx:beforeSwap', again);
+  });
 }
 
-// Auto-refresh the history when a charge completes. The live panel (#charging-live-panel) polls
-// every 30s; when its state flips charging→not-charging a charge has just ended, so reload once to
-// surface the new completed-charge card + updated totals.
+// A charge's note saved (#107): its line says the note as the server stored it. A field changed while
+// the save was on its way keeps its text and stays open, since that text is not saved.
+function chargeNoteSaved(form, id, ok) {
+  var m = document.getElementById('cnote-msg-' + id), saved = ok && m && m.querySelector('[data-saved-note]');
+  if (!saved) return;
+  var v = saved.dataset.savedNote, line = document.getElementById('cnote-line-' + id), b = document.getElementById('cnote-edit-' + id);
+  setTimeout(function () { m.textContent = ''; }, 2500);
+  line.hidden = !v;
+  line.querySelector('span').textContent = v;
+  b.textContent = v ? b.dataset.labelEdit : b.dataset.labelAdd;
+  if (document.getElementById('cnote-' + id).value.trim() === v) form.classList.add('hidden');
+}
+
+// Expand all / Collapse all in a list's heading: every charge row of the list under it. Expand all shows
+// while a row is closed, Collapse all while one is open. Delegated, since the lists are swapped in by htmx.
 (function () {
-  const isCharging = () => {
+  function rows(box) {
+    for (var el = box.parentElement; el; el = el.parentElement)
+      if (el.querySelector('details.charge-card')) return Array.prototype.slice.call(el.querySelectorAll('details.charge-card'));
+    return [];
+  }
+  function sync(box) {
+    var cards = rows(box);
+    box.querySelector('[data-charges-all="open"]').hidden = cards.every(function (c) { return c.open; });
+    box.querySelector('[data-charges-all="close"]').hidden = !cards.some(function (c) { return c.open; });
+  }
+  function syncAll() { document.querySelectorAll('[data-charges-expand]').forEach(sync); }
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest ? e.target.closest('[data-charges-all]') : null;
+    if (!btn) return;
+    var box = btn.closest('[data-charges-expand]');
+    rows(box).forEach(function (c) { c.open = btn.dataset.chargesAll === 'open'; });
+    sync(box);
+  });
+  // Rows opened or closed by hand, and lists drawn with a row already open (?highlight).
+  document.addEventListener('toggle', function (e) {
+    if (e.target.matches && e.target.matches('details.charge-card')) syncAll();
+  }, true);
+  document.body.addEventListener('htmx:afterSettle', syncAll);
+})();
+
+// A merge or a split draws the calendar again, every row closed: the row of the charge it leaves opens.
+document.body.addEventListener('chargeOpen', function (e) {
+  var row = document.getElementById('charge-card-' + e.detail.value);
+  if (row) row.open = true;
+});
+
+// The row is a <summary>: a click on an editor's own words or padding or on a tooltip's mark, Enter or Space on
+// a focused mark, or a Space released in an editor's field would open or close it. Only its controls keep their
+// own activation there.
+(function () {
+  document.addEventListener('click', function (e) {
+    var t = e.target, row = t.closest && t.closest('summary.charge-row');
+    var own = row && t.closest('form, [data-row-editor], [data-tip]');
+    if (!own || !row.contains(own) || t.closest('button, a, input, select, textarea, label')) return;
+    e.preventDefault();
+  }, true);
+  document.addEventListener('keydown', function (e) {
+    var t = e.target;
+    if ((e.key === 'Enter' || e.key === ' ') && t.matches && t.matches('[data-tip]') && t.closest('summary.charge-row')) e.preventDefault();
+  }, true);
+  document.addEventListener('keyup', function (e) {
+    var t = e.target;
+    if (e.key === ' ' && t.closest && t.closest('summary.charge-row') && t.matches('input, textarea, select')) e.preventDefault();
+  }, true);
+})();
+
+// A row opened by a click or a key scrolls as little as shows it whole, or to its top where it is taller than the
+// screen, once a chart still on its way is drawn. Rows opened by Expand all or a link stay where they are.
+document.addEventListener('click', function (e) {
+  var card = e.target.closest && e.target.closest('summary.charge-row') && e.target.closest('details.charge-card');
+  if (!card || card.open) return;
+  setTimeout(function () {                              // after the click has opened the row, if it did
+    if (!card.open) return;
+    var chart = card.querySelector('[data-chart-pending]'), opening = card._opening = {};
+    function show() {                                   // its top kept below the bars stuck to the page's top
+      if (card._opening !== opening || !card.isConnected) return;   // closed, or drawn over, while its chart was on its way
+      var main = card.closest('main'), r = card.getBoundingClientRect(), top = main.getBoundingClientRect().top;
+      [].forEach.call(main.children, function (b) { if (getComputedStyle(b).position === 'sticky') top = Math.max(top, b.getBoundingClientRect().bottom); });
+      var by = Math.min(Math.max(r.bottom - main.getBoundingClientRect().bottom, 0), r.top - top);
+      if (by) main.scrollBy({ top: by, behavior: 'smooth' });
+    }
+    if (!chart) return show();
+    chart.parentElement.addEventListener('htmx:afterSettle', function () { requestAnimationFrame(show); }, { once: true });
+  });
+});
+document.addEventListener('toggle', function (e) {     // a closing, by any hand, ends the opening's wait
+  if (!e.target.open && e.target.matches && e.target.matches('details.charge-card')) e.target._opening = null;
+}, true);
+
+// Auto-refresh the history when the car ends its charge session. The live panel (#charging-live-panel)
+// polls every 30s and carries the open session; once it is gone the charge is in the history, so reload
+// once to surface the new completed-charge card + updated totals. Not the charging flag: that goes off
+// once the battery is full, while the car still holds the session open and the charge is not filed yet.
+(function () {
+  const session = () => {
     const m = document.getElementById('charging-state');
-    return m ? m.dataset.charging === 'true' : null;
+    return m ? m.dataset.session : null;
   };
-  let wasCharging = isCharging();
+  let was = session();
   document.body.addEventListener('htmx:afterSwap', (e) => {
     if (e.target && e.target.id === 'charging-live-panel') {
-      const now = isCharging();
-      if (wasCharging === true && now === false) location.reload();
-      wasCharging = now;
+      const now = session();
+      if (was && now === '') location.reload();
+      was = now;
     }
   });
 })();

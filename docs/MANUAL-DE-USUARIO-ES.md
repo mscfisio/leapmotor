@@ -1,6 +1,969 @@
 # LeapMotor Mate — Manual de usuario
 
-> **Versión de Mate:** v3.14.6 · **Idioma:** Español
+> **Versión de Mate:** v4.27.0 · **Idioma:** Español
+
+## Novedades de la versión 4.27.0
+
+**El trayecto en curso está en la página Trayectos, en directo.** Mientras el coche circula, arriba de
+*Trayectos* aparece *🚗 En marcha*: EN DIRECTO o la antigüedad de la última lectura, cuándo empezó el
+trayecto, la distancia recorrida hasta ahora, el nivel de carga al inicio y ahora, y el gráfico *Datos del
+trayecto*, actualizados cada 30 segundos. Cuando el trayecto termina, la página se recarga una vez para
+mostrarlo entre los trayectos, cuando no la estás usando, y mantiene tu posición. Por @arekm (#477).
+
+**Una página que se recarga sola mantiene tu posición.** *Salud de la batería*, un trayecto y las demás
+páginas que se recargan solas cada 30 segundos vuelven a donde estabas leyendo, aunque un bloque de la
+página llegue un momento después (#476).
+
+### Novedades de la versión 4.26.0
+
+**La «←» te lleva de vuelta a donde estabas.** En Home Assistant no hay botón Atrás, así que la «←» de
+arriba de una página es el camino de vuelta. Un trayecto abierto desde los *Trayectos recientes* del
+Resumen, desde *Trayectos parecidos* o desde una búsqueda en Trayectos tiene ahora «← Resumen», «←
+Trayectos parecidos» o «← Trayectos», y te lleva de vuelta allí con la fila del trayecto a la vista. Una
+carga abierta desde un trayecto (⚡ ▸ *Ver la carga →*) lleva de vuelta al trayecto, y una abierta desde un
+lugar de carga del Mapa lleva de vuelta al Mapa con el mismo centro y zoom. Las flechas ‹ › mantienen el
+camino de vuelta, y el Mapa mantiene su vista al recargar. Por @arekm (#473, #474).
+
+**Una búsqueda en Trayectos se queda en la dirección.** Al recargar vuelves a la misma búsqueda, y en
+Trayectos y Cargas *Volver al calendario* abre el mes que mostraba el calendario, no el de cuando se abrió
+la página.
+
+**Cada coche tiene su referencia de salud de la batería.** Con dos coches, la salud de la batería de ambos
+se medía con una sola referencia, y fijarla para uno cambiaba la del otro (#472). Abre *Ajustes → Batería*
+con cada coche seleccionado y comprueba su *Referencia del estado de salud*.
+
+### Novedades de la versión 4.25.0
+
+**Una versión de seguridad: actualiza.** Una página web de otro sitio podía controlar un Mate sin contraseña,
+puertas incluidas. Sin contraseña, Mate ahora responde solo a los nombres de una red doméstica: una dirección
+IP, `localhost`, un nombre sin puntos, `.local`, `.lan`, `.home`, `.home.arpa`, `.internal`. Si lo abres con
+un nombre público (un nombre DuckDNS, un nombre Tailscale `*.ts.net`, un proxy inverso que pasa su nombre
+público), pon una contraseña en *Ajustes → Acceso*, abriendo Mate por su dirección en tu red, o escribe ese
+nombre en `MATE_ALLOWED_HOSTS` (ver `.env.example`).
+
+**También en esta versión.** Con contraseña, vuelve a iniciar sesión una vez tras la actualización, y cambiar
+la contraseña cierra la sesión de todos los demás. El token de Home Assistant va a un nombre público solo por
+una conexión verificada. Como complemento, el panel no cambia; el puerto 4000, si lo abriste, rechaza
+formularios y marcos de otros sitios. La app de escritorio necesita MateDesktop 1.2.3 para esta versión;
+la 1.2.2 pide descargar una app más reciente.
+
+### Novedades de la versión 4.24.0
+
+**El checo.** Mate habla checo: *Ajustes → Idioma → Čeština* (gracias a @petrw1).
+
+**Un interruptor para la altimetría.** *Ajustes → Valores por defecto de los trayectos → Altimetría y temperatura
+del viaje*: desmárcalo y Mate deja de enviar por su cuenta la traza GPS de un viaje terminado a Open-Meteo. El
+botón **Calcular la altimetría** en la página de un viaje lo sigue buscando cuando lo pulsas.
+
+**Un coche aparcado se queda donde está.** Un coche aparcado al oeste de Greenwich o al sur del ecuador ya no
+salta al punto simétrico cuando sus lecturas GPS pierden el signo menos. La *Location* de Home Assistant
+conserva la última posición cuando el coche no tiene ninguna, y un coche que no envía la presión de los
+neumáticos la muestra como desconocida, no 0 bar.
+
+**La carga, leída en el sentido correcto.** Un coche enchufado que alimenta el clima desde la batería ya no
+aparece cargando, y una carga que el coche pausa sigue siendo una sola.
+
+### Novedades de la versión 4.23.0
+
+**El Mapa muestra dónde está el coche.** En el Mapa, un marcador da ahora la última posición conocida
+del coche, como en el Resumen, y sigue al coche mientras la página está abierta; la vista del mapa se queda
+donde la dejaste. Para ocultarlo, desmarca *Última posición conocida* en la fila bajo el mapa: la página
+recuerda tu elección.
+
+### Novedades de la versión 4.22.0
+
+**Los trayectos recientes son las filas de Trayectos.** En Resumen, *Trayectos recientes* muestra ahora
+cada trayecto como su fila en Trayectos, sin el recorrido: dónde empezó y dónde terminó, la batería antes
+y después, la energía consumida y de dónde viene esa cifra (*Medida por el coche*, por ejemplo). Resumen
+no da el coste; las listas de Trayectos sí. En Trayectos cada fila da ahora sus kWh entre la distancia y
+el consumo, y una fila junto a la barra lateral muestra enteros los lugares de salida y llegada; un lugar
+que aún queda cortado da su nombre completo al pasar el ratón por encima.
+
+### Novedades de la versión 4.21.0
+
+**Las cargas gratuitas tienen su propia porción en Casa y pública.** En Cargas, una carga de tipo
+**Gratis** contaba como Pública; ahora tiene su propia porción verde lima y una casilla **🆓 Gratis**,
+que aparece solo si tienes alguna. Una carga en casa que marcaste como gratuita (solar, por ejemplo) se
+queda en En casa. La leyenda de los dos roscos es más compacta: cada tipo da sus sesiones y su nombre, y
+debajo sus kWh y su porcentaje.
+
+### Novedades de la versión 4.20.0
+
+**Trayectos muestra la energía consumida.** Una quinta tarjeta en Trayectos da la energía que consumieron
+todos tus viajes, la misma cifra que *Energía consumida* en Estadísticas, y el encabezado de un día, la
+franja del mes y el total de una búsqueda dan también sus kWh. La tarjeta de energía añade el *Consumo
+total* del coche junto a la distancia y la media; los dos pueden diferir un poco, porque la nube cuenta
+por fecha y Mate por los viajes que registró. Los meses y años de Estadísticas suman ahora exactamente la
+*Energía consumida*.
+
+### Novedades de la versión 4.19.0
+
+**El ventilador tiene las velocidades del coche.** La nube le dice a Mate cuántas velocidades tiene el
+ventilador del clima remoto de cada coche. En un coche con más de siete, como un B10 con nueve, la página
+Vehículo dice «x / 9», el control del ventilador en Comandos va de 1 a 9 y el número *Fan Level* de Home
+Assistant llega a 9. Los demás coches siguen de 1 a 7.
+
+**La regeneración de un viaje cuenta el tiempo que representa cada lectura.** Cada lectura al frenar
+cuenta ahora el tiempo desde la lectura anterior del coche, no el intervalo de sondeo, así que los viajes
+nuevos muestran más regeneración que antes. Los viajes ya registrados conservan su valor.
+
+### Novedades de la versión 4.18.1
+
+**El rastreador Location en Home Assistant sigue la zona del coche.** El device_tracker
+`Location` que Mate publica por MQTT decía `home` cada vez que el coche enviaba una posición, estuviera
+donde estuviera. Ahora dice la zona de las coordenadas del coche: `home`, `not_home` o el nombre de
+otra de tus zonas; sin GPS dice `not_home`. Una automatización que lo usaba para saber si el coche
+está en casa ahora ve salir el coche.
+
+### Novedades de la versión 4.18.0
+
+**Cada coche tiene su propio PIN de operaciones.** En *Ajustes → Vehículo* el formulario dice «PIN de
+operaciones de este coche», con el modelo y el final del VIN; con dos coches, primero se elige el coche
+(ya no existe «Todos los coches»). El PIN escrito ahí es el que usan los comandos: con un solo coche
+podía guardarse donde los comandos no lo leían. Un PIN guardado por una versión anterior pasa a ser el
+del coche al arrancar Mate. Un comando a un coche sin PIN no se envía, y la página dice que se configure
+en Ajustes → Vehículo. Si tras la actualización un comando se rechaza por PIN incorrecto, escribe el
+PIN ahí una vez más.
+
+### Novedades de la versión 4.17.0
+
+**El panel de carga dice cuándo termina la carga.** En la página *Cargas*, *Estado de la carga* muestra
+bajo el tiempo restante la hora a la que termina la carga, p. ej. «Termina a las 14:30», con el día
+cuando termina en otro. Cuenta desde que el coche midió los minutos restantes, así que una lectura de
+hace unos minutos no la mueve.
+
+### Novedades de la versión 4.16.3
+
+**Un wallbox que se ha mudado se vuelve a encontrar.** Mate aprende dónde está tu wallbox a partir de las
+cargas que ha medido, y solo da el contador del wallbox a las cargas en ese lugar. Tras una mudanza, las
+cargas en casa se quedaban sin él. Ahora una carga lejos de ese lugar lee igualmente el contador y lo
+conserva si subió junto con el coche (más de 2 kWh, nunca parado mientras el coche cargaba); esas cargas
+trasladan el lugar a tu nueva casa. Las cargas registradas antes de esta versión no cambian.
+
+### Novedades de la versión 4.16.2
+
+**El mapa ocupa la pantalla en la que está.** El mapa de la página *Mapa* ocupa ahora todo el ancho de la
+página y termina donde la fila de abajo, con *Trayectos mostrados* y *Puntos mostrados*, todavía cabe en
+pantalla: más grande en un monitor grande, más pequeño en un portátil, 400 px como mínimo. Sigue a la
+ventana cuando la redimensionas.
+
+### Novedades de la versión 4.16.1
+
+**Un T03 muestra su objetivo de carga.** En un T03 la tarjeta *Objetivo de la carga programada* de la página
+Cargas quedaba vacía justo después de guardar, y el *Charge Limit* de Home Assistant seguía desconocido: el
+estado del coche no lo trae. Mate ahora lo lee del plan de carga del coche, que sí lo trae.
+
+### Novedades de la versión 4.16.0
+
+**El mapa del Resumen dibuja el último viaje de hoy.** Bajo el punto del coche, el mapa *Última posición
+conocida* dibuja ahora la ruta del último viaje: el que está en curso mientras conduces, y el que terminó hoy
+durante el resto del día. Las líneas son las de la página del viaje. Pasada la medianoche el mapa vuelve a
+quedar limpio.
+
+**Los comandos ya no se rechazan por un reloj del ordenador atrasado unos segundos.** Antes de un comando
+Mate mira la hora de la última lectura del coche, y rechazaba una con hora posterior al reloj del ordenador
+(*Command not sent: state_timestamp_invalid*). Ahora una lectura hasta un minuto adelantada cuenta como
+actual.
+
+### Novedades de la versión 4.15.12
+
+**En el T03 la tarjeta del objetivo de carga dice lo que es.** La tarjeta *Objetivo de la carga
+programada* de la página Cargas decía que su número no es el límite superior de la app del coche. En el
+T03 lo es: un propietario fijó 92 % y luego 90 % desde la tarjeta, y la app oficial mostró cada uno como su
+límite superior de carga. En un coche con la programación sencilla, como el T03, la tarjeta ahora lo dice.
+
+### Novedades de la versión 4.15.11
+
+**El odómetro en MQTT ya no baja a 0 km.** Cuando una lectura del coche no trae el odómetro, como
+algunas del T03, Mate publicaba 0 km en MQTT (el sensor del odómetro en Home Assistant) y enviaba 0 km a
+ABRP. Ahora una lectura así no publica nada para el odómetro: el sensor conserva el último valor, como ya
+hacía la autonomía, y ABRP no recibe el odómetro.
+
+### Novedades de la versión 4.15.10
+
+**La salud de la batería ya no lee una temperatura ausente como 0 °C.** En un coche que no envía la
+temperatura de la batería, como el T03, una lectura hecha por la página web durante una carga guardaba
+0 °C, y la *Salud de la batería* dejaba fuera la carga como hecha en frío. Ahora una temperatura ausente
+queda vacía, y los 0 °C ya guardados de un coche así ya no se toman como lecturas.
+
+### Novedades de la versión 4.15.9
+
+**La salud de la batería cuenta las cargas de un T03.** El T03 envía el nivel de batería en puntos
+enteros, y la página *Salud de la batería* tomaba cada punto ganado en una carga AC por una recalibración
+de la batería y dejaba fuera la carga: la página se quedaba sin cifra. Ahora un punto cada vez es una
+subida normal; un salto real sigue dejando fuera una carga. También cuentan las cargas ya registradas.
+
+### Novedades de la versión 4.15.8
+
+**El asistente de configuración ofrece los paquetes del extensor de autonomía.** Un C10 o un B10 con
+extensor de autonomía puede elegir su paquete (*28.4 kWh — REEV* o *18.8 kWh — REEV*) en *Paquete de
+baterías* del asistente de configuración. Hasta ahora la versión oficial los dejaba fuera de la lista.
+
+**El paquete de diagnóstico muestra lo que respondió la nube.** Con *Información del sistema* marcado, el
+archivo de *Ajustes → Diagnóstico → Descargar el diagnóstico* tiene una sección con las respuestas de la
+nube a las últimas peticiones de Mate: cuántas por dirección, y cada inicio de sesión, renovación y
+respuesta rechazada, con su hora. No contiene parámetros, VIN ni tokens.
+
+### Novedades de la versión 4.15.7
+
+**La salud de la batería cuenta entera una carga unida.** Una carga que el coche registró en partes y que
+se unió en una sola sesión (por Mate tras una pausa corta, o a mano con *Unir con la anterior* en la página
+*Cargas*) ahora da a la página *Salud de la batería* la energía de todas sus partes. Hasta ahora solo
+contaba la primera parte: la carga quedaba fuera del gráfico, o daba una capacidad calculada con solo una
+parte de la sesión.
+
+### Novedades de la versión 4.15.6
+
+**El sensor MQTT del conector sigue al cable.** Con MQTT activado, el sensor *Plug Connected* (y
+`evcc/plugged` para EVCC) ahora está encendido siempre que el Resumen muestra el cable: también después
+de terminar una carga, o mientras una carga espera su programación, con el cable todavía conectado.
+Hasta ahora seguía solo la sesión de carga, y se apagaba con el cable aún conectado.
+
+**La imagen del coche aparece enseguida.** Mientras el coche carga, el Resumen muestra enseguida el coche
+con su cable y pone la animación de carga en su lugar cuando está lista, en vez de una tarjeta vacía
+durante unos segundos. Tras reiniciar Mate, la primera imagen tampoco espera ya una descarga.
+
+### Novedades de la versión 4.15.5
+
+**Salud de la batería conserva tus vistas.** La página sigue actualizándose sola cuando queda abierta, y
+ahora las vistas elegidas en sus dos gráficos (*Distancia*, *% perdido*, *por fecha*) vuelven con ella:
+se guardan en la dirección de la página, como un calendario guarda su mes.
+
+**El gráfico de una carga en curso ya no parpadea.** En cada actualización, cada 30 segundos, la
+tarjeta se quedaba un instante sin gráfico y la página de debajo saltaba; ahora el gráfico nuevo ocupa
+el lugar del anterior.
+
+**La temperatura exterior tras un reinicio.** Cuando Open-Meteo rechaza la primera consulta tras
+reiniciar Mate, Mate conserva la lectura de la última posición del coche, si tiene menos de 20 minutos,
+en lugar de quedarse hasta 20 minutos sin ella.
+
+### Novedades de la versión 4.15.4
+
+**La temperatura exterior sin GPS.** Cuando la nube no envía la posición GPS de un coche parado,
+Mate consulta la temperatura exterior en la última posición conocida del coche, siempre que el
+cuentakilómetros no haya cambiado desde entonces. Hasta ahora el valor se quedaba fijo, y tras
+reiniciar Mate faltaba.
+
+### Novedades de la versión 4.15.3
+
+**La línea de la wallbox se queda con la carga.** Con la wallbox activada y Home Assistant
+configurado, Mate guarda ahora las lecturas de la wallbox de cada carga en casa, así que la línea verde
+*Wallbox (CA)* de su gráfico ya no desaparece cuando Home Assistant borra su historial, y el gráfico se
+abre más rápido. Una sola vez después de la actualización, las líneas de las cargas anteriores se
+copian de lo que Home Assistant todavía conserva (#419, @arekm).
+
+**Un helper de kWh personalizados en Wh.** Con el precio *kWh personalizados (Home Assistant)*, un
+helper que da Wh ahora se cobra en kWh (#419).
+
+**Las horas de los gráficos en el móvil.** En el móvil, las horas bajo el gráfico de una carga o de un
+viaje ya no se superponen.
+
+### Novedades de la versión 4.15.2
+
+**El gráfico de una carga llega al abrir su fila.** En el calendario de Cargas, el gráfico de una carga
+se pide en cuanto abres su fila, también en el móvil, donde queda debajo del borde de la pantalla, y
+dibuja como mucho una lectura por cada píxel de ancho, así que una carga nocturna aparece varias veces más
+rápido. Lo que dibuja son lecturas reales, y una pausa sigue cortando la línea (#417, @arekm).
+
+**Una fila abierta se pone a la vista.** Una fila de carga que abres en la parte baja de la pantalla
+ahora se desplaza, una vez dibujado su gráfico, lo justo para verse entera, o hasta su inicio si es más
+alta que la pantalla. Las filas abiertas con *Desplegar todo* se quedan donde están (#418, @arekm).
+
+### Novedades de la versión 4.15.1
+
+**Una carga termina cuando deja de entrar energía.** Después de una carga, con el cable enchufado, el
+coche mantiene abierta su sesión de carga un rato más. Mate termina ahora la carga cuando deja de entrar
+energía, así que su hora de fin y su duración son las de la carga en sí, y cuando la batería ha alcanzado
+el límite de carga fijado en el coche, el Resumen dice *Carga completada* en lugar de *Cargando*
+(#414, @arekm).
+
+**Una fila que termina otro día lo dice.** En los calendarios de Cargas y Trayectos, una carga o un
+trayecto que termina al día siguiente de empezar muestra ese día antes de su hora de fin, por ejemplo
+«23:05 → 09 oct 06:40» (#415, @arekm).
+
+### Novedades de la versión 4.15.0
+
+**Una carga se lee como un viaje.** En el calendario de Cargas cada carga es ahora una fila, con una
+miniatura de su curva al lado; un clic la abre debajo, con la energía, la temperatura de la batería, la
+exterior y la potencia media, el gráfico, la nota y las acciones. *Desplegar todo* abre todas las filas
+del día. Con Mayús-clic, arrastrando o manteniendo pulsado un día se abren varios días a la vez, con los
+totales del intervalo y de cada día (#412, @arekm).
+
+**La potencia de una carga lenta.** *Estado de la carga* en la página Cargas y la carga en curso en el
+Resumen muestran ahora también la potencia de una carga por debajo de 3 A, que en un C10, a unos 720 V, es
+una carga en casa por debajo de unos 2,2 kW: antes decían 0,00 kW (#409).
+
+**Una programación guardada aquí se ve enseguida.** Tras una ventana de carga guardada en la página
+*Programación* y confirmada por el coche, el Resumen muestra enseguida la ventana nueva, en lugar de la
+antigua durante hasta 30 minutos (#395).
+
+### Novedades de la versión 4.14.2
+
+**Una contraseña rechazada se nombra.** Cuando Leapmotor rechaza el correo y la contraseña que diste a
+Mate, el Resumen dice ahora «la contraseña fue rechazada» y te remite a la cuenta de Leapmotor en
+Ajustes, y Mate espera una hora antes de volver a probar la misma contraseña, en lugar de cada 5 minutos
+(#411). Una contraseña que cambies en Ajustes se prueba enseguida.
+
+### Novedades de la versión 4.14.1
+
+**Una lectura se queda con su coche.** En una cuenta con dos coches, una lectura que Mate tomaba después
+de un comando, o con el botón 🔄 Actualizar, podía guardarse en el otro coche si cambiabas de coche en la
+barra lateral mientras la nube respondía: ese coche mostraba entonces un día con miles de kilómetros y
+una pérdida en reposo que nunca tuvo. Ahora la lectura se guarda siempre en el coche del que se leyó
+(#338). Una fila ya guardada en el coche equivocado se queda donde está.
+
+### Novedades de la versión 4.14.0
+
+**Mate ya no escribe la nota de las cargas.** Hasta ahora, con los ajustes predeterminados, Mate escribía
+una nota en cada carga que cerraba — la dirección, las horas, las temperaturas — y, para encontrar la
+dirección, enviaba a OpenStreetMap la posición de cada carga fuera de casa, incluso con la búsqueda de
+direcciones apagada. Las dos cosas se acaban: la nota es tuya, como la de los trayectos desde la 4.13.0,
+y las notas escritas antes se quedan como están. Las horas están en el encabezado de la carga, las
+temperaturas en su gráfico y la dirección en su línea 📍. Una carga que allí aún no tiene dirección, una
+más antigua por ejemplo, tiene **🧭** junto a 📍: pregunta en el momento al servicio elegido en *Ajustes →
+Búsqueda de direcciones*, incluso con el interruptor apagado, y vuelve a dibujar la línea; si no llega
+ninguna dirección, una línea debajo dice por qué. *Escribir la nota sola* desaparece de esa tarjeta. El
+🧭 de un trayecto también dice ahora por qué no llegó una dirección: el servicio no tiene nada allí, o
+cómo falló la petición. De @arekm (#406).
+
+**Mate dentro de Home Assistant desde una instalación Docker.** Con hass_ingress en su modo
+predeterminado `ingress`, pon en `MATE_FRAME_ANCESTORS` la dirección con la que abres Home Assistant. El
+README explica ahora qué hace una contraseña de Mate dentro de un marco (#407).
+
+### Novedades de la versión 4.13.1
+
+**Cada carga muestra dónde se hizo.** Junto a 📍 una carga muestra el cargador con su dirección detrás;
+sin cargador, tu lugar de carga allí, con «(lugar de carga)», o la dirección — también una carga en casa.
+Las direcciones vienen de la misma búsqueda que las de los trayectos, así que una carga donde ya terminó
+un trayecto no cuesta ninguna petición; el interruptor de *Ajustes → Búsqueda de direcciones*, que ahora
+se llama **Buscar las direcciones de trayectos y cargas**, vale para ambos. Las cargas de más de tres días
+no se buscan solas. La búsqueda en Cargas y en Eventos encuentra una carga por su dirección, su ciudad o
+su código postal, y el CSV de cargas gana `place` y `address`. Un trayecto unido cuyo último tramo terminó
+en los últimos tres días ahora tiene su origen buscado aunque el primer tramo terminara antes. De @arekm
+(#405).
+
+### Novedades de la versión 4.13.0
+
+**Los trayectos muestran de dónde salieron y adónde llegaron.** La fila de un trayecto dice «A → B», el
+*Resumen del viaje* en su página nombra los dos extremos, y lo mismo las filas de inicio y fin del
+trayecto en Eventos. Un extremo dentro de uno de tus lugares de carga muestra su nombre con «(lugar de
+carga)»; en otro sitio es la dirección. Mate busca las direcciones poco después de que termine un
+trayecto, con el servicio elegido en *Ajustes → Búsqueda de direcciones*; allí el nuevo interruptor
+**Buscar el origen y el destino de los trayectos** lo desactiva, y tras la actualización empieza como
+estaba **Escribir la nota sola**. Los trayectos de más de tres días no se buscan solos: la 🧭 junto a una
+dirección que falta en el *Resumen del viaje* busca ese trayecto al momento. La búsqueda encuentra un
+trayecto por cualquiera de sus dos extremos, y el CSV de trayectos gana `start_place` y `end_place`.
+Mate ya no escribe sola la nota de un trayecto —**Escribir la nota sola** ahora vale solo para las
+cargas— y las notas escritas antes se quedan como están. De @arekm (#404).
+
+### Novedades de la versión 4.12.1
+
+**Al recargar la página te quedas en el mes que estás mirando.** En los calendarios de Trayectos,
+Cargas, Wallbox y Repostajes, el mes en pantalla va en la dirección de la página (por ejemplo
+`?month=2026-09`), así que una recarga —la tuya o la que la página hace sola— vuelve a ese mes, con el
+día o el intervalo que tenías abierto; antes volvía siempre al mes actual. El botón Atrás del navegador,
+después de abrir un trayecto, hace lo mismo. **Ir a hoy** quita el mes de la dirección. Cuando termina
+una carga, la página Cargas se recarga sola y ahora se queda en el mes que estás mirando: la carga
+nueva está en el mes actual, a un clic en **Ir a hoy**. En Repostajes, añadir o borrar un repostaje
+redibuja el mes en pantalla, y ya no el mes actual. De @arekm (#403).
+
+### Novedades de la versión 4.12.0
+
+**Varios días a la vez en el calendario de Trayectos.** Una semana, un fin de semana o unas vacaciones
+se abren con un solo gesto: en el ordenador, **Mayús+clic** en un segundo día, o **arrastrar** el ratón
+sobre los días; en el móvil, **mantener pulsado** un día —lo marca un borde discontinuo— y luego
+**tocar** el último. El cajón se abre con una cabecera para todo el intervalo —batería, tiempo de
+conducción, kilómetros y las demás cifras de un día— y debajo cada día con trayectos, del más reciente
+al más antiguo, con su propia cabecera. El intervalo se queda dentro del mes en pantalla. La fecha de un
+día bajo el intervalo abre ese día solo, con su botón 🔗 para unir trayectos, que un intervalo no tiene.
+Los demás calendarios siguen abriendo un día por clic. Una línea bajo el calendario de Trayectos
+recuerda los tres gestos. De @arekm (#402).
+
+Si el coche cargó entre el primer trayecto y el último —en unos días casi siempre ocurre—, la batería
+del intervalo se lee como la de un día con una carga: lo que gastaron los trayectos y lo que añadieron
+las cargas, y cada una de las dos cifras dice qué cuenta al pasar el puntero o tocarla. Por eso la cifra
+del intervalo puede no coincidir con la suma de las de sus días: un día sin cargas va de su primera
+lectura a la última, y cuenta también lo que el coche perdió parado entre sus trayectos.
+
+**El cajón muestra el último día elegido.** Dos días elegidos seguidos enviaban dos peticiones a la
+vez, y una respuesta lenta del primero podía llenar el cajón bajo el borde del segundo —en los cuatro
+calendarios—. Ahora una nueva elección sustituye a la petición que aún está en camino, y la franja
+**Volver a intentarlo** de un día que no se pudo cargar desaparece en cuanto pides otro. De @arekm
+(#402).
+
+### Novedades de la versión 4.11.2
+
+**El parasol lleva el nombre de la app oficial en todos los idiomas.** Las páginas lo llamaban
+«Techo panorámico» en las tarjetas de Vehículo y Comandos, y «cortinilla» en las confirmaciones, en
+Eventos y en el aviso que se muestra durante la conducción. En español ahora es el **Parasol** en
+todas partes: las tarjetas, las confirmaciones («¿Abrir el parasol?») y Eventos («Parasol abierto al
+40%»); la tarjeta de Vehículo dice «Abierto» / «Cerrado», en masculino como la palabra. Los demás
+idiomas también toman los nombres de la app (#391). Nada cambia en Home Assistant.
+
+### Novedades de la versión 4.11.1
+
+**En italiano, la cortinilla se llama «Parasole».** Las páginas en italiano la nombraban de tres
+maneras: «Tetto panoramico» en las tarjetas de Vehículo y Comandos, «tendina» en Eventos y en las
+confirmaciones, y «parasole» en el aviso que se muestra durante la conducción. Ahora dicen
+«Parasole» en todas partes, el nombre que le da la app oficial. Nada cambia en español ni en Home
+Assistant.
+
+### Novedades de la versión 4.11.0
+
+**El T03 recupera sus ventanillas en Comandos.** Desde la 4.0.0, Mate buscaba el código de las
+ventanillas que declaran el B10 y el C10, y un T03 declara otro: en un T03, la tarjeta **Ventanillas**
+de Comandos ocultaba su botón **Abrir** / **Cerrar**, y el control deslizante que quedaba respondía
+*«Command not sent»*. Ahora basta cualquiera de los dos códigos, y un T03 recibe la posición en su
+propia escala de 0 a 100. Aún no probado en un T03 (#400). Donde es el propio coche quien no permite
+las ventanillas, el control deslizante desaparece ahora junto con el botón.
+
+**Mate arranca en una carpeta compartida de un NAS.** Desde la 4.0.0, una carpeta de datos que no
+conserva los permisos de los archivos — como puede serlo la carpeta compartida de un NAS con sus
+propias reglas de acceso — detenía Mate al arrancar con *«Private directory permissions required»*.
+Ahora Mate arranca, y escribe una vez en el registro que quién puede leer los archivos de la cuenta lo
+deciden los permisos de esa carpeta. En un disco normal, una carpeta de datos abierta a todos se sigue
+rechazando (#401).
+
+**La cortinilla en porcentaje.** La tarjeta del techo en la página Vehículo y la de la cortinilla en
+Comandos dicen cuánto está abierta; parada a medio camino, la tarjeta de Comandos ofrece tanto
+**Abrir** como **Cerrar**, las dos posiciones que el coche ejecuta. La página Eventos indica dónde se
+detuvo, y Home Assistant recibe un sensor **Sunshade Position** en %. De @arekm (#391).
+
+**Un trayecto corto que la nube lee como 0,0 kWh conserva esa cifra.** Mate tomaba esa respuesta por
+una ausencia, volvía a preguntar durante seis horas y dejaba el trayecto sin energía. Si la batería
+marcaba el mismo valor en los dos extremos, el trayecto conserva ahora 0,0 kWh y cuenta en las medias;
+en un trayecto en el que la batería bajó, o no se leyó, un cero sigue sin ser una respuesta. De @arekm
+(#394).
+
+**Las ⓘ se abren al tocarlas.** Las ⓘ junto a la temperatura exterior en el Resumen y junto a la
+corriente máxima de la Wallbox se abren ahora al tocarlas, también en la app de Home Assistant, y una ⓘ
+nueva junto a **READY** dice qué significa ese estado. De @arekm (#399).
+
+**El paquete de soporte dice qué puede hacer tu cuenta con el coche**: sus permisos, y si el coche está
+compartido contigo, junto a lo que el coche declara — una orden puede rechazarse por una cosa o por la
+otra.
+
+### Novedades de la versión 4.10.0
+
+**La batería y el tiempo de conducción del día en Trayectos.** Abre un día en el calendario de
+Trayectos: su cabecera dice ahora cuánta batería gastaron los trayectos del día,
+*84,4% → 51,6% (−32,8%)* del primero al último — o, si el coche cargó entre medias, lo que gastaron los
+trayectos y lo que añadieron las cargas, *−45,3%* y *⚡ +40,2%* — y cuánto tiempo se condujo ese día,
+sin los trayectos reconstruidos, como lo cuenta Estadísticas. Si falta una lectura, la batería no
+aparece en lugar de adivinarse. Cada cifra de la cabecera del día y de la franja del mes dice qué es
+cuando pasas el puntero por encima o la tocas. La fila de cada trayecto muestra su cambio de batería,
+*84,4→51,6% (−32,8%)*, también en el móvil, donde las horas del trayecto ya no quedan aplastadas. De
+@arekm (#392).
+
+**«Volver a la estimación» solo donde hay una.** En la página de un trayecto, el botón aparecía también
+en trayectos sin una estimación guardada aparte, donde pedía confirmación y luego no cambiaba nada.
+Ahora solo aparece donde puede devolver una estimación. De @arekm (#396).
+
+**La programación de carga espera la respuesta del coche.** Guardar una programación de carga, o
+enviar un destino al navegador, ahora espera a que el coche diga que la ha ejecutado, durante el
+tiempo que le da la nube — en un B10, 30 s si el coche duerme y 5 s si está despierto. «Programación
+guardada» significa que el coche la ha tomado; si el coche no contesta, aparece el aviso **ámbar** de
+que no ha confirmado a tiempo, y Mate conserva los horarios que tenía. Cada orden escribe ahora una
+línea en el registro: lo que ha enviado, sin la dirección ni las coordenadas de un destino, y lo que
+ha respondido la nube (#395).
+
+### Novedades de la versión 4.9.2
+
+**Un final dice que su tiempo llegó después del estado anterior.** En la página de Eventos,
+«Bloqueado · 4 min» se leía como un coche bloqueado desde hacía cuatro minutos, cuando esos minutos
+eran el tiempo que había estado desbloqueado. Ahora se lee «Bloqueado · tras 4 min». El final de un
+viaje y de una carga conserva su cifra, que es la duración del viaje o de la carga.
+
+**La fila a la que vuelves queda en pantalla, también en un teléfono lento.** Al volver de un viaje
+con el mapa abierto, un teléfono que dibuja despacio podía dejar esa fila debajo de la pantalla.
+
+**La página de Eventos lee solo los días que muestra**, y al bajar por una lista larga ya no la
+recompone para cada trozo: cada trozo siguiente llega al momento. En una Raspberry Pi la lectura del
+historial en el primer arranque también es más ligera, y con una retención del GPS fijada, un viaje
+todavía abierto conserva sus eventos igual que sus posiciones.
+
+### Novedades de la versión 4.9.1
+
+**La lista de Eventos ya no se desplaza bajo tus ojos.** Al recorrer un intervalo largo,
+los encabezados de hora y de día situados encima cambiaban de altura a medida que el navegador los
+alcanzaba, y lo que estabas leyendo se movía unos píxeles — hasta 25 de golpe. Ahora los
+encabezados de hora y de día declaran la altura que van a ocupar de verdad: ya no mueven lo que
+estás leyendo.
+
+### Novedades de la versión 4.9.0
+
+**Un enchufado es una carga.** Enchufas por la noche y desenchufas por la mañana, y la página
+Cargas mostraba cuatro sesiones. Es el coche el que las parte: declara el cable retirado en el
+instante en que la corriente se detiene, que es exactamente el aspecto que tienen, desde dentro del
+coche, una wallbox que equilibra la carga, un cargador que sigue al sol o una red que raciona la
+potencia. Los trozos ahora se vuelven a juntar solos, cuando la pausa es de menos de seis minutos y
+nada más ha cambiado — la misma unión que hace el botón **Unir con la anterior**, con todas sus
+comprobaciones. Nada se reescribe: **Separar** devuelve los trozos exactamente como los contó el
+coche, y una carga que has separado no se vuelve a unir nunca. En el primer arranque también vuelven
+a juntarse las noches que ya están en tu base de datos.
+
+**La energía de un trayecto ya no puede ser el doble de lo que perdió su batería.** Un trayecto de
+7 km marcaba 41,4 kWh/100km en el gráfico de consumo, porque la cifra de la nube era de 2,90 kWh
+donde la batería había perdido 1,07. Mate ya rechazaba una cifra por encima del doble de la batería,
+pero solo si además marcaba más de 60 kWh/100km. Cuando el nivel de carga ha bajado un punto entero
+o más — una medida de verdad, no dos o tres décimas de redondeo —, el doble de la batería basta
+ahora por sí solo. Los trayectos ya convertidos vuelven a la estimación por batería en el primer
+arranque.
+
+**Los kilómetros medidos sin contacto dicen cuántos de ellos han vuelto.** Los trayectos que el
+historial de Leapmotor devuelve para un tramo de silencio aparecen ahora junto a esa cifra, en las
+Estadísticas y en el mes del calendario de Trayectos. No se le restan: esos kilómetros se recorrieron
+sin contacto igualmente, y el silencio sigue sin poder repartirse entre el final de un trayecto, una
+parada y el comienzo de otro.
+
+**El ajuste de capacidad dice por qué los kilovatios-hora de la app oficial salen más altos.** La
+app oficial cuenta todo el paquete, búfer incluido; Mate cuenta la parte útil. La misma energía,
+medida sobre un 100 % distinto.
+
+### Novedades de la versión 4.8.0
+
+**Una página Eventos cuenta, momento a momento, lo que hizo el coche.** Cerrado, abierto, puertas,
+ventanillas, cable, climatización, READY, trayectos, cargas y las órdenes que enviaste — un comienzo
+y un final son dos filas unidas por una línea del color del grupo, así que lo que ocurrió a la vez,
+y durante cuánto tiempo, se ve de un vistazo. Un mapa junto a la lista dice dónde; los filtros por
+palabra, grupo y tipo viven en la dirección, de modo que un enlace o una recarga los conserva. Los
+eventos se derivan de las posiciones que Mate ya guarda: en una instalación existente el primer
+arranque relee todo el historial, una porción por lectura, y la página dice por dónde va. Gracias a
+**@arekm**, que la escribió.
+
+**Un trayecto termina cuando termina el coche.** Ir a buscar a alguien — sin apagar, solo Park y una
+espera — cerraba el trayecto al cabo de un minuto y abría otro al reanudar la marcha. Ahora el
+trayecto termina en la lectura que muestra el coche **apagado**: esperar en Park con el coche
+encendido es una parada dentro del trayecto, como un semáforo. Un recado es un solo trayecto, y el
+consumo oficial que la nube mide del encendido al apagado le pertenece entero.
+
+**Un fallo que Mate aplazó ya no esconde el de verdad.** Mate guarda un minuto entre dos inicios de
+sesión, y la lectura que caía dentro de ese minuto decía «Login temporarily deferred after a recent
+attempt» — palabras sobre nuestro propio temporizador, que ocupaban el lugar del fallo que de verdad
+mantiene lejos la nube.
+
+### Novedades de la versión 4.7.18
+
+**Restaurar una copia de seguridad funciona en Windows.** En MateDesktop para Windows, restaurar una
+copia de la base de datos respondía un error, porque el archivo no se podía sustituir mientras Mate
+lo mantenía abierto. Ahora la copia entra en la base de datos en uso; nada más cambia.
+
+**Un fallo hacia la nube dice por qué.** Donde el registro, la página de configuración y el paquete
+de diagnóstico decían solo «Cloud transport failed» o «stage=transport», ahora añaden una palabra:
+«dns_failure», «timeout», «connection_refused», «certificate_rejected», etc.
+
+**Actualizar una instalación Docker:** el manual ya no sugiere Watchtower, que ha sido archivado.
+Descarga la imagen y vuelve a crear el contenedor.
+
+### Novedades de la versión 4.7.17
+
+**El Resumen muestra el cable mientras el cargador lo retiene.** Un wallbox programado toma el cable y no
+da corriente hasta que se abre su ventana; el Resumen entonces no mostraba el cable. Ahora lo lee también
+desde la toma AC del coche: la etiqueta sobre el coche dice «Cable conectado (Sin cargar)», o «(Carga
+completada)», y la palabra bajo el coche dice «Aparcado». Por @arekm.
+
+### Novedades de la versión 4.7.16
+
+**Una escritura que encuentra la base de datos ocupada ya no bloquea todas las siguientes.** Una
+escritura que había esperado demasiado a la base de datos dejaba su transacción abierta, y desde entonces
+cada escritura fallaba con «database is locked» hasta reiniciar el contenedor: 17 horas perdidas en una
+instalación. Cada ciclo de lectura cierra ahora primero esa transacción, y lo dice en el registro.
+
+**Un T03 vuelve a leer su programación de carga.** Tras guardar, la página Cargas mostraba «Sin
+programación», porque la configuración del T03 no la contiene. Ahora Mate la lee donde la leía la
+biblioteca anterior, solo en un coche cuya configuración no dice si la programación está activa ni
+cuándo empieza.
+
+**Informe se llama Informes**, en el menú y en la página, como todas las demás entradas del menú.
+
+### Novedades de la versión 4.7.15
+
+**Un T03 vuelve a guardar su programación de carga.** Desde la 4.7.7, la página Cargas se negaba a
+guardar la programación de carga de un T03 o a fijar su límite de carga («complete current charging
+configuration is required»). Ahora Mate completa lo que el T03 no envía, como hacía la biblioteca
+anterior.
+
+### Novedades de la versión 4.7.14
+
+**El gráfico de la carga en curso, en directo.** Mientras el coche carga, la página Cargas muestra entre
+las tarjetas de arriba el gráfico *📈 Datos de la carga* de esa carga, que crece con cada consulta. En
+casa dibuja la línea de la wallbox junto a la del coche; una pausa con el cable enchufado cuenta como
+0 kW. Cuando las lecturas dejan de llegar, EN DIRECTO deja paso a la antigüedad de la última. De @arekm.
+
+**El Informe mensual ahora se llama Informe**, en el menú y en la página. Nada más cambia.
+
+### Novedades de la versión 4.7.13
+
+**Un T03 vuelve a recibir comandos.** Desde la 4.7.7 ningún comando llegaba a un T03; con la 4.7.12
+cada uno terminaba en «signal». Antes de un comando, Mate comprueba la última lectura del coche, y la
+de un T03 la buscaba en el lugar equivocado.
+
+**Una carga que falta no es 0 %.** *Actualizar* guardaba al 0 % una lectura sin nivel de carga. Ahora
+no guarda nada, como el poller, y las posiciones ya guardadas así se quitan una sola vez, en el primer
+arranque.
+
+### Novedades de la versión 4.7.12
+
+**Un T03 muestra sus lecturas.** Con la 4.7.11 un T03 volvía a leerse, pero Mate mostraba 0 %, 0 km y
+0 °C: la nube responde a un T03 con campos con nombre, y la 4.7.11 los leía como numerados. Ahora se
+leen por su nombre, y las posiciones guardadas al 0 % se quitan una sola vez, en el primer arranque.
+
+**El paquete de diagnóstico deja fuera también las coordenadas con nombre.** Si publicaste un paquete
+tomado en un T03 con la 4.7.11, contiene la posición de tu coche: bórralo.
+
+### Novedades de la versión 4.7.11
+
+**Un T03 vuelve a leerse.** Desde la 4.7.7, un T03 recibía de la nube «No data found» en cada
+consulta, y Mate no registraba nada. Ahora Mate pide un coche que nunca ha leído con el modelo con el
+que la nube lo lista, y después en la dirección que usaba la biblioteca anterior; el camino que
+responde se guarda para ese coche. Los coches que ya se leían se leen exactamente como antes.
+
+**Datos de la carga.** Bajo cada carga, *📈 Datos de la carga* abre un gráfico en bandas como el de un
+viaje: la potencia con los minutos que según el coche faltaban, el nivel de carga y las temperaturas —
+la de la celda más fría y, si está activada, la del aire exterior.
+
+### Novedades de la versión 4.7.10
+
+**Un C10 con extensor de autonomía vuelve a mostrar la corriente y la potencia de carga.** Desde la
+4.0.0, durante una carga AC de un C10 con extensor de autonomía, Mate descartaba la corriente de la
+batería y la potencia calculada a partir de ella: Home Assistant mostraba *Charge Current* y *Charge
+Power* como desconocidos, y la potencia máxima de cada carga era 0,0 kW. El sensor del coche sí mide,
+y ambas vuelven. Las cargas registradas antes de esta actualización se quedan en 0,0 kW: su corriente
+no se había guardado.
+
+### Novedades de la versión 4.7.9
+
+**Los meses anteriores de los trayectos, desde la nube de Leapmotor.** En **Ajustes → Historial de
+trayectos en la nube**, con **Importar trayectos de la nube de Leapmotor** activado, el nuevo menú
+**Importar también los meses anteriores, desde** muestra los meses de septiembre de 2026 al mes
+pasado. Se elige una sola vez: Mate descarga ese mes y todos los siguientes, una sola vez cada uno, y
+los meses que terminan se añaden solos. La línea bajo el menú dice qué añade la elección. La nube de
+Leapmotor no tiene ningún trayecto individual antes de septiembre de 2026.
+
+**La salud de la batería se abre más rápido**, igual que el gráfico de potencia de una carga
+([#363](https://github.com/ProtossBlaster/leapmotor-mate/pull/363), de @hubcasale): medido con
+cuatro meses de historial, de unos 1,4 s a 0,05 s.
+
+### Novedades de la versión 4.7.8
+
+**Una instalación nueva arranca limpia.** En el primer arranque, con la carpeta de datos vacía, los
+dos procesos de Mate podían abrir la base de datos nueva en el mismo instante y el que registra se
+detenía con «database is locked». Ahora espera los pocos milisegundos que necesita el otro. Las
+instalaciones existentes nunca lo encontraron.
+
+### Novedades de la versión 4.7.7
+
+**Nada que descargar para configurar Mate.** El certificado de la app de Leapmotor que Mate necesita
+para iniciar sesión — el mismo para todo el mundo, identifica la app y no a ti — ahora viene incluido
+en Mate y se instala solo en el primer arranque. El asistente va directo a tu cuenta: el paso del
+certificado y su enlace ya no están. Una instalación que ya tiene el certificado lo conserva; uno
+subido en el antiguo formato de exportación, con líneas de atributos al principio, se reescribe como
+la copia que trae Mate — es el mismo certificado — y los archivos anteriores quedan en una carpeta de
+copia de seguridad junto a los datos.
+
+**Mate funciona solo con su propio cliente de la nube.** El cliente es el de Mate desde la 4.0, pero
+una instalación cuya primera comprobación nunca terminó se volvía a poner en la biblioteca de terceros
+que Mate usaba antes. Esa biblioteca y ese recurso ya no existen: cada instalación usa el cliente de
+Mate. Una que seguía en la biblioteca antigua inicia sesión una vez con el cliente nuevo en el primer
+arranque. En el paquete de diagnóstico la línea `Cloud client` dice `independent (mate-api)` para
+todos.
+
+**Un C10 ya no muestra 0 km junto a una batería llena.** Al dormirse, el C10 envía su autonomía a 0
+con la batería todavía cargada, y la vista general mostraba «100 % · 0 km». Mate ya no toma ese cero
+por una lectura: la vista general mantiene la última autonomía que informó el coche, y Home Assistant
+mantiene su último valor. Por debajo del 5 % de carga un cero sigue contando, porque una batería
+vacía puede significarlo.
+
+**La tarjeta de costes cuenta una sola vez una carga unida.** En Estadísticas, la tarjeta del coste por
+100 km decía que a una carga le faltaba el precio cuando era una de las dos filas que habías unido.
+Ahora cuenta las cargas como las muestra la página Cargas; los euros y los kWh no cambian.
+
+### Novedades de la versión 4.7.6
+
+**Un viaje termina ahora cuando apagas el coche.** Mate da un viaje por terminado cuando el coche ha
+estado en P alrededor de un minuto, y escribía ese minuto *entero* dentro del viaje. El final — hora,
+nivel de carga, cuentakilómetros, posición y combustible — viene ahora de la primera lectura de esa
+parada que muestra el coche **apagado**. Sobre cuatro meses de historial de un propietario, esto movió
+el final de 183 viajes, de 7 a 54 segundos (42 de media). Se ve en los viajes cortos: un salto de 1 km
+que marcaba 2,9 minutos a 21 km/h ahora marca 2,2 minutos a 27 km/h. Kilómetros, kWh y consumo no
+cambian.
+
+Si bajas a abrir una verja y vuelves a subir para meterte marcha atrás en el sitio, sigue siendo un
+solo viaje. Un coche que se queda encendido en P, o que no dice si está encendido, conserva el final
+que Mate escribía antes.
+⚠️ **Los viajes ya registrados no cambian** — se aplica a partir de esta versión.
+
+ℹ️ En un viaje de uno o dos kilómetros la nube da a veces su energía como 0,0 kWh, y Mate prefiere la
+cifra del coche a su propia estimación. Algunos viajes muy cortos pueden por tanto marcar
+`0,00 kWh/100 km` donde antes mostraban una estimación de unas centésimas.
+
+**La página Cargas se abre al instante.** Abrir las Cargas, o un día de su calendario, leía todo el
+registro de posiciones por cada carga de la página. En una base de datos con 381.076 filas de posición
+pasó de **880 ms a 1 ms**, con las mismas cifras en pantalla.
+
+**A una carga que has unido se le puede asignar su lugar directamente.** Antes había que separarla,
+asignar el lugar y volver a unirla; ahora el lugar vale para todo el grupo. Unir y separar tampoco
+recargan la página entera ni pierden el día que estabas viendo.
+
+### Novedades de la versión 4.7.5
+
+Dos cambios, ambos encontrados en un mismo paquete de diagnóstico enviado por un usuario.
+
+**Mate ya conoce el B03X.** La nube de Leapmotor envía el nombre de proyecto *chino* de un coche, así
+que el crossover vendido en Europa como B03X llega como `A10`, y Mate no tenía ninguna entrada para
+él. Su batería recaía entonces en la cifra que se usa para un coche desconocido, 65,0 kWh, que el
+B03X nunca ha tenido; y el asistente no ofrecía ninguna variante, por lo que el primer propietario en
+llegar escribió un número a mano. Escribió 53,0, la cifra de la ficha técnica — la capacidad
+**nominal** — cuando ese campo quiere la **útil**, la energía que el coche deja extraer de verdad. El
+asistente ofrece ahora las dos baterías del B03X: **39,0 kWh** (nominal 39,8, 292 km WLTP) y
+**52,0 kWh** (nominal 53,0, 382 km).
+
+⚠️ **Si ya escribiste una capacidad, Mate no la toca** — nunca sobrescribe un número que hayas
+elegido. Un B03X puesto en 53,0 lee alrededor de un 2 % menos en cada cifra de energía; cámbialo a
+52,0 en **Ajustes → Batería** y a partir de ahí es correcto.
+
+**El B03 no es el B03X.** Los separa un carácter y son dos coches distintos: el B03 es el compacto de
+cinco puertas, unos 10 cm más corto. Todavía no está en Mate, a propósito: no está a la venta y las
+cifras de su batería no se publican en ninguna parte. Dos cosas que el B03X tampoco tiene: un plan de
+mantenimiento validado y una escala de apertura de ventanillas medida, por lo que el porcentaje de
+las ventanillas puede ser incorrecto.
+
+**Si envías un paquete de diagnóstico, ahora dice por qué tu instalación sigue con el cliente de nube
+anterior** — el estado, el motivo y cuándo se intentó el cambio por última vez. La identidad de tu
+cuenta sigue sin aparecer nunca en un paquete.
+
+### Novedades de la versión 4.7.4
+
+Tres cambios de una persona que contribuye. Dos tienen que ver con que Mate pregunte menos; el tercero
+con una señal que, cuando el coche no la enviaba, se anotaba como si el coche hubiera respondido.
+
+**Mate deja de volver a pedir la temperatura exterior cuando el servicio meteorológico rechaza.** La
+lectura viene de un servicio gratuito con un cupo diario. Una petición fallida no dejaba nada, así que
+el siguiente sondeo volvía a pedir, y todos los siguientes también — en un día con el cupo agotado,
+eso fueron 432 rechazos en menos de cuatro horas. Una petición fallida ahora espera veinte minutos,
+exactamente lo que ya se confía en una lectura buena; medido sobre cuatro horas de peticiones
+rechazadas, 480 antes y 12 ahora. Si falla la primerísima petición tras un arranque te quedas veinte
+minutos sin temperatura exterior; una lectura que ya existe se conserva, como antes.
+
+**Un READY que el coche no envió ya no se anota como «apagado».** READY dice si el coche está
+encendido, y Mate lo usa para saber si dos trayectos pertenecen al mismo encendido — que es lo que
+decide cuándo te propone unir dos trayectos. Una trama puede llegar sin él, y esa ausencia se guardaba
+como un cero. Una parada en P durante la cual el coche no dijo si estaba encendido mantenía dos
+trayectos en un mismo encendido, durase lo que durase; ahora se comporta exactamente como un apagado
+que se ve, y un par de segundos en P para cambiar un modo de conducción dejan el trayecto entero. La
+tarjeta de estado muestra un guion para un valor que el coche nunca envió. Para un coche que informa
+READY no cambia nada: todo el historial real se reconstruye idéntico.
+
+También en esta versión, invisible desde tu instalación: la suite de pruebas de Mate ya no llama al
+exterior. Resolvía 187 direcciones externas en cada ejecución, suficiente para que dos ejecuciones en
+una hora agotaran el cupo por hora que GitHub concede a una dirección — y una instalación que
+compartía esa dirección veía luego rechazada su propia comprobación de actualizaciones.
+
+### Novedades de la versión 4.7.3
+
+Dos cambios, los dos de personas que usan Mate, y uno de ellos corrige algo que este proyecto dijo
+mal en público.
+
+**Mate deja de pedirle al cloud que inicie sesión cada dos horas.** La versión 4.4.0 le había
+enseñado a renovar una sesión en lugar de volver a comprarla con un inicio de sesión, y decía que eso
+significaba unos un inicio de sesión por semana. No era así: la renovación solo se usaba cuando el
+cloud rechazaba un token a mitad de una petición, así que una sesión que caducaba con normalidad
+seguía costando un inicio de sesión — medido en una instalación real, uno cada 119 minutos, doce al
+día, mientras el billete de renovación guardado al lado seguía sirviendo otra semana. Ese cloud
+raciona los inicios de sesión, y uno rechazado es un tramo en el que Mate no recibe nada: ni mapa, ni
+duración, ni velocidad. Tras la corrección, en la misma instalación: seis renovaciones seguidas en
+una noche y ningún inicio de sesión. No hay nada que hacer por tu parte.
+
+**Un lugar de carga puede decir qué tipo de cargador es.** Los lugares se pensaron para una segunda
+casa, así que cada lugar guardado tipificaba sus cargas como Casa — incluido un cargador del trabajo
+o uno municipal gratuito. Un lugar lleva ahora su propio tipo (Casa, AC, DC, HPC o Gratis), y el tipo
+fija el precio además de la etiqueta: un lugar tipificado AC a 0,45 cobra 10 kWh a 4,50, y uno Gratis
+no cuesta nada sea cual sea la tarifa que le quedara puesta. Los lugares que ya tienes leen Casa,
+exactamente como antes. Asignar un lugar a una carga ya no recarga toda la página, así que el día que
+tuvieras abierto en Cargas sigue abierto.
+
+### Novedades de la versión 4.7.2
+
+Nueve cosas que Mate ya sabía y no usaba.
+
+**Los kilómetros recorridos mientras Mate no veía el coche se conservan.** Si el cuentakilómetros se
+movió mientras Mate estaba sin contacto, ese salto es el único rastro del trayecto — y se perdía en
+dos casos: cuando la lectura de vuelta no traía cuentakilómetros, y cuando enchufabas nada más
+llegar a casa. Ahora se reconstruyen los dos. Si entre las dos lecturas hay una carga, los
+kilómetros se conservan sin una cifra de energía: la diferencia de batería a través de una carga no
+es lo que gastó el trayecto.
+
+**Una lectura que el coche no envió ya no se guarda como un cero.** Una velocidad ausente y una
+parada medida eran idénticas en el historial; y un cuentakilómetros ausente y otro parado, también.
+
+**Un trayecto interrumpido por un cambio de hora acaba donde acabó de verdad.** Si el reloj de tu
+máquina retrocede a mitad de camino — una corrección NTP, una Raspberry Pi que se despierta — el
+trayecto se cerraba en la lectura equivocada, tomando de ahí también su cuentakilómetros y su SoC
+finales.
+
+**Una carga que el coche deja de declarar se sigue dibujando.** Si bajas la wallbox a mitad de
+sesión y el coche deja de declarar la carga por debajo de su corriente de detección, el gráfico de
+potencia terminaba en ese minuto mientras la carga seguía durante horas. El gráfico, la comparación
+con la wallbox, el reparto por franjas y el coste con tarifa dinámica leen ahora toda la sesión. Tus
+kilovatios-hora y tus totales nunca se vieron afectados.
+
+**Las etiquetas ya no caen encima de sus valores** en los idiomas de palabras largas — el español
+sobre todo, en la tarjeta de resumen.
+
+**Una instalación que se quedó en el cliente antiguo de la nube lo vuelve a intentar.** Esa decisión
+se tomó una sola vez, varias versiones atrás, y una comprobación que simplemente agotó el tiempo o
+encontró la base de datos ocupada se guardaba como si fuera una respuesta.
+
+**El €/kWh de una carga ya dice por qué kilovatios-hora divide** — los que entregó el cargador o los
+que llegaron a la batería. Las dos cifras eran correctas; faltaba la palabra.
+
+**Una programación de carga que tu coche no aceptaba ya pasa.** Si el coche publica con un valor
+inesperado uno de los ajustes que Mate lee y reescribe tal cual, guardar la programación — o cambiar
+el límite de SoC — fallaba por completo. Esos ajustes son del coche, no de Mate: diga lo que diga,
+le vuelve igual.
+
+### Novedades de la versión 4.7.1
+
+Nada nuevo en pantalla: cinco puntos en los que Mate se paraba antes de terminar lo que estaba
+haciendo.
+
+**Un corte ya no deja un viaje grabado a medias.** Si Mate pierde la nube durante un trayecto y el
+coche está aparcado o cargando cuando el enlace vuelve dentro de la media hora, el viaje termina ahí
+y se queda con los kilómetros recorridos en el hueco. Tras un silencio más largo termina en lo último
+que dijo el coche, y los kilómetros posteriores se tratan como cualquier otro recorrido fuera de
+cobertura. Antes el viaje simplemente seguía abierto hasta que el poller se reiniciaba, y el
+siguiente trayecto abría un segundo al lado. Los viajes que una versión anterior dejó abiertos se
+ordenan en el siguiente sondeo. ⚠️ Si tienes fijada una **retención de GPS**, los puntos de un
+trayecto todavía en curso ahora se conservan hasta que termina, porque su final se lee de ahí.
+
+**El gráfico de potencia de una carga que hayas unido ya dibuja toda la sesión.** Bajar la potencia
+del cargador en mitad de la noche cerraba el gráfico en ese momento, mientras la sesión seguía horas.
+Los kilovatios hora y el coste siempre fueron correctos: solo se detenía el dibujo.
+
+**Dos mensajes dicen más.** Una programación de carga que Mate se niega a enviar ahora nombra el
+ajuste erróneo y el valor que publicó tu coche, en lugar de una sola frase válida para tres ajustes
+distintos. Y en una instalación que se está actualizando, un choque inofensivo entre las dos mitades
+de Mate ya no corta el resto de la actualización de la base de datos.
+
+**Tocar el logotipo de la parte superior de la página te lleva al inicio**, tanto en el móvil como en
+el ordenador.
+
+### Novedades de la versión 4.7.0
+
+**Si conduces un Leapmotor con extensor de autonomía, ahora Mate también es para ti.** Esos modelos
+solo se podían leer con la compilación BetaTester; sus páginas — la página REEV, la gasolina por viaje
+y por periodo y los **paquetes de batería REEV del asistente de configuración** — están ahora en el
+complemento normal y en la imagen Docker normal.
+
+**La cifra de gasolina es la del propio coche.** El historial de Leapmotor guarda, para cada viaje,
+cuánta gasolina dice el coche haber quemado: es el número que ves en la app oficial. Mate la calculaba
+por su cuenta, a partir del nivel del depósito en los dos extremos del viaje, y en el único viaje en
+el que se pudieron comparar los tres salía un **20,7 % menos**: 3,886 L frente a 4,9. Ahora gana la
+cifra del coche; el depósito queda como respaldo para un viaje del que Leapmotor no tiene registro, y
+cada cifra dice cuál de las dos estás mirando. ⚠️ **Algunos viajes antiguos se leerán distinto tras la
+actualización**: la ventana de Leapmotor es de unos 28 días, así que los viajes más antiguos conservan
+la respuesta del depósito, alrededor de una quinta parte más baja.
+
+**Un viaje que no ha quemado nada ahora lo dice.** Un extensor de autonomía circula casi siempre en
+eléctrico, y esos viajes no mostraban nada — igual que un viaje cuyo depósito Mate no pudo leer.
+Cuando el contador del coche lee el mismo valor en los dos extremos, eso es una medida, y ahora se lee
+`0 L` con *todo eléctrico* al lado. El blanco vuelve a significar una sola cosa: no lo sabemos.
+
+**La regeneración vuelve a ser frenada.** En un extensor de autonomía el generador recarga la batería
+mientras conduces, y Mate lo contaba como energía recuperada al frenar — en el único viaje medible era
+el 89 %. Ya no lo cuenta. La cifra sigue oculta en un extensor de autonomía, como antes, pero lo que
+se guarda ahora es honesto.
+
+**Un reinicio ya no estropea un viaje.** Cuando Mate se reinicia en mitad de un viaje, ese viaje se
+cierra después con lo ya registrado. Antes perdía el cuentakilómetros de llegada, el nivel de depósito
+de llegada y toda la regeneración, que marcaba 0,00 kWh — **esto último también en coches totalmente
+eléctricos**. Los tres se reconstruyen ahora a partir de las lecturas del propio viaje.
+
+Además: si tu base de datos rechaza las escrituras — algunos recursos compartidos de red lo hacen — la
+limpieza diaria ya no lo reintenta en cada consulta; en la instalación que lo notificó fueron 266
+intentos en cuatro horas.
+
+### Novedades de la versión 4.6.0
+
+En cada consulta mientras conduces, Mate lee la potencia que sale de la batería, la temperatura de su
+celda más fría, la estimación de autonomía y el aire exterior. Lo guardaba todo y casi nada te lo
+mostraba. Esas cuatro lecturas quedan ahora **con el viaje mismo** y están en su página: **Potencia
+máx.** y **Regen. máx.**, la temperatura de la batería y la exterior como intervalo, de la más baja a
+la más alta del viaje en lugar de como media, y — bajo la duración — cuánto de ella pasaste **en
+movimiento, parado y sin datos**, en minutos enteros que suman la duración de arriba. Junto a la
+velocidad media está ahora la **mediana** de las mismas lecturas, que en un viaje mitad autopista
+mitad atasco dice más que la media.
+
+El gráfico bajo el mapa se llama ahora **Datos del viaje**: un gráfico en tres bandas sobre un solo
+eje de tiempo — velocidad y potencia, SoC y autonomía, altitud y temperatura de la batería — con un
+solo recuadro al pasar el ratón para todas. Su leyenda enciende y apaga cada línea, y tu elección
+queda guardada en este navegador.
+
+La **velocidad máxima** está corregida: donde el registro que Leapmotor guarda de ese viaje está
+emparejado con él, la cifra es la del coche, no la muestra más rápida de Mate. Las lecturas de Mate
+están separadas unos once segundos, así que un pico más corto nunca estuvo en ellas — en 38 viajes la
+muestra quedó por debajo de la cifra del coche en 37.
+
+⚠️ **Los viajes que condujiste antes de esta versión reciben esas lecturas una sola vez, al arrancar
+Mate**, y solo desde las consultas cuya fila de posición sigue en la base de datos. Si has fijado una
+conservación del GPS, en los viajes más antiguos verás un guion: a 7 días se puede rellenar cerca del
+3 % de sus puntos, a 30 días un quinto, a 90 días siete décimos. Con el valor por defecto — guardar
+todo — todos. Cada viaje de ahora en adelante tiene las lecturas sea cual sea ese ajuste.
+
+### Novedades de la versión 4.5.5
+
+Esta versión quita dos cosas y no añade ninguna, y las dos eran sobre actualizaciones de software
+del coche. La fila «Actualizaciones OTA» de la vista general decía **Ninguna** siempre que en la
+bandeja de entrada de tu cuenta no hubiera un aviso — y de tu coche nunca supo nada: Leapmotor
+dice las versiones solo a la cuenta que lo posee, y Mate debe funcionar en una cuenta con la que
+el coche está compartido, que no recibe ningún aviso del vehículo. Así que decía «Ninguna» para
+siempre, y bajo esa etiqueta «Ninguna» se lee como «estás actualizado». ⚠️ Con ella se va la
+entidad **OTA Update Notice** en Home Assistant — en tres diagnósticos encontró cero avisos en 44
+lecturas correctas — así que si construiste una automatización sobre ella, se quedará sin
+entidad. No cambia nada más, y en tus datos no se escribe nada.
+
+### Novedades de la versión 4.5.4
+
+De lo que ves en esta versión no cambia nada: es para nosotros. Desde la 4.5.3 Mate guarda el
+historial de viajes que mantiene la propia nube de Leapmotor — los mismos datos que la aplicación
+oficial muestra en su panel por viaje — y cada registro dice cuánta gasolina consumió ese viaje. En
+un coche con extensor de autonomía es un segundo dato, independiente, junto al que Mate ya lee del
+contador del depósito del coche, y estaba en la base de datos sin forma de extraerlo. Ahora viaja en
+el paquete de diagnóstico, y el texto de diagnóstico dice si ese historial llegó y si el campo de
+combustible está lleno o plano a cero. En un coche solo eléctrico es cero en cada viaje, que es la
+respuesta correcta y no un silencio. En tus datos no se escribe nada y a la nube no se le pide nada
+nuevo.
+
+### Novedades de la versión 4.5.3
+
+Mate es aún más rápido, y esta vez el motivo no son las preguntas sino el hecho de hacerlas. Cada
+lectura abría una conexión nueva a la base de datos, y en una lectura pequeña eso era casi todo el
+coste; ahora hay una por hilo. Y la estimación de salud de la batería leía cada fotograma de cada
+carga solo para descubrir que nadie había estado sentado en el coche con la calefacción encendida —
+ahora es una comprobación indexada. Medido en un add-on real con noventa días de historial: Resumen
+0,213 s → 0,048, Batería 0,129 → 0,012, Cargas 0,278 → 0,035, Estadísticas 0,489 → 0,163, la salud de
+la batería 1,150 → 0,114. De lo que ves no ha cambiado nada.
+
+### Novedades de la versión 4.5.2
+
+Mate es más rápido, en todas las páginas. Las páginas más lentas preguntaban a la base de datos lo mismo una y otra vez — en qué zona horaria mostrar una hora, una vez por fila; qué coche estás mirando, ochenta y siete veces para dibujar una sola tarjeta; si el coche se ha usado como toma de corriente, leyendo una semana de datos — y cada una de esas preguntas abría su propia conexión a la base de datos. Ahora se preguntan una sola vez. La página de batería ya no espera sus dos cálculos largos: aparece, y la salud y el consumo en reposo se rellenan después. Medido en un add-on real con noventa días de historial: batería 3,526 s → 0,121 s, estadísticas 2,679 → 0,448, viajes 1,696 → 0,406, ajustes 1,613 → 0,413. De lo que ves no ha cambiado nada.
+
+### Novedades de la versión 4.5.1
+
+Mate carga más rápido. Decidir qué botones puede mostrar tu coche leía la base de datos 156 veces por página — una por comando, tres ajustes cada una, y cada una abría su propia conexión. Ahora se leen una sola vez. En un add-on que funciona desde una tarjeta SD, eso era la mayor parte de la espera. La tarjeta «Enlace con la nube» de los ajustes ya no se construye en cada carga de la página: busca sus cifras cuando la abres tú. Y el menú mantiene su sitio — elegir una entrada de abajo lo devolvía arriba, y la entrada recién usada quedaba otra vez fuera de pantalla.
+
+### Novedades de la versión 4.5.0
+
+La página de inicio dice ahora si sus datos son de fiar. Junto al título hay un pequeño panel: **Mate → nube → coche**, dos puntos, y al pasar el ratón (o tocar) sobre cada palabra aparecen los hechos que hay detrás — cuánto tiempo lleva funcionando el lector, si la nube lo deja entrar y cuándo respondió por última vez, cuándo envió el coche su último dato y qué estaba haciendo. Mientras todo va bien, no escribe nada más. Cuando es Mate quien no consigue leer, el panel se pone rojo y dice qué implica: cuándo llegó el último dato, cuándo lo intentará de nuevo, el error que dio la nube y — solo si la nube culpó a la contraseña — que la contraseña es lo que hay que revisar. Hasta ahora, una nube que llevaba nueve días rechazando los accesos de una instalación se veía igual que un coche dormido en el garaje: «visto hace 9 h», y nada más.
+
+Home Assistant se entera de lo mismo. Cada coche recibe un sensor **Data Link** (`sensor.<coche>_data_link`) que vale `fresh`, `no_new_data`, `age_unknown`, `login_refused` o `fetch_failed`, con desde cuándo, el error y el próximo intento como atributos. Se publica incluso mientras Mate espera tras un acceso rechazado, y caduca por sí solo a los 21 minutos — así que `unavailable` significa que el lector se ha detenido, no que el coche esté callado. Basta una automatización: avísame cuando no haya estado ni `fresh` ni `no_new_data` durante una hora.
+
+En los ajustes hay una tarjeta nueva, **📡 Enlace con la nube**: las últimas 24 horas como una tira de ventanas de cinco minutos, y siete días de recuentos — cuántas lecturas, cuántas traían un dato actual, cuántas fallaron, cuántas rechazó la nube y cuántos accesos gastó cada parte de Mate. Cada celda y cada etiqueta se explica al pasar el ratón. La misma tabla entra ahora en el paquete de diagnóstico.
+
+Dos cosas más pequeñas. Una antigüedad de más de un día se escribe en días: nueve días sin contacto se leían «hace 216h». Y la comprobación de salud de Mate ya no declara un proceso muerto mientras la nube no lo deja entrar: está esperando, y ahora lo dice.
+
+Bajo la energía de un viaje, la etiqueta que decía **getEC** dice ahora **Medida por el coche**: era el nombre de un punto de acceso de la nube, no una palabra para las personas. **Nube Leapmotor** pasa a **Historial Leapmotor** por lo mismo — las dos cifras vienen de la nube, y lo que cambia es cuál: el viaje tal como lo registra el historial de la nube, o la energía que el coche midió por sí mismo en esa ventana. **Estimación Mate** no cambia.
+
 > Este manual está escrito para quien *usa* Mate, no para quien lo desarrolla. Explica cómo
 > configurarlo desde cero y qué hace cada página. Para los detalles técnicos internos está `ARCHITECTURE.md`.
 
@@ -15,7 +978,7 @@
 5. [Conocer la interfaz](#5-conocer-la-interfaz)
 6. [Las páginas, una a una](#6-las-páginas-una-a-una)
    - [Resumen](#resumen) · [Trayectos](#trayectos) · [Mapa](#mapa) · [Cargas](#cargas)
-   - [Precios de la carga](#precios-de-la-carga) · [Estadísticas](#estadísticas) · [Informe mensual](#informe-mensual)
+   - [Precios de la carga](#precios-de-la-carga) · [Estadísticas](#estadísticas) · [Eventos](#eventos) · [Informes](#informes)
    - [Salud de la batería](#salud-de-la-batería) · [Mantenimiento](#mantenimiento) · [Comandos](#comandos)
    - [Programación](#programación) · [Preparar el coche](#preparar-el-coche)
    - [Navegación](#navegación) · [Vehículo](#vehículo) · [Wallbox](#wallbox)
@@ -47,10 +1010,13 @@ programaciones…) y, si quieres, integrar los datos con **Home Assistant** (med
 - **No habla directamente con el coche.** Todo pasa por la nube de Leapmotor. Cuando Mate «consulta»
   la nube (polling) lee el **último estado conocido**: *no* despierta al coche y *no* descarga la
   batería. Es una operación segura y barata.
-- **Solo coches 100 % eléctricos (BEV).** Los modelos compatibles son **T03, B05, B10, C10** en sus
-  versiones eléctricas. Las versiones **REEV** (con extensor de autonomía de gasolina) **no** están
-  soportadas: los cálculos de energía, consumo y coste usarían la capacidad de batería equivocada y
-  saldrían distorsionados.
+- **Eléctricos y con extensor de autonomía.** Los modelos compatibles son **T03, B03X, B05, B10, C10**.
+  Sus versiones **REEV**, con extensor de autonomía de gasolina, están soportadas desde la **4.7.0**:
+  la página REEV, la gasolina por viaje y por periodo y los paquetes de batería REEV del asistente
+  están todos en la compilación normal. En un extensor de autonomía **no** se muestra la regeneración
+  — un generador que recarga la batería mientras conduces no se distingue de una frenada — y el
+  consumo eléctrico de un viaje con el generador se queda en la compilación BetaTester, donde puede
+  vigilarse.
 - **Solo la nube europea (Leapmotor International / Stellantis).** Las cuentas registradas en
   servidores de otras regiones (por ejemplo China) no pueden iniciar sesión. Fuera de Europa, hoy por
   hoy Mate no se puede usar.
@@ -71,12 +1037,12 @@ Para configurar Mate necesitas tres cosas:
    **datos perdidos** (trayectos y cargas no registrados). Es la causa número uno de los problemas que
    nos llegan. *Solución:* una cuenta secundaria con una **contraseña usada solo en Mate**.
 
-2. **El certificado de la app de Leapmotor** (`app.crt` + `app.key`). Es un certificado que es **el
-   mismo para todo el mundo** (pertenece a la app, no a tu cuenta) y hace falta para hablar con la
-   nube. Se descarga de un repositorio público — el asistente te da el enlace directo
-   ([github.com/markoceri/leapmotor-certs](https://github.com/markoceri/leapmotor-certs)).
+2. **Nada que descargar para el certificado de la app.** Mate necesita el certificado TLS de la app
+   de Leapmotor (`app.crt` + `app.key`) para iniciar sesión — es **el mismo para todo el mundo**
+   (pertenece a la app, no a tu cuenta). Viene incluido en Mate y se instala solo en el primer
+   arranque: nunca se te pide.
 
-3. **Correo, contraseña y el PIN de operaciones de la cuenta.** El **PIN de 4 dígitos** es el mismo
+3. **Correo, contraseña y el PIN de operaciones del coche.** El **PIN de 4 dígitos** es el mismo
    que usas en la app oficial para autorizar los comandos a distancia (cierre, climatización…).
 
 > 💡 ¿Solo quieres echar un vistazo sin configurar nada? Sáltatelo todo y usa el
@@ -100,7 +1066,8 @@ Mate funciona igual en tres entornos (la interfaz es idéntica):
   Docker: lo descargas, lo abres y tienes el mismo asistente de configuración. En Windows se
   distribuye **dentro de un `.zip`** — descomprímelo antes y luego ejecuta el instalador, porque un
   `.exe` suelto descargado de internet todavía no tiene reputación ante SmartScreen y lo bloquean al
-  entrar.
+  entrar. El servidor web solo escucha en este ordenador; para acceder desde otro dispositivo usa
+  Docker o el complemento.
 
 Las instrucciones de instalación paso a paso (repositorio, compose, etc.) están en el **README** del
 proyecto y en la página de **Docker Hub**. Una vez en marcha, el *primer inicio de sesión* es igual en
@@ -141,7 +1108,6 @@ que hay que pulsar depende de cómo ejecutes Mate.
   ```
 
   La base de datos está en el volumen, no en la imagen, así que no se pierde nada.
-  [Watchtower](https://containrrr.dev/watchtower/) puede hacerlo solo.
 - **MateDesktop** — nada que descargar: la aplicación obtiene Mate del repositorio **en cada
   arranque**, así que cerrarla y volver a abrirla *es* la actualización.
 
@@ -182,17 +1148,7 @@ Dos botones:
 - **🧪 Probar la demostración** — entra en el modo demostración con datos falsos. Puedes salir cuando
   quieras.
 
-### Paso 1 — Certificado de la app
-
-Mate te pide el certificado TLS de la app de Leapmotor. Tienes dos maneras:
-
-- **Subir los archivos** `app.crt` y `app.key` (el modo por defecto), o
-- **Pegar el texto PEM** de los dos archivos (el botón *«Pegar el texto PEM en su lugar»*).
-
-Descárgalos del enlace que aparece, súbelos y pulsa **Guardar el certificado**. Este paso solo aparece
-si el certificado no viene ya dentro de la imagen.
-
-### Paso 2 — Iniciar sesión con la cuenta
+### Paso 1 — Iniciar sesión con la cuenta
 
 Escribe:
 
@@ -207,7 +1163,7 @@ Pulsa **🔍 Detectar mi coche**. Mate comprueba las credenciales y lee de la nu
 número de bastidor (VIN)**. Si todo va bien verás una tarjeta «Coche detectado» que muestra
 `Leapmotor <modelo> · VIN ···xxxxxx`.
 
-### Paso 3 — Batería
+### Paso 2 — Batería
 
 Según el modelo:
 
@@ -230,7 +1186,7 @@ Según el modelo:
 > se trata del **C10 RWD**: 69,9 kWh es el valor nominal, y las cargas reales dan una batería
 > utilizable de 67,0.
 
-### Paso 4 — Conectar
+### Paso 3 — Conectar
 
 Pulsa **Conectar y empezar**. Mate guarda la configuración, se conecta y te lleva al **Resumen**.
 A partir de ese momento el «poller» empieza a recoger datos en segundo plano: los primeros trayectos
@@ -259,14 +1215,15 @@ contraseña de acceso* — y lo único que hace es cerrar esa sesión de contras
 aparece, porque no hay nada que cerrar.
 
 **Para cambiar el PIN del coche 🆕** — si lo cambias en el coche, no hace falta desvincular nada: ve a
-**Ajustes → Vehículo** y, bajo la dirección de la cuenta, encontrarás **PIN de operaciones**. Se
-escribe dos veces, con un ojo para volver a leerlo, y surte efecto al momento — tanto para los
+**Ajustes → Vehículo** y, bajo la dirección de la cuenta, encontrarás **PIN de operaciones de este coche**.
+Cada coche tiene su propio PIN, el que se configura en el coche; con dos coches, elige primero el
+coche. Se escribe dos veces, con un ojo para volver a leerlo, y surte efecto al momento — tanto para los
 comandos de la página como para los que llegan desde Home Assistant. Lo pidió **@alextchao** (#225).
 
 **Si dos Leapmotor comparten tu cuenta 🆕** — aparece un **selector de coche** en la cabecera, al lado
 de la insignia del modelo. Solo está a partir del segundo coche: con un solo Leapmotor no cambia
 absolutamente nada. Eliges un coche y todo lo sigue — el Resumen, las Estadísticas, los trayectos, las
-cargas, el informe mensual, los comandos que ese coche permite y sus entidades de Home Assistant. Tu
+cargas, los informes, los comandos que ese coche permite y sus entidades de Home Assistant. Tu
 elección se recuerda. En el teléfono el selector está dentro del menú ☰, bajo el encabezado.
 
 Los ajustes siguen siendo comunes, porque bajo un mismo techo rara vez difieren: precios, moneda, zona
@@ -284,9 +1241,13 @@ buscar lo primero y quería lo segundo).
 Muchas páginas **se actualizan solas** más o menos cada 30 segundos, así que los valores «en directo»
 (estado, carga en marcha…) se mantienen frescos sin recargar la página.
 
+Un calendario guarda en la dirección de la página el mes que estás mirando, así que una recarga —la de
+la página o la tuya— devuelve ese mes con el día o el intervalo que tenías abierto; **Ir a hoy** vuelve
+al mes actual. **Salud de la batería** hace lo mismo con las vistas elegidas en sus dos gráficos.
+
 **El idioma, la moneda y las unidades** se cambian desde *Ajustes → 🌍 Idioma y moneda*:
 
-- **Idioma:** English, Italiano, Français, Deutsch, Polski, Nederlands, Português, Español.
+- **Idioma:** English, Italiano, Français, Deutsch, Polski, Nederlands, Português, Español, Čeština.
   *(Un manual escrito como este existe en inglés, italiano, francés, alemán y español.)*
 - **Moneda:** para los costes (€, £, …).
 - **Unidades:** métricas (km, °C) o imperiales RU/EE. UU. (millas, °F). Los datos se guardan siempre en
@@ -308,8 +1269,9 @@ estado en directo:
 - **comandos rápidos** (abrir/cerrar, localizar el coche…), que ya «saben» cuál es el estado actual;
 - cuando el coche está **cargando**, una **animación** muestra el flujo de energía y una etiqueta con
   el tiempo estimado «hasta el X %» (X = el límite de carga que hayas puesto en el coche);
-- una etiqueta **«Cable conectado / Carga completada»** cuando el cable está enchufado pero no está
-  cargando de verdad. A su lado, si tienes una **carga programada**, aparece la franja del propio
+- una etiqueta **«Cable conectado (Sin cargar / Carga completada)»** cuando el cable está enchufado pero no está
+  cargando de verdad; *Carga completada* cuando la batería ha llegado al límite de carga fijado en el
+  coche. A su lado, si tienes una **carga programada**, aparece la franja del propio
   coche (por ejemplo **«Carga 01:50 – 12:00»**) — la respuesta a «el cable está puesto, ¿por qué no
   carga?».
 
@@ -324,6 +1286,32 @@ queda invisible).
 
 Más abajo encontrarás miniestadísticas y un indicador de **«Respuesta del coche»** (un punto 🟢/🟡/🔴,
 ⚪ si no hay datos): resume con qué fiabilidad ha respondido el coche a los últimos comandos enviados.
+
+El mapa **Última posición conocida** dibuja también la traza GPS del último trayecto de hoy —mientras
+conduces, la del trayecto en curso—, igual que el detalle del trayecto.
+
+**La última carga dice las dos 🆕** — el recuadro **Última carga** lleva por delante la misma cifra
+que su fila en Cargas: en casa, con un contador de wallbox, los kWh **🔌 wallbox (a pagar)**, y debajo lo
+que llegó al paquete — *🔋 12,0 kWh en la batería (DC) · rendimiento 81 %*; en otro sitio la cifra de
+la batería, con los kWh del cargador en una línea propia donde los escribiste. El coste de debajo es
+el coste del número de arriba. Antes mostraba solo la cifra de la batería, junto a un coste
+calculado sobre la otra.
+
+**La autonomía en tu límite de carga, y al 100 % 🆕** — bajo la autonomía estimada Mate muestra cuánto
+haría el coche **con el límite al que lo cargas de verdad** (el 80 %, por ejemplo), y al lado la
+cifra al 100 %. Si el coche no declara ningún límite por debajo de 100 la línea es una sola, para que
+el mismo número no se imprima dos veces.
+
+**La temperatura exterior, del tiempo 🆕** — la nube de Leapmotor envía la temperatura del habitáculo
+pero nunca la del aire de fuera, y la app oficial tampoco. Con el interruptor activado, mientras el
+coche está despierto Mate consulta [Open-Meteo](https://open-meteo.com) sobre su posición — como
+mucho una vez cada 20 minutos o cada 10 km, lo que llegue antes — y muestra el valor junto al del
+habitáculo. Está **desactivado por defecto**, porque la consulta envía la posición del coche a
+Open-Meteo: el único interruptor está en *Ajustes → valores por defecto de los trayectos*. El mismo
+dato se convierte en una entidad **Temperatura exterior** en Home Assistant y da a cada trayecto
+lecturas en ruta, de las que salen su temperatura más alta y más baja. Si la nube no envía la
+posición GPS, Mate usa la última que tenía, pero solo mientras el cuentakilómetros no haya cambiado;
+un coche conducido sin GPS conserva el último valor.
 
 #### Las tres temperaturas: habitáculo, consigna del A/A y batería
 No todos los Leapmotor envían las tres. Mate distingue **tres situaciones diferentes**, porque
@@ -353,7 +1341,12 @@ temperatura **desconocida** no dispara la preparación, y lo dice en el registro
   de ese trayecto concreto.
 - **Un calendario y una búsqueda.** Los trayectos se recorren por **mes**; haz clic en un día para ver
   solo los de ese día, o usa la **búsqueda** con un intervalo de fechas, una distancia o una ventana
-  de consumo para sacar un conjunto de todo el histórico.
+  de consumo para sacar un conjunto de todo el histórico. La cabecera de un día abierto dice cuánta
+  batería gastaron sus trayectos: *84,4% → 51,6% (−32,8%)* o, si el coche cargó entre ellos, *−45,3%* gastado y
+  *⚡ +40,2%* cargado, y cuánto tiempo se condujo ese día. En el móvil, la fila de cada trayecto
+  muestra también su batería, *84,4→51,6% (−32,8%)*, debajo de la duración.
+  Con **Mayús+clic**, arrastrando el ratón sobre los días o, en el móvil, manteniendo pulsado un día se
+  abren **varios días a la vez**: una cabecera para todo el intervalo y debajo cada día con la suya.
 - **Unir trayectos, desde el día que estás mirando.** Una parada lo bastante larga como para cerrar un
   recorrido puede partir un mismo viaje en dos filas. Abre un día y el botón **🔗** que hay junto a la
   fecha te ofrece las parejas de ese día que se pueden unir: un deslizador amplía lo que cuenta como
@@ -365,23 +1358,81 @@ temperatura **desconocida** no dispara la preparación, y lo dice en el registro
   cae mientras conduces, Mate cierra el trayecto solo al cabo de media hora — pero lo fecha en la
   **última noticia real**, no en el momento en que se dio cuenta. Así la duración no contiene media
   hora de silencio y la velocidad media sigue siendo honrada.
-- **Los kilómetros recorridos mientras el coche estaba sin contacto no van a ningún trayecto.** Cuando
-  el enlace con la nube se cae, el coche sigue moviéndose pero Mate no lo ve; cuando el enlace vuelve,
-  lo único que encuentra es un cuentakilómetros más adelantado. Ese salto puede contener el final de
-  un recorrido, una parada y el principio de otro, y **nada dice cómo se reparte** — así que Mate no
-  se lo atribuye a nadie. Una línea encima del calendario declara los kilómetros, la carga y el coste
-  de ese mes, y la página de **Estadísticas** declara el total acumulado: *medidos, pero no
-  atribuibles a un trayecto concreto — por eso quedan fuera de distancias, consumos y costes.*
+- **Un corte nunca deja un trayecto abierto.** Si Mate pierde la nube durante la marcha y el coche
+  sigue circulando cuando el enlace vuelve antes de media hora, el trayecto simplemente continúa. Si
+  para entonces el coche está aparcado o cargando, el trayecto termina ahí, y los kilómetros
+  recorridos durante el corte forman parte de él. Tras un silencio más largo, el trayecto termina en
+  lo último que dijo el coche antes de ese silencio, y los kilómetros posteriores se tratan como
+  todos los que se recorren sin conexión.
+- **Un trayecto termina cuando termina el coche 🆕.** Un trayecto se cierra en la lectura que
+  muestra el coche **apagado**, y de esa lectura sale su final: hora, nivel de carga,
+  cuentakilómetros, posición y combustible. Por tanto **esperar en Park con el coche encendido es
+  una parada dentro del trayecto**, no su final: ir a buscar a alguien y volver es un solo trayecto,
+  no dos, y el consumo oficial que la nube mide del encendido al apagado pertenece entero a ese
+  trayecto, sin mitades que unir. Es la primera lectura que *vio* el coche apagado: tras un corte
+  del enlace llega, por tanto, más tarde que el propio apagado. Un coche que no indica si está
+  encendido se cierra tras un minuto aproximadamente en Park, como antes, y lo mismo ocurre cuando
+  la lectura en Park es una imagen que la nube repite desde hace media hora. El final se queda en la
+  última lectura cuando a la lectura del apagado le falta algún dato o una posterior muestra otro
+  kilometraje. Un trayecto que Mate encuentra aún abierto al reiniciarse, con el coche ya aparcado,
+  se cierra en su último punto registrado; uno parado en Park durante media jornada en un coche que
+  sigue declarándose encendido se cierra donde se detuvo.
+- **Los kilómetros que Mate no vio no se suman a los trayectos de alrededor.** Cuando el enlace con
+  la nube se cae durante más tiempo que un corte breve dentro de un mismo trayecto (ver arriba), el
+  coche sigue moviéndose pero Mate no lo ve; cuando el enlace vuelve, lo único que encuentra es un
+  cuentakilómetros más adelantado. Ese salto puede contener el final de un recorrido, una parada y
+  el principio de otro, y **nada dice cómo se reparte**. Si el coche aparece aparcado, su nivel de
+  carga no ha subido y no se detectó ninguna carga en ese intervalo, Mate reconstruye un trayecto
+  solo a partir del salto, sin ruta. Si no (un trayecto nuevo ya en marcha, una carga o un nivel de
+  carga que ha subido), Mate no atribuye esos kilómetros a nadie. Una línea encima del calendario
+  declara los kilómetros, la carga y el coste de ese mes, y la página de **Estadísticas** declara el
+  total acumulado: *medidos, pero no atribuibles a un trayecto concreto — por eso quedan fuera de
+  distancias, consumos y costes.*
   ⚠️ Por eso el total del propio Mate puede quedar por debajo del cuentakilómetros del coche: la
   diferencia es exactamente esa línea.
 - **Altitud y temperatura exterior.** La nube de Leapmotor no da ninguna de las dos, así que unos
   minutos después de terminar un recorrido Mate consulta la traza GPS del trayecto contra
   [Open-Meteo](https://open-meteo.com) (gratis, sin clave, sin cuenta). El detalle gana entonces una
-  **línea de altitud bajo el gráfico de SoC y velocidad**, los metros **subidos y bajados**, y la
-  temperatura **a la salida y a la llegada** — no una media, para que una subida de valle a puerto
-  muestre la caída real. Entre las dos explican buena parte del consumo de un recorrido: subir cuesta
-  energía, el frío cuesta autonomía. Los trayectos registrados antes de que esto existiera tienen un
-  botón **Calcular la altimetría**, y todo el conjunto se puede desactivar en Ajustes.
+  **línea de altitud en el gráfico Datos del trayecto**, los metros **subidos y bajados** (fila
+  *Desnivel + / −*; su ⓘ explica cómo se cuentan), y la temperatura **más alta y más baja** del
+  trayecto — no una media, para que una subida de valle a puerto muestre la caída real. Entre las
+  dos explican buena parte del consumo de un recorrido: subir cuesta energía, el frío cuesta
+  autonomía. Los trayectos registrados antes de que esto existiera tienen un botón **Calcular la
+  altimetría**, y la búsqueda automática se desactiva en *Ajustes → Valores por defecto de los trayectos → Altimetría y temperatura del viaje*.
+- **En movimiento y detenido 🆕.** Bajo la duración, el detalle la divide entre el tiempo en
+  movimiento y el tiempo parado durante el trayecto (semáforos, atascos), según las lecturas de Mate
+  tomadas cada pocos segundos. Una parada entre trayectos unidos no cuenta para ninguno de los dos,
+  y un hueco en las lecturas aparece como *sin datos* en lugar de asignarse a uno de ellos.
+- **Velocidad mediana 🆕.** Bajo la velocidad media, el detalle da la mediana de las mismas lecturas
+  en movimiento, la velocidad por debajo de la cual quedó la mitad de ellas. Un tramo rápido breve
+  sube la media de un trayecto urbano, mientras que la mediana conserva su ritmo habitual.
+- **Velocidad máxima del coche 🆕.** Cuando el registro del recorrido en la nube del coche se asocia
+  al trayecto (el mismo que da el consumo oficial), el detalle muestra la velocidad máxima que midió
+  el propio coche. Las lecturas de Mate están separadas unos segundos y pierden los picos breves —
+  en un B10, hasta 21 km/h —, así que un trayecto sin ese registro conserva el valor muestreado,
+  marcado con una ⓘ.
+- **Potencia máxima y regeneración máxima 🆕.** El detalle indica la potencia más alta que entregó la
+  batería y la más alta que volvió a ella al frenar, a partir de la tensión y la corriente de la
+  batería que Mate lee en cada actualización. Las lecturas están separadas unos segundos, así que un
+  pico breve entre dos se pierde: los valores son un mínimo, y la ⓘ junto a ellos lo indica. No se
+  muestran en un coche con extensor de autonomía, igual que la regeneración.
+- **Temperatura de la batería 🆕.** El coche solo informa de una temperatura de la batería — la de su
+  celda más fría, en grados enteros — y el detalle indica sus valores durante el trayecto como un
+  único rango, del más bajo al más alto, por ejemplo 19 – 22 °C; la ⓘ junto a la fila aclara que es la
+  celda más fría. En invierno, el rango muestra lo fría que estaba la batería y cuánto la calentó el
+  trayecto.
+- **Gráfico Datos del trayecto 🆕.** El gráfico bajo el mapa se llama *Datos del trayecto* y se
+  divide en franjas que comparten un eje de tiempo, una línea de cursor y un recuadro al pasar el
+  ratón, con las líneas agrupadas por franja: **conducción** (velocidad y potencia de la batería —
+  por encima de cero la entrega, por debajo vuelve a ella), **batería** (SoC y autonomía que estima
+  el coche) y **altitud con la temperatura de la batería** (la de la celda más fría). Una franja
+  tiene como mucho dos escalas, una a cada lado, cada una con la unidad arriba y los números en el
+  color de su línea. Cada entrada de la leyenda muestra u oculta su línea — un cuadrado vacío señala
+  una línea oculta — y una franja con todas sus líneas ocultas se pliega. Todas las líneas empiezan
+  visibles; la elección se recuerda en el navegador para todos los trayectos. El recuadro empieza
+  con la hora del día, al segundo, y el minuto del trayecto. Mientras el coche circula, el mismo gráfico
+  aparece en directo arriba de la página Trayectos, bajo *🚗 En marcha*: indica cuándo empezó el trayecto
+  y desde qué nivel, cuánto ha recorrido el coche hasta ahora, y crece con cada consulta.
 - **Consumo oficial desde la nube 🆕** — cuando está disponible, el **consumo, el rendimiento y el
   coste** de un trayecto salen de la **cifra oficial** de Leapmotor (el reparto real entre **marcha /
   climatización / otros**) en vez de solo de la estimación por % de batería. Justo después de un
@@ -394,12 +1445,29 @@ temperatura **desconocida** no dispara la preparación, y lo dice en el registro
     todo el **encendido** (de arrancar a apagar), así que puede incluir tiempo con el coche encendido
     antes de que empezaras a moverte. Si **nunca apagas el coche entre dos trayectos** (paras, te
     quedas en Park, vuelves a arrancar), la nube los cuenta como **uno solo** — Mate te dice que
-    **unas los dos trayectos** para obtener el consumo combinado real.
+    **unas los dos trayectos** para obtener el consumo combinado real. Mate solo lo indica cuando el
+    coche lo ha comunicado: una parada en Park de más de un minuto durante la cual el coche no dijo si
+    estaba encendido no cuenta como un solo encendido.
+- **Dónde empezó y terminó un trayecto 🆕** — la fila de un trayecto muestra **«A → B»**, y el *Resumen del
+  viaje* de su página nombra los dos extremos. Un extremo dentro de uno de tus **lugares de carga**
+  muestra su nombre seguido de «(lugar de carga)», así que al renombrar el lugar se renombran esos
+  trayectos; en otro sitio es la dirección (una tienda o una gasolinera por su nombre, si no la calle y el
+  número, y luego la localidad). Mate la busca poco después de terminar el trayecto con el servicio
+  elegido en *Ajustes → Búsqueda de direcciones*, donde se puede desactivar. Una dirección que falta, por
+  ejemplo en un trayecto antiguo, la busca al momento 🧭 en el *Resumen del viaje*. El buscador encuentra
+  un trayecto por cualquiera de sus extremos. Mate ya no escribe direcciones en la nota del trayecto, que
+  es tuya; las notas que escribió antes se quedan como están.
 - **Tu nota + las etiquetas de conducción 🆕** (#107) — en el detalle de un trayecto puedes escribir
   una **nota libre** (tráfico, tiempo, tipo de carretera, lo que sea) y etiquetar el **modo de
   conducción** (Confort / Normal / Sport) y el **One-Pedal** (activado/desactivado) que usaste. Mate no
   puede leerlos del coche — Leapmotor no los manda a la nube — así que los pones tú a mano; ayudan a
   explicar por qué dos recorridos parecidos consumieron cosas distintas.
+
+- **Un periodo buscado se suma solo 🆕** — los filtros de fecha siempre supieron seleccionar
+  cualquier ventana, pero los resultados listaban sus tarjetas sin totalizar nada: un periodo de
+  facturación que no es un mes natural había que sumarlo a mano. Encima de los resultados aparecen
+  ahora los **trayectos, los km y el coste** de ese periodo — las mismas cifras, de la misma fuente,
+  que la franja del mes en el calendario.
 
 ### Mapa
 **(menú: Mapa)** — Todo lo que has recorrido, en un solo mapa. Está la posición actual del coche (si
@@ -423,8 +1491,15 @@ válida** en vez de hacer desaparecer el mapa), y con ella:
 
 ### Cargas
 **(menú: Cargas)** — La lista de cargas. De cada una: **energía añadida (kWh)**, **potencia máxima**,
-**tipo** y **coste**, con los **€/kWh efectivos** bien a la vista. El tipo se clasifica con una
-etiqueta:
+**tipo** y **coste**, con los **€/kWh efectivos** bien a la vista.
+
+- **Una carga es una fila 🆕** — la lista se lee como la de Trayectos, con una miniatura de la curva en
+  cada fila: la potencia (kW) encima del estado de carga (%). Pulsa una fila para abrir el resto debajo:
+  la energía en detalle, el gráfico, tu nota y las acciones. El tipo, 🆓, ✎ y 📍 se editan en la propia
+  fila. **Desplegar todo**, en la cabecera de un día, de un intervalo o de una búsqueda, abre todas las
+  filas, y **Plegar todo** las cierra.
+
+El tipo se clasifica con una etiqueta:
 
 - **La franja «por confirmar» te lleva hasta ella 🆕** (#240) — cuando una carga ha terminado sin
   tipo, aparece una franja arriba de la página. **Haz clic**: abre la carga en su propio día del
@@ -433,24 +1508,49 @@ etiqueta:
   instante después de abrir la página. Si uno falla, ahora **lo dice debajo de sí mismo**, con el
   error y un **Volver a intentarlo**, en lugar de dejar un hueco vacío sin explicación.
 - **En casa** (tu wallbox **o un enchufe doméstico**), **AC** (corriente alterna pública), **DC
-  rápida**, **HPC** (carga ultrarrápida) y **✎ Manual**.
+  rápida**, **HPC** (carga ultrarrápida) y **Gratis**; al final del menú, **✎ Manual** para el total
+  pagado (ver más abajo). Una carga que nadie ha confirmado todavía se queda en **❓ Por confirmar**
+  hasta que elijas uno.
 - **«En casa» no significa wallbox.** *En casa* es dónde cargaste, no con qué cargaste — un enchufe
   del garaje también es una carga en casa. Importa por lo que se factura: con un contador de wallbox
   asignado (ver *Wallbox* más abajo), la carga se factura sobre la **energía que entregó el
   contador**; sin él, se factura sobre la **energía que llegó a la batería**, exactamente igual que
   una carga pública. Entre las dos está la pérdida en calor del propio cargador, normalmente del 10 al
   15 %.
-- **✎ Manual**: para puntos de recarga públicos con tarifas complicadas (suscripciones, coste por
-  sesión…) puedes **escribir a mano el total que pagaste de verdad**; ese valor sustituye a la
-  estimación automática.
+- **✎ Manual — el total pagado** — para puntos de recarga públicos con tarifas complicadas
+  (suscripciones, coste por sesión…) **escribes a mano el total que pagaste de verdad**: abre el
+  menú del tipo, escríbelo en la fila **✎ Manual** del final y pulsa **OK** (el **✎** que hay junto
+  al tipo es el mismo campo). Sustituye a la estimación automática y **no toca el tipo de la
+  carga**: una carga sin tipo se lee entonces **✎ Manual** y ya no está por confirmar, y una con
+  tipo lo conserva. El coste de la fila lleva la marca **introducido** en lugar de **estim.**, y
+  *Restablecer*, en el ✎, devuelve la cifra calculada. Las cargas que escribiste así antes de la
+  v3.16.0 vuelven a leerse **✎ Manual**, con su precio: no hay nada que hacer.
+- **Casa y pública 🆕** — junto a la tarjeta *Reparto CA / CC* hay una segunda: **En casa**,
+  **Pública**, **🆓 Gratis**, **✎ Manual** y **Por confirmar**, en forma de rosco y una casilla cada
+  una (las tres últimas solo si las hay). Suman siempre el número de cargas escrito encima, así que
+  una carga con el precio escrito a mano no se cuenta como pública, ni una de tipo Gratis, y una que
+  espera su tipo se ve como tal. Una carga en casa marcada como gratuita se queda en En casa.
+- **Una carga abandonada por la nube termina cuando pasó corriente por última vez 🆕** (#289) —
+  cuando el coche se duerme con el cable puesto, la nube no lo dice: sigue repitiendo la última
+  noticia que tiene, y ahí el cable consta todavía como conectado. La carga se quedaba abierta
+  hasta que el coche despertaba — cuatro horas contadas como diecinueve, y en la lista no se veía
+  nada hasta que se cerraba. Ahora, tras media hora sin noticias nuevas, Mate la cierra sola y la
+  fecha en la **última lectura con corriente de verdad**: la duración ya no contiene la noche de
+  silencio. La pausa de una wallbox no se toca — allí el coche está despierto y las noticias llegan.
 - **Los kWh del propio cargador 🆕** (#222) — en un cargador público Mate **no tiene contador**: lee
   solo lo que entró en la batería, mientras que el cargador te factura lo que salió del suyo. Puedes
-  escribir esa cifra: en la tarjeta de la carga, bajo las tres casillas, hay un **✎**; el campo **solo
+  escribir esa cifra: en la fila abierta de la carga, bajo la energía, hay un **✎**; el campo **solo
   se abre si lo abres tú** y **siempre está vacío** — así un clic despistado no cambia nada, y darle a
   Aceptar con el campo vacío lo deja todo como estaba. *Quitar* deshace un número mal puesto. A partir
   de ahí **le pone precio a la carga**, exactamente igual que hace en casa un contador de wallbox, y
   muestra el **rendimiento** (cuánto convirtió en calor el cargador de a bordo). La energía que
-  declara Mate sigue siendo la **medida en la batería**.
+  declara Mate sigue siendo la **medida en la batería**. En una **carga unida**, la cifra que escribes
+  cubre las piezas para las que la escribiste — una sesión unida después cuenta por su cuenta — y
+  cuando las piezas se facturan sobre cifras distintas (el contador cogió una pieza y la otra no, o
+  escribiste la cifra en una pieza antes de unir), la fila y la Vista general llevan la suma, bajo
+  la palabra *entregados*, y el €/kWh divide por ella 🆕. El rendimiento y la pérdida junto a las
+  cifras escritas aparecen solo si esas cifras cubren todas las piezas. Un contador que solo cogió
+  una parte te deja ver y corregir igualmente la energía solar que introdujiste.
 - **Qué se cuenta y qué no 🆕** — una carga aparece en estas comparaciones solo cuando tiene **las
   dos** cifras, la del contador y la de la batería. Una sesión con una sola llevaría la proporción por
   encima del 100 %, cosa que ningún cargador puede hacer. **Las cargas todavía en marcha quedan
@@ -459,20 +1559,29 @@ etiqueta:
 - **El mes dice las dos 🆕** — encima del calendario: *«154,93 kWh entregados · 142,57 en la
   batería»*. La primera es lo que salió de los contadores (el wallbox, o los kWh que escribiste tú); la
   segunda es lo que llegó al paquete. Entre ambas está la pérdida de conversión que pagas.
+  **Energía total** en la página de Cargas y **Energía cargada** en Estadísticas son la misma cifra
+  *entregada*, con *en la batería* debajo cuando las dos difieren. Una sola regla para cada total: el
+  contador de la wallbox donde lo haya, los kWh del cargador donde los escribiste, y si no la cifra
+  de la batería.
 - Las cargas ocurridas con el coche apagado o sin conexión también se **reconstruyen**, a partir del
   salto del estado de carga.
-- **Tu nota 🆕** (#107) — cada carga tiene una **nota libre** (justo encima de *Eliminar la carga*)
-  para lo que los números no recogen: dónde estaba el punto, si había sombra o techo, si es fiable,
-  cómo está el aparcamiento, el tiempo que hacía, cualquier comentario personal.
+- **Tu nota 🆕** (#107) — cada carga tiene una **nota libre** (en la fila abierta, debajo del gráfico) para
+  lo que los números no recogen: dónde estaba el punto, si había sombra o techo, si es fiable, cómo está
+  el aparcamiento, el tiempo que hacía, cualquier comentario personal. *📝 Añadir una nota*, o ✏️ junto a
+  una nota, abre el campo.
+- **Dónde fue una carga 🆕** — junto a 📍 una carga muestra el punto de recarga y su dirección, o si no tu
+  **lugar de carga** allí o la dirección, buscada como en los trayectos. Una dirección que falta, por
+  ejemplo en una carga antigua, la busca al momento 🧭 junto a 📍. El buscador encuentra una carga por
+  ellos, y la exportación de cargas los incluye. Mate ya no escribe en la nota de la carga, que es tuya;
+  las notas que escribió antes se quedan como están.
 - **El cuentakilómetros de la carga 🆕** (#237) — cada sesión lleva ahora **lo que marcaba el
   cuentakilómetros al empezar**. Mate lo escribe en todo lo que ve, y lo recuperó una vez de las
   cargas que ya estaban en el archivo. En una carga que **escribes tú** hay una casilla
   *Cuentakilómetros*: es la única manera de que una sesión anterior a la existencia de Mate lleve
   kilómetros — nada de aquellos días puede aportarlos. Se escribe en **tu** unidad (km o millas).
-- **Cuánto anduvo el coche entre dos cargas 🆕** (#237) — bajo la carga: *«🛣 122 km desde la carga
-  anterior»*, según el cuentakilómetros del propio coche. Solo aparece donde **las dos** cargas llevan
-  una lectura y solo donde el coche se movió de verdad: dos sesiones de la misma tarde no dicen nada
-  en vez de escribir un cero.
+- **Cuánto anduvo el coche entre dos cargas 🆕** (#237) — en la fila, tras AC/DC: *🛣 122 km*, según el
+  cuentakilómetros del propio coche. Solo aparece donde **las dos** cargas llevan una lectura y solo donde
+  el coche se movió de verdad: dos sesiones de la misma tarde no dicen nada en vez de escribir un cero.
 - **Importar cargas desde una hoja de cálculo (CSV)** — *Importar cargas desde un CSV* te da una
   **plantilla que se explica sola**; rellénala con Excel o Numbers y vuelve a subirla. Solo dos
   columnas son obligatorias, la fecha y la energía; el resto — coste, AC/DC, porcentajes inicial y
@@ -484,14 +1593,60 @@ etiqueta:
   el cuentakilómetros: un coste que Mate calculó a partir de una curva de carga real no se sobrescribe
   nunca.
 
+- **Varios días a la vez 🆕** — el calendario abre un intervalo de días igual que el de Trayectos
+  (Mayús+clic, arrastrando el ratón sobre los días o, en el móvil, manteniendo pulsado un día): una
+  cabecera con las sesiones, los kWh y el coste del intervalo y debajo cada día con la suya. La cabecera
+  de un día abierto lleva los mismos totales.
+- **Un periodo buscado se suma solo 🆕** — encima de los resultados, las **sesiones, los kWh
+  entregados (con la cifra en batería al lado) y el coste** de esa ventana. La electricidad
+  facturada del 22 al 21, o cualquier otro periodo que no sea un mes natural, ya no hay que sumarla
+  a mano.
+
+- **Gráfico Datos de la carga 🆕** — en la fila abierta, primero una línea con lo que dicen las lecturas:
+  la temperatura de la batería de la primera lectura a la última, la del aire exterior de la mínima a la
+  máxima y la potencia media; después un gráfico en bandas sobre el eje de tiempo de la sesión, como el de
+  un viaje: **carga** (la potencia DC del coche, al lado la potencia AC del wallbox en una carga en casa
+  con wallbox asignado, y cuántos minutos decía el coche que faltaban), **batería** (SoC) y
+  **temperaturas** (la de la celda más fría y, si la temperatura exterior está activada en Ajustes, el
+  aire exterior donde está el coche). Cada entrada de la leyenda enciende y apaga su línea, una banda con
+  todas las líneas apagadas se pliega, el navegador recuerda la elección y el cuadro al pasar el ratón
+  empieza por la hora y el tiempo desde la primera lectura. La comparación AC-DC de la página Wallbox es
+  este mismo gráfico. Mientras una carga está en curso, el mismo gráfico aparece en directo junto a las
+  tarjetas de arriba de la página, con la línea del wallbox al lado de la del coche en una carga en casa:
+  indica cuándo empezó la carga y desde qué nivel, y crece con cada consulta.
+
 ### Precios de la carga
 **(menú: Precios de la carga)** — Aquí indicas **cuánto pagas por la energía**, para que Mate pueda
 calcular los costes. Puedes definir un precio **para cada tipo** de carga (En casa, AC, DC rápida,
 HPC) y elegir entre:
 
-- **Tarifa fija** (unos únicos €/kWh), o
+- **Tarifa fija** (unos únicos €/kWh);
 - **Franjas horarias (TOU)** — precios distintos según el día de la semana y la franja horaria (por
   ejemplo punta / llano / valle, más barata de noche).
+- **Dinámico (sensor de Home Assistant) 🆕** — Mate lee el precio de una entidad que **cambia con el
+  tiempo** (Nordpool, Tibber, la integración de tu comercializadora) y lo pondera sobre la curva de
+  potencia de la sesión: una carga a caballo de un cambio de precio se factura por lo que cada parte
+  costó de verdad.
+- **kWh personalizados (Home Assistant) 🆕** — sirve cuando el precio es fijo pero **cuánta parte de
+  la carga has pagado** no lo es. Con solar en el tejado solo una parte de la sesión viene de la
+  red, y ese reparto no lo conoce ni el coche ni la nube: lo conoce un helper de Home Assistant.
+  Elige la entidad que contiene los kWh que hay que facturar; al terminar la carga Mate la lee y la
+  multiplica por tu precio fijo. **La energía que Mate declara para la carga no cambia** — sigue
+  siendo la que llegó a la batería; de tu número solo sale el coste. Si la entidad falta o no
+  responde, la carga vuelve al precio fijo sobre los kWh medidos.
+
+- **kWh solares (manuales) 🆕** — el mismo caso de arriba, sin Home Assistant. Elígelo si tienes
+  solar y prefieres escribir tú, carga por carga, cuántos kWh vinieron de tu instalación: Mate los
+  resta de lo que midió el cargador y te cobra solo el resto. En la fila abierta de la carga, bajo la
+  energía, aparece un campo **☀️ Solar**, y la línea de al lado escribe la cuenta entera — «20,0
+  entregados − 8,0 solares = 12,0 pagados» — para que un número escrito al revés se vea enseguida.
+  Un valor mayor de lo que midió el cargador se rechaza. El campo aparece solo en las cargas en casa
+  que el cargador midió de verdad: sin esa medida no hay nada de lo que restar, y una línea te lo
+  dice. **La energía que Mate declara no cambia** — sigue siendo la medida; de tu número sale solo
+  el coste.
+
+> Las tres últimas valen solo para las cargas **En casa**: una sesión pública la factura su operador,
+> y un helper tuyo no tiene por qué ponerle precio.
 
 El precio **En casa** es el que alimenta el coste de las cargas domésticas y, a su vez, el coste de
 los trayectos (calculado sobre el precio «medio» de la energía que había en la batería en el momento
@@ -502,15 +1657,29 @@ del trayecto).
 > exacto* (sobre la curva de potencia real) o *Por la hora de inicio* (toda la sesión en la franja en
 > la que empezó).
 
+> **Sin tope en el precio 🆕** — los campos rechazaban cualquier valor por encima de `9,99`, un
+> límite que solo servía para tarifas en euros o dólares. Islandia, Japón, Corea y Hungría facturan
+> la electricidad en decenas o centenares de unidades por kWh: escribe la cifra tal cual. La
+> **corona islandesa** está en la lista de monedas, y todo importe muestra ahora **al menos dos
+> decimales**, de modo que nada se redondea en pantalla.
+
 ### Estadísticas
 **(menú: Estadísticas)** — Tus medias y tus totales a lo largo del tiempo: **distancia de los
 trayectos registrados** 🆕 (antes ponía *distancia total*, pero siempre ha sido la suma de los
 trayectos terminados — no el cuentakilómetros del coche) y número de trayectos, **distancia media por
 trayecto**, **tiempo al volante**, **consumo medio** (ponderado por distancia) y **el mejor**,
-**energía consumida y cargada**, **regeneración** total y media, número de **sesiones de carga**, con
+**energía consumida y cargada** (la energía cargada es la que los cargadores **entregaron**, con la
+cifra **en la batería** debajo — el mismo par que muestra la página de Cargas 🆕), **regeneración** total y media, número de **sesiones de carga**, con
 sus **evoluciones** correspondientes (consumo y regeneración a lo largo del tiempo). Los totales
 incluyen además una tarjeta **Total V2L** con la energía acumulada consumida por V2L en todo el
 histórico.
+
+**Consumo frente a temperatura exterior 🆕** — un punto por cada trayecto terminado: su consumo
+frente a la temperatura del aire en la que se condujo, con una línea de tendencia discontinua que los
+atraviesa. Responde a la pregunta que se hace todo propietario cuando llega el frío — *¿cuánto bebe
+de verdad MI coche a 5 °C?* — a partir de tu propia conducción y no de una tabla. Hace falta que los
+trayectos lleven una temperatura exterior (ver *Resumen*); con datos realistas el dibujo se lee al
+cabo de un mes de conducción aproximadamente.
 
 **Coste por 100 km 🆕** — lo que cuesta de verdad recorrer 100 km: **los euros gastados**, divididos
 entre **los kilómetros recorridos**. Sin precio por kWh y sin estimaciones — la suma de lo que pagaste
@@ -557,8 +1726,64 @@ ella queda **fuera** en vez de contar como cero, y la casilla dice de cuántos t
 coche donde cada trayecto lleva su propio consumo — que es casi siempre — nada de esto llega a
 aparecer.
 
-### Informe mensual
-**(menú: Informe mensual)** — Un resumen **mes a mes**: cuánto condujiste, cuánta energía consumiste y
+### Eventos
+**(menú: Eventos)** — Qué hizo el coche, momento a momento: desbloqueado y de nuevo bloqueado, una puerta o
+el portón abiertos y cerrados, el cable dentro y fuera, el clima encendido y apagado, READY encendido y
+apagado, dónde se detuvo el parasol, cada trayecto y cada carga de principio a fin, y cada orden enviada desde Mate. La lista se abre en
+los últimos tres días, lo más reciente primero, en una sola tarjeta con un encabezado por día y una línea
+fina por hora; el punto de una fila tiene el color de la píldora de su grupo. Los botones sobre las píldoras
+llegan más atrás — 3, 7 o 30 días, 3, 6 o 12 meses, o Todo —, contando desde hoy; las fechas escritas bajo
+⚙ prevalecen sobre ellos. Un rango largo llega en partes de mil filas, y la siguiente se carga cuando el
+final de la lista aparece en pantalla.
+
+- **Un inicio y un final son dos filas, unidas por una línea.** A la izquierda de las horas, una línea del
+  color del grupo une el punto de un final con el de su inicio, como en un gráfico del historial de git,
+  así que lo que ocurrió a la vez, y durante cuánto tiempo, se ve de un vistazo. El final dice cuánto duró
+  el estado — «Portón cerrado · tras 35s» — y un clic en la línea o en un punto resalta el par y sus dos filas
+  sin desplazar la lista. Si el inicio es anterior a los días mostrados, la línea sale atenuada por el
+  borde inferior de la lista y el final lo indica: «desde el 02 oct 2026 a las 14:20:05». Un estado aún en
+  curso lleva su línea hasta arriba y dice **(en curso)** solo si el último dato del coche es
+  reciente; mientras la nube repite un dato antiguo (el coche dormido, o sin cobertura) la fila indica en
+  su lugar la hora de ese dato.
+- **El parasol es una fila donde se detuvo** — «Parasol abierto al 50%», «Parasol cerrado» — sin
+  línea y sin «tras»: se queda abierto durante días, y una línea solo cruzaría toda la página. Un valor visto
+  en un solo dato no aparece: el parasol de paso, o una parada más corta que el intervalo entre dos datos.
+- **Las horas son las del coche, al segundo**: la hora del primer dato que mostró el nuevo estado,
+  confirmado por el siguiente. Con el puntero sobre una hora se ve junto a la hora en que Mate registró la
+  fila. Los trayectos, las cargas y las órdenes solo tienen el reloj de Mate, así que junto a una señal de
+  los mismos segundos su orden puede diferir en esos segundos.
+- **Un final responde a su propia pregunta.** READY apagado: cuánto recorrió el coche y la carga antes y
+  después. Clima encendido: aparcado o durante un trayecto, la temperatura fijada y la exterior; Clima
+  apagado: el habitáculo antes y después. Cable desconectado: la energía cargada y, si la primera carga
+  empezó más de cinco minutos después de enchufar el cable (un cargador que espera su horario), cuánto
+  esperó. El final de un trayecto o de una carga lleva las cifras de Trayectos y Cargas.
+  Esas cifras destacan del resto de la fila; el coste va en verde y el tiempo hasta que empezó la carga,
+  en ámbar.
+- **Lugares**: una fila en uno de tus lugares de carga (*Precios de la carga → Lugares de carga*) lo nombra;
+  el origen o el destino de un trayecto en otro sitio lleva su dirección, como en Trayectos, y una carga, el
+  nombre de su fila en Cargas.
+- **El mapa** está oculto hasta que **🗺 Mostrar mapa**, sobre la lista, lo abre (junto a la lista en una
+  pantalla ancha, encima en el teléfono o en una más estrecha), y la próxima vez sigue como lo dejaste.
+  Cada fila con posición tiene un 🌍: abre el mapa si hace falta, resalta el punto de la fila, lo trae a la
+  vista y resalta la fila y la otra mitad de su par. Un clic en un punto lo resalta junto con sus filas y
+  lleva la lista a su fila más reciente; la fila bajo el puntero resalta su punto mientras el puntero
+  sigue ahí. Un punto representa un sitio de unos 110 m, o un lugar de carga entero. La fila de un
+  trayecto o de una carga lo abre, y **← Eventos** allí vuelve a la lista tal como estaba.
+- **Dos datos hacen un evento.** La nube envía parpadeos de un solo dato — una puerta «abierta» durante
+  una sola lectura —, así que un cambio cuenta solo cuando dos lecturas consecutivas lo mantienen. Un cambio
+  que el coche deshizo entre dos de sus propios envíos nunca se ve, y la nube puede perder la señal del
+  cierre durante una o dos lecturas, que entonces se leen como un breve desbloqueo.
+- **Filtros**: una palabra (el nombre del evento, el resultado de una orden, un lugar, dónde empezó o
+  terminó un trayecto o dónde fue una carga — su nombre o su dirección completa — o la nota de un trayecto
+  o de una carga), las píldoras de
+  grupo (Seguridad, Puertas, Ventanillas, Carga, Clima, Conducción, Órdenes) y, bajo ⚙, un rango de fechas y
+  tipos sueltos. Los filtros viven en la dirección: un enlace o una recarga los conserva.
+- **Histórico**: los eventos se derivan de las posiciones que Mate ya guarda, así que en una instalación
+  existente el primer arranque relee todo el histórico, un trozo por lectura, y hasta terminar la página dice
+  hasta dónde ha llegado. Los eventos se conservan tanto como las posiciones (*Ajustes → Base de datos*).
+
+### Informes
+**(menú: Informes)** — Un resumen **mes a mes**: cuánto condujiste, cuánta energía consumiste y
 cargaste, cuánto gastaste. Útil para vigilar la tendencia. Lleva también las tarjetas de **consumo
 oficial** (Hoy / Esta semana / Este mes) de la nube.
 
@@ -567,7 +1792,7 @@ vacío lo dice en vez de enseñarte calladamente el anterior, y un mes en el que
 comparación con el precedente (todas las cifras darían −100 %, lo cual describe el calendario y no tu
 conducción).
 
-**De dónde sale la cifra de consumo, y cuándo Mate la corrige.** *Consumo medio* y *Energía consumida*
+**De dónde sale la cifra de consumo, y cuándo Mate la corrige.** *Consumo medio* y *Consumo total*
 salen normalmente del total oficial del propio coche para ese mes. Ese total solo es tan completo como
 lo fuera la conexión de tu coche: si el coche no pudo llegar a la nube durante un recorrido, ese
 recorrido entero falta. Cuando el total vuelve muy por debajo de lo que suman los trayectos del propio
@@ -632,6 +1857,8 @@ toca es lo que llegue primero.
 **(menú: Comandos)** — Los **comandos a distancia**. Desde aquí puedes:
 
 - **abrir y cerrar**, abrir el **maletero**, **localizar el coche** (claxon/luces);
+- abrir o cerrar el **parasol** del techo: la casilla indica cuánto está abierto y, si se
+  detuvo a medio camino, ofrece **Abrir** (del todo) y **Cerrar**, las dos únicas que el coche ejecuta;
 - gestionar la **climatización**: frío, calor, desempañado, ventilación, **apagar**;
 - activar la **calefacción de los asientos**, el **volante** y los **retrovisores calefactados** (donde
   estén disponibles);
@@ -711,10 +1938,11 @@ cercanos**. La página tiene tres partes:
 ### Vehículo
 **(menú: Vehículo)** — La tarjeta de **estado completo** del coche: todos los sensores disponibles en tu
 modelo (carga, autonomía, temperatura interior, marcha, puertas, ventanillas, neumáticos, cierres,
-estado de la carga…), y ahora también el **detalle de la climatización**: **nivel del ventilador** (1–7),
+estado de la carga…), y ahora también el **detalle de la climatización**: **nivel del ventilador** (1–7, o más si el coche tiene más, p. ej. 1–9),
 **recirculación del aire** (exterior / recirculación) y el **modo de climatización activo** (AUTO /
 Frío / Calor / Ventilación). Mate muestra **solo lo que tu coche informa de verdad** (algunos modelos no
-exponen ciertos datos).
+exponen ciertos datos). La casilla del parasol indica cuánto está abierto —
+«40%» sobre «Abierto» —, como lo hacen las de las ventanillas.
 
 ### Wallbox
 **(menú: Wallbox)** — Si has conectado un wallbox (ver
@@ -756,12 +1984,20 @@ dividida en tres columnas.
 - **Detección de carga** — el **umbral de corriente** (en amperios) por encima del cual Mate considera
   que hay «carga en marcha». Bájalo solo si tienes cargas muy lentas que se quedan sin detectar.
 
+- **Siempre cargo en casa 🆕** — sin wallbox y sin Home Assistant no hay nada que le diga a Mate
+  dónde ocurrió una carga, así que cada sesión nace sin tipo y hay que etiquetarla a mano: muchos
+  clics idénticos para quien solo carga en casa, quizá con varias recargas cortas al día. Con esto
+  activado una carga nueva nace **En casa**, y sigue siendo modificable para la rara vez en público.
+  Vale **solo hacia delante** — las cargas que ya tienes se quedan exactamente como están — y
+  activarlo pide una confirmación explícita, para que no ocurra nunca por descuido.
+
 **Columna 2 — Integraciones**
 
 - **ABRP** — envío de telemetría a A Better Routeplanner (ver [§8](#8-las-integraciones-en-detalle)).
 - **Búsqueda de direcciones** — el servicio que traduce direcciones ↔ coordenadas en la página de
-  Navegación (Geoapify *recomendado*, LocationIQ, TomTom). Requiere una **clave** gratuita del servicio
-  elegido.
+  Navegación y nombra dónde empiezan y terminan tus trayectos y dónde cargas (Geoapify *recomendado*,
+  LocationIQ, TomTom). Requiere una **clave** gratuita del servicio elegido; sin ella, Mate usa el
+  servicio sin clave de OpenStreetMap.
 - **⚡ Puntos de recarga** — activa los **nombres de los puntos** en las cargas (📍) y acepta claves
   opcionales (Open Charge Map, TomTom) para enriquecer la búsqueda. Viene **desactivado**.
 - **Wallbox** — conecta tu wallbox para tener **costes reales** y los controles que haya (ver
@@ -779,13 +2015,24 @@ dividida en tres columnas.
   hash con sal, nunca en claro. **Si la pierdes**, no te quedas fuera para siempre: el campo *Contraseña
   nueva* no pide la anterior, así que desde cualquier dispositivo con la sesión todavía abierta puedes
   poner una nueva sin más. Si ya no queda ningún dispositivo con la sesión abierta, la variable de
-  entorno `MATE_AUTH_PASSWORD` tiene prioridad sobre lo que haya guardado.
+  entorno `MATE_AUTH_PASSWORD` tiene prioridad sobre lo que haya guardado: añádela al contenedor con
+  una contraseña nueva, reinícialo y entra con ella. ⚠️ Tiene *prioridad*, no lo sustituye: el hash
+  olvidado sigue debajo en la base de datos, y mientras la variable esté puesta **Ajustes → Acceso**
+  no puede ni cambiarlo ni quitarlo. Así que conserva la variable: desde entonces la contraseña es
+  ella, y si la quitas vuelve a mandar la que habías perdido.
 
 - **Base de datos** — el tamaño de la BD y la **retención del GPS**: puedes conservar los puntos GPS
-  «para siempre» (por defecto) o borrar los de más de 6/12/18/24 meses para ahorrar espacio. *Solo se
-  limpian las posiciones*: los trayectos, las cargas y las curvas de carga se quedan.
+  «para siempre» (por defecto) o borrar los de más de 6/12/18/24 meses para ahorrar espacio. *Solo
+  se limpian las posiciones*: los trayectos (con su ruta y las lecturas en ruta), las cargas y las
+  curvas de carga se quedan.
+  Los puntos de un trayecto aún en curso se quedan hasta que termina, porque su final se toma de
+  ellos.
 - **Exportar / Copia de seguridad** — descargar **trayectos (CSV)**, **cargas (CSV)** y una **copia de
-  la base de datos**.
+  la base de datos**. La copia llega **comprimida en gzip** (`leapmotor_mate.db.gz`) 🆕, enviada a
+  trozos para que ni una base de datos grande tenga que caber entera en memoria. La restauración
+  acepta **tanto** el archivo comprimido **como** un `.db` guardado antes de este cambio, así que
+  nada de lo que ya tienes deja de funcionar — y un archivo más pequeño es más cómodo de guardar o
+  de sincronizar donde hagas las copias.
 - **🩺 Diagnóstico** — una foto del sistema (versión, modelo, recuentos, última consulta, integraciones
   activas), la posibilidad de **ver los registros** (poller/web) y, sobre todo, de **descargar un
   paquete de diagnóstico** marcando las partes que quieras (información, registro del poller, registro
@@ -855,18 +2102,30 @@ Publica el estado del coche (carga, autonomía, posición, puertas, estado de la
 desde las entidades de HA — incluidos un número **Límite de carga** escribible para fijar el SoC
 objetivo, una entidad de texto **Programación de carga** escribible que acepta un plan en JSON para
 automatizaciones (`{"start":"23:00","soc":90}` — cada clave es opcional, y lo que omitas conserva su
-valor actual), un número **Nivel del ventilador** escribible (1–7) y un interruptor **Recirculación**
+valor actual), un número **Nivel del ventilador** escribible (1–7, o más si el coche tiene más, p. ej. 1–9) y un interruptor **Recirculación**
 escribible, más un sensor **Modo de climatización** (AUTO / Frío / Calor / Ventilación). Las entidades
 publicadas incluyen además tres de V2L de solo lectura: **`V2L Active`** (sensor binario), **`V2L
 Power`** (W) y **`V2L Session Energy`** (Wh), y un sensor binario **`Ready`** que se enciende en cuanto
 el coche se pone en marcha — antes de que se mueva, que es cuando a una automatización todavía le da
-tiempo a actuar.
+tiempo a actuar. Un sensor **`Sunshade Position`** indica cuánto está abierto el parasol, en % (0 = cerrado); el sensor binario **`Sunshade`** sigue como estaba, encendido con cualquier apertura.
 
 Las entidades que **tu** coche no soporta no se te quedan en las manos: las que el modelo no tiene
 (asientos calefactados, volante…) no se crean nunca, y una **entidad de temperatura** cuyo sensor el
 coche no ha informado jamás **se elimina** — no se queda en `unknown` para siempre. La eliminación
 llega cuando llega la prueba (más o menos media hora de actualizaciones), sin necesidad de reiniciar, y
 si el sensor empieza a responder la entidad **vuelve**.
+
+Hace poco han llegado dos entidades más 🆕: **Potencia del clima**, los vatios que está consumiendo
+la climatización (así una automatización ve el habitáculo calentándose o enfriándose), y
+**Temperatura exterior**, la del aire según el tiempo — esta última solo mientras ese interruptor
+esté activado (ver *Resumen*).
+
+Y una más 🆕: **Aviso de actualización OTA**, encendida cuando en el buzón de tu cuenta Leapmotor hay
+un mensaje de actualización de software, con el título y la fecha del mensaje como atributos — lo
+suficiente para que una automatización te avise. Léela por lo que es: el buzón es de la **cuenta**,
+así que con dos coches el mismo aviso aparece en ambos, y dice que ha llegado un mensaje, no que tu
+coche tenga una actualización pendiente. Leapmotor no publica un estado de actualización, por lo que
+no hay número de versión que mostrar.
 
 1. Ten preparado un **broker MQTT** (normalmente el complemento *Mosquitto* de Home Assistant).
 2. En *Ajustes → MQTT*, activa **Activado** y rellena:
@@ -927,8 +2186,9 @@ Mate tiene protecciones contra valores imposibles (por ejemplo, contadores de wa
 total histórico). El caso contrario también está cubierto: si el contador del wallbox **se para** a
 media carga mientras el coche sigue consumiendo, Mate deja de fiarse de su total para esa sesión y
 factura sobre la energía que llegó a la batería — la cifra del contador se quedaría corta en todo lo que
-se perdió mientras estuvo congelado.
-Si una carga pública tiene una tarifa complicada, usa el tipo **✎ Manual** y escribe el total pagado.
+se perdió mientras estuvo congelado. A esos dos se suma un tercero: si una carga permanece abierta más de diez minutos **sin que se lea el contador** — Home Assistant apagado, Mate reiniciado a media carga —, el total tampoco es una medida de esa carga y ocurre lo mismo. (El contador se sigue leyendo mientras la nube **del coche** no responde: está en tu casa, no detrás de ella.) Y un rendimiento superior al 100 % es imposible, así que nunca se muestra.
+Si una carga pública tiene una tarifa complicada, escribe el total pagado en **✎ Manual**, al final
+del menú de su tipo.
 
 **El gráfico de descarga pasiva está vacío.**
 Hace falta al menos una **parada larga** con una caída de carga medible en los últimos días. Si el coche
@@ -945,8 +2205,43 @@ ahí una caída no se puede distinguir del ruido, y Mate prefiere no dibujar nad
 inventado.
 
 **Tengo un Leapmotor REEV (híbrido con extensor de autonomía).**
-No está soportado: los cálculos de energía usarían la capacidad de batería de la versión BEV y saldrían
-mal. Mate es **solo para las versiones 100 % eléctricas**.
+Soportado desde la **4.7.0**, en la compilación normal: la página REEV, la gasolina por viaje y por
+periodo y los paquetes de batería REEV del asistente. Para eso ya no hace falta la compilación
+BetaTester.
+La cifra de gasolina es la del propio coche, tomada del historial por viaje de Leapmotor — el mismo
+número que muestra la app oficial. Donde la nube no tiene registro de un viaje, Mate calcula los
+litros a partir del depósito, y cada cifra dice cuál de las dos está en pantalla. La ventana de la
+nube es de unos 28 días, así que en un historial largo los viajes más antiguos leen la respuesta del
+depósito, que mide alrededor de un 20 % menos.
+Un viaje que no ha quemado nada lee `0 L` con *todo eléctrico* al lado, que no es lo mismo que un
+viaje cuyo depósito no se pudo leer: ese se queda en blanco.
+En un extensor de autonomía no se muestra la **regeneración**, porque un generador que recarga la
+batería mientras conduces no se distingue de una frenada.
+¿Ya usas la compilación BetaTester? No hace falta que te muevas: sigue funcionando. Si quieres
+hacerlo, es una copia de seguridad y una restauración, en ese orden:
+[De la compilación BetaTester a la oficial](BETA-TO-OFFICIAL.md).
+
+**Mate no recibe datos y tengo un cortafuegos (Synology u otro).**
+Mate nunca necesita ser alcanzable desde fuera. La única regla **de entrada** que necesita es el
+puerto TCP **4001** desde tu propia red, para que puedas abrir la página. Todo lo demás es **de
+salida**: DNS en el puerto 53 y luego HTTPS en el 443 hacia
+`app-gw-global-master.leapmotor-international.de` y `appgateway.leapmotor-international.de` — el
+mismo balanceador en AWS Fráncfort, cuyas direcciones rotan: permite los nombres o la región y no
+fijes nunca las direcciones de hoy.
+Por eso añadir puertos o países al perfil del cortafuegos no cambia nada: esas reglas describen
+conexiones **entrantes**, y las respuestas de la nube vuelven por una conexión que abrió Mate. Lo
+que lo detiene es la regla final de «denegar todo» del perfil, aplicada al tráfico que sale del
+puente de Docker.
+En un Synology, lo que funcionó
+([#384](https://github.com/ProtossBlaster/leapmotor-mate/issues/384)): lee la red del contenedor —su
+puerta de enlace y su dirección, por ejemplo `172.28.0.1` y `172.28.0.2`— y crea después una regla
+que permita **todos los puertos** a ese rango entero (de `172.28.0.1` a `172.28.255.254`) y muévela
+**arriba del todo**, por encima de las demás. El resto del perfil, el «denegar todo» incluido, puede
+quedarse tal cual.
+Desde **4.7.18** una conexión fallida termina con una palabra, en el registro y en la página de
+configuración — `dns_failure`, `connection_refused`, `timeout`, `network_unreachable`… —, que dice de
+un vistazo si la máquina no resuelve el nombre o no alcanza la dirección. Desde **4.8.0** esa palabra
+ya no queda oculta tras el mensaje de Mate «login temporarily deferred».
 
 **No estoy en Europa.**
 Por ahora Mate solo funciona con la nube **europea** de Leapmotor. Las cuentas alojadas en servidores de
@@ -965,8 +2260,9 @@ Desde *Ajustes → Exportar/Copia de seguridad* descargas la base de datos (y lo
   nueva.
 - **CA / CC** — corriente alterna (carga lenta, desde casa o puntos de CA) / corriente continua (carga
   rápida y ultrarrápida).
-- **En casa / AC / DC rápida / HPC / Manual** — los tipos de carga que Mate reconoce o que puedes
-  asignar tú; «HPC» es la carga de potencia muy alta.
+- **En casa / AC / DC rápida / HPC / Gratis** — los tipos de carga que Mate reconoce o que puedes
+  asignar tú; una carga sin tipo se lee **✎ Manual** si le escribiste el precio,
+  **❓ Por confirmar** si no; «HPC» es la carga de potencia muy alta.
 - **TOU** (*Time-of-Use*) — una tarifa por **franjas horarias** (precios distintos según el día y la
   hora).
 - **Regeneración** — energía **recuperada** al frenar o al levantar el pie y devuelta a la batería.
@@ -979,8 +2275,8 @@ Desde *Ajustes → Exportar/Copia de seguridad* descargas la base de datos (y lo
 - **Poller / Web** — los dos componentes internos de Mate: el *poller* recoge los datos, la *web*
   muestra la interfaz. Para ti, como usuario, es un detalle: trabajan juntos.
 - **VIN** — el número de bastidor del coche; identifica tu vehículo de forma única.
-- **PIN de operaciones** — el PIN de 4 dígitos de la cuenta, necesario para autorizar los comandos a
-  distancia.
+- **PIN de operaciones** — el PIN de 4 dígitos del coche, configurado en el coche y necesario para
+  autorizar los comandos a distancia.
 
 ---
 

@@ -56,6 +56,10 @@
               class="px-4 py-1.5 rounded-full text-sm font-medium border transition-all cursor-pointer">
         🇪🇸 Español
       </button>
+      <button type="button" onclick="setLang('cs')" id="btn-cs"
+              class="px-4 py-1.5 rounded-full text-sm font-medium border transition-all cursor-pointer">
+        🇨🇿 Čeština
+      </button>
     </div>
     <h1 id="setup-title" class="text-2xl font-bold text-white mb-1">Welcome to LeapMotor Mate</h1>
     <p id="setup-subtitle" class="text-slate-400 text-sm">Configure your vehicle connection to get started</p>
@@ -74,53 +78,19 @@
     <p id="demo-cta-note" class="text-[11px] text-slate-500 mt-3 text-center">Sample data only — nothing is real. You can exit anytime.</p>
   </div>
 
-  <!-- Back to the landing (shown only once the setup/cert form is revealed) -->
+  <!-- Back to the landing (shown only once a setup step is revealed) -->
   <button type="button" id="back-link" onclick="backToChoice()" style="display:none"
           class="mb-4 text-sm text-slate-400 hover:text-white">← <span id="back-label">Back</span></button>
 
-  <!-- ── Step 1: App certificate ──────────────────────────────────────────── -->
-  <div id="cert-step" style="display:none">
-    <div style="background:#1e293b;border:1px solid #334155;border-radius:14px;padding:18px 18px 20px">
-      <div id="cert-title" style="color:#f1f5f9;font-size:15px;font-weight:700;margin-bottom:6px">App certificate</div>
-      <p id="cert-desc" style="color:#94a3b8;font-size:13px;line-height:1.5;margin-bottom:10px"></p>
-      <a id="cert-link" href="https://github.com/markoceri/leapmotor-certs" target="_blank" rel="noopener"
-         style="display:inline-flex;align-items:center;gap:6px;color:#14b8a6;font-size:13px;font-weight:600;margin-bottom:16px">
-        github.com/markoceri/leapmotor-certs ↗
-      </a>
-
-      <div id="cert-error" style="display:none;background:#ef444422;border:1px solid #ef444455;border-radius:10px;padding:10px 14px;color:#fca5a5;font-size:13px;margin-bottom:12px"></div>
-
-      <!-- Mode: file upload (default) -->
-      <div id="cert-mode-file">
-        <label class="block text-xs font-medium text-slate-400 mb-1" id="lbl-crt">app.crt (certificate)</label>
-        <input type="file" id="file-crt" accept=".crt,.pem,.cert"
-               class="w-full text-sm text-slate-300 mb-3 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:bg-brand/20 file:text-brand file:cursor-pointer cursor-pointer">
-        <label class="block text-xs font-medium text-slate-400 mb-1" id="lbl-key">app.key (private key)</label>
-        <input type="file" id="file-key" accept=".key,.pem"
-               class="w-full text-sm text-slate-300 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:bg-brand/20 file:text-brand file:cursor-pointer cursor-pointer">
-      </div>
-
-      <!-- Mode: paste PEM -->
-      <div id="cert-mode-paste" style="display:none">
-        <label class="block text-xs font-medium text-slate-400 mb-1">app.crt (PEM)</label>
-        <textarea id="paste-crt" rows="3" placeholder="-----BEGIN CERTIFICATE-----"
-                  class="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-600 text-slate-200 text-xs font-mono mb-3 focus:outline-none focus:border-brand"></textarea>
-        <label class="block text-xs font-medium text-slate-400 mb-1">app.key (PEM)</label>
-        <textarea id="paste-key" rows="3" placeholder="-----BEGIN PRIVATE KEY-----"
-                  class="w-full px-3 py-2 rounded-lg bg-slate-900 border border-slate-600 text-slate-200 text-xs font-mono focus:outline-none focus:border-brand"></textarea>
-      </div>
-
-      <button type="button" onclick="toggleCertMode()" id="cert-toggle-mode"
-              class="text-xs text-slate-400 hover:text-slate-200 mt-3 cursor-pointer underline"></button>
-
-      <button type="button" onclick="saveCert()" id="btn-cert"
-              class="w-full py-3 mt-4 rounded-xl bg-brand text-white font-semibold text-sm hover:bg-teal-500 transition-all cursor-pointer">
-        <span id="cert-btn-label">Save certificate</span>
-      </button>
-    </div>
+  <div id="application-bundle-step" style="display:none" class="rounded-xl bg-slate-800 p-5 mb-4">
+    <h2 class="font-semibold text-white">Application bundle / Pacchetto applicativo</h2>
+    <p class="text-sm text-slate-300 my-3">Carica il pacchetto applicativo fornito per questa installazione. Non contiene il tuo account o lo storico. / Upload the application bundle supplied for this installation. It does not contain your account or history.</p>
+    <input id="application-bundle" type="file" accept=".zip" class="w-full text-slate-300">
+    <button type="button" onclick="saveApplicationBundle()" class="mt-3 px-4 py-2 rounded-xl bg-brand text-white">Installa / Install</button>
+    <p id="application-bundle-result" role="status" class="mt-2 text-sm text-slate-300"></p>
   </div>
 
-  <!-- ── Step 2: Account login ────────────────────────────────────────────── -->
+  <!-- ── Account login ────────────────────────────────────────────────────── -->
   <!-- Form -->
   <form method="post" action="setup" class="space-y-4" id="setup-form" style="display:none"
         onsubmit="return validateSubmit()">
@@ -146,7 +116,7 @@
       </label>
       <input type="email" name="user" required
              value="{{ prefill.user if prefill else '' }}"
-             id="inp-email" placeholder="you@example.com"
+             id="inp-email" placeholder="you@example.com" oninput="forgetDetection()"
              class="w-full px-4 py-3 rounded-xl bg-slate-800 border border-slate-600 text-white
                     placeholder-slate-500 focus:outline-none focus:border-brand text-sm">
     </div>
@@ -171,7 +141,7 @@
     <!-- PIN -->
     <div>
       <label id="lbl-pin" class="block text-sm font-medium text-slate-300 mb-1.5">
-        Operation PIN
+        Operation PIN (set on the car)
       </label>
       <div class="relative">
         <input type="password" name="pin" required maxlength="4"
@@ -239,12 +209,11 @@
   // Il fuso rilevato dal server: l'unico pezzo di quella frase che non e' traduzione.
   const TZ_DETECTED = {{ (tz_detected or 'UTC') | tojson }};
 // ── Battery options ─────────────────────────────────────────────────────────
-// Rendered from the server's map (battery_options_for_build), already filtered for this build —
-// deliberately not a hand-kept copy, so this list can never drift from what detect-vehicle answers.
-// See that function for what the filtering is about; the reasoning stays server-side, out of the
-// page source.
+// Rendered from the server's map (battery_options_for_build): every pack, the range-extenders
+// included — deliberately not a hand-kept copy, so this list can never drift from what
+// detect-vehicle answers. The page draws all of it: it used to take the range-extender packs out
+// again on every build but the BetaTester, and a REEV could not pick its pack (BetaTester #13).
 const BATTERY_OPTIONS = {{ battery_options|tojson }};
-const RESEARCH = {{ research|tojson }};
 
 // ── i18n strings ─────────────────────────────────────────────────────────────
 const strings = {
@@ -255,7 +224,8 @@ const strings = {
     email:         "Leapmotor account email",
     emailPh:       "you@example.com",
     password:      "Password",
-    pin:           "Operation PIN",
+    pin:           "Operation PIN (set on the car)",
+    pinPerCar:     "Operation PIN of this car",
     pinPh:         "4-digit PIN",
     tz:            "Time zone",
     tzHint:        "Trips and charges are shown in this zone. Detected: {tz} — change it if that isn't where you are.",
@@ -267,21 +237,12 @@ const strings = {
     batteryHint:   "Select your battery variant",
     batteryAutoSet:"Battery detected (EU spec)",
     detectFail:    "Could not detect vehicle",
+    pinNotSaved:   "With no car detected, the PIN is not saved. Once Mate has found the car, set it in Settings → Vehicle.",
     manualEntry:   "Enter battery capacity manually (kWh)",
-    manualHint:    "B10 Pro: 55.0 · B10 Pro Max: 65.0 · B05 Pro: 55.0 · B05 Pro Max: 65.0 · T03: 36.0 · C10 RWD: 67.0 · C10 AWD: 81.9",
+    manualHint:    "B10 Pro: 55.0 · B10 Pro Max: 65.0 · B05 Pro: 55.0 · B05 Pro Max: 65.0 · T03: 36.0 · C10 RWD: 67.0 · C10 AWD: 81.9 · B03X 292 km: 39.0 · B03X 382 km: 52.0",
     submit:        "Connect & Start",
     required:      "Email, password and PIN are required.",
     noBattery:     "Please select a battery variant first.",
-    certTitle:     "Step 1 — App certificate",
-    certDesc:      "Mate needs the Leapmotor app TLS certificate (the same for everyone, not your account). Download the two files app.crt and app.key from:",
-    certBtn:       "Save certificate",
-    certSaving:    "⏳ Saving…",
-    certToPaste:   "Paste the PEM text instead",
-    certToFile:    "Upload the files instead",
-    certBoth:      "Both app.crt and app.key are required.",
-    certSaved:     "✓ Certificate saved",
-    certCrtLabel:  "app.crt (certificate)",
-    certKeyLabel:  "app.key (private key)",
     setupChoice:   "Set up my car",
     back:          "Back",
     demoBtn:       "Try the demo",
@@ -295,7 +256,8 @@ const strings = {
     email:         "Email account Leapmotor",
     emailPh:       "tu@esempio.com",
     password:      "Password",
-    pin:           "PIN operativo",
+    pin:           "PIN operativo (impostato sull'auto)",
+    pinPerCar:     "PIN operativo di questa auto",
     pinPh:         "PIN a 4 cifre",
     tz:            "Fuso orario",
     tzHint:        "Viaggi e ricariche sono mostrati in questo fuso. Rilevato: {tz} — cambialo se non è dove ti trovi.",
@@ -307,21 +269,12 @@ const strings = {
     batteryHint:   "Seleziona la variante batteria",
     batteryAutoSet:"Batteria rilevata (spec. europea)",
     detectFail:    "Impossibile rilevare il veicolo",
+    pinNotSaved:   "Senza un'auto rilevata il PIN non viene salvato. Quando Mate avrà trovato l'auto, inseriscilo in Impostazioni → Veicolo.",
     manualEntry:   "Inserisci la capacità batteria manualmente (kWh)",
-    manualHint:    "B10 Pro: 55.0 · B10 Pro Max: 65.0 · B05 Pro: 55.0 · B05 Pro Max: 65.0 · T03: 36.0 · C10 RWD: 67.0 · C10 AWD: 81.9",
+    manualHint:    "B10 Pro: 55.0 · B10 Pro Max: 65.0 · B05 Pro: 55.0 · B05 Pro Max: 65.0 · T03: 36.0 · C10 RWD: 67.0 · C10 AWD: 81.9 · B03X 292 km: 39.0 · B03X 382 km: 52.0",
     submit:        "Connetti e avvia",
     required:      "Email, password e PIN sono obbligatori.",
     noBattery:     "Seleziona prima una variante batteria.",
-    certTitle:     "Passo 1 — Certificato app",
-    certDesc:      "Mate ha bisogno del certificato TLS dell'app Leapmotor (uguale per tutti, non del tuo account). Scarica i due file app.crt e app.key da:",
-    certBtn:       "Salva certificato",
-    certSaving:    "⏳ Salvataggio…",
-    certToPaste:   "Incolla il testo PEM invece",
-    certToFile:    "Carica i file invece",
-    certBoth:      "Servono entrambi app.crt e app.key.",
-    certSaved:     "✓ Certificato salvato",
-    certCrtLabel:  "app.crt (certificato)",
-    certKeyLabel:  "app.key (chiave privata)",
     setupChoice:   "Configura la mia auto",
     back:          "Indietro",
     demoBtn:       "Prova la demo",
@@ -335,7 +288,8 @@ const strings = {
     email:         "E-mail du compte Leapmotor",
     emailPh:       "vous@exemple.com",
     password:      "Mot de passe",
-    pin:           "Code PIN d'opération",
+    pin:           "Code PIN d'opération (réglé sur la voiture)",
+    pinPerCar:     "Code PIN d'opération de cette voiture",
     pinPh:         "PIN à 4 chiffres",
     tz:            "Fuseau horaire",
     tzHint:        "Les trajets et les recharges s'affichent dans ce fuseau. Détecté : {tz} — changez-le si ce n'est pas là que vous êtes.",
@@ -347,21 +301,12 @@ const strings = {
     batteryHint:   "Sélectionnez votre variante de batterie",
     batteryAutoSet:"Batterie détectée (spéc. UE)",
     detectFail:    "Impossible de détecter le véhicule",
+    pinNotSaved:   "Sans voiture détectée, le code PIN n'est pas enregistré. Quand Mate aura trouvé la voiture, saisissez-le dans Paramètres → Véhicule.",
     manualEntry:   "Saisir la capacité batterie manuellement (kWh)",
-    manualHint:    "B10 Pro: 55.0 · B10 Pro Max: 65.0 · B05 Pro: 55.0 · B05 Pro Max: 65.0 · T03: 36.0 · C10 RWD: 67.0 · C10 AWD: 81.9",
+    manualHint:    "B10 Pro: 55.0 · B10 Pro Max: 65.0 · B05 Pro: 55.0 · B05 Pro Max: 65.0 · T03: 36.0 · C10 RWD: 67.0 · C10 AWD: 81.9 · B03X 292 km: 39.0 · B03X 382 km: 52.0",
     submit:        "Connecter et démarrer",
     required:      "E-mail, mot de passe et PIN sont obligatoires.",
     noBattery:     "Veuillez d'abord sélectionner une variante de batterie.",
-    certTitle:     "Étape 1 — Certificat de l'app",
-    certDesc:      "Mate a besoin du certificat TLS de l'app Leapmotor (le même pour tous, pas celui de votre compte). Téléchargez les deux fichiers app.crt et app.key depuis :",
-    certBtn:       "Enregistrer le certificat",
-    certSaving:    "⏳ Enregistrement…",
-    certToPaste:   "Coller le texte PEM à la place",
-    certToFile:    "Téléverser les fichiers à la place",
-    certBoth:      "app.crt et app.key sont tous deux requis.",
-    certSaved:     "✓ Certificat enregistré",
-    certCrtLabel:  "app.crt (certificat)",
-    certKeyLabel:  "app.key (clé privée)",
     setupChoice:   "Configurer ma voiture",
     back:          "Retour",
     demoBtn:       "Essayer la démo",
@@ -375,7 +320,8 @@ const strings = {
     email:         "E-Mail des Leapmotor-Kontos",
     emailPh:       "sie@beispiel.com",
     password:      "Passwort",
-    pin:           "Bedien-PIN",
+    pin:           "Bedien-PIN (am Auto eingestellt)",
+    pinPerCar:     "Bedien-PIN dieses Autos",
     pinPh:         "4-stellige PIN",
     tz:            "Zeitzone",
     tzHint:        "Fahrten und Ladevorgänge werden in dieser Zone angezeigt. Erkannt: {tz} — ändern Sie sie, wenn Sie woanders sind.",
@@ -387,21 +333,12 @@ const strings = {
     batteryHint:   "Wählen Sie Ihre Batterievariante",
     batteryAutoSet:"Batterie erkannt (EU-Spezifikation)",
     detectFail:    "Fahrzeug konnte nicht erkannt werden",
+    pinNotSaved:   "Ohne erkanntes Auto wird die PIN nicht gespeichert. Sobald Mate das Auto gefunden hat, geben Sie sie unter Einstellungen → Fahrzeug ein.",
     manualEntry:   "Batteriekapazität manuell eingeben (kWh)",
-    manualHint:    "B10 Pro: 55.0 · B10 Pro Max: 65.0 · B05 Pro: 55.0 · B05 Pro Max: 65.0 · T03: 36.0 · C10 RWD: 67.0 · C10 AWD: 81.9",
+    manualHint:    "B10 Pro: 55.0 · B10 Pro Max: 65.0 · B05 Pro: 55.0 · B05 Pro Max: 65.0 · T03: 36.0 · C10 RWD: 67.0 · C10 AWD: 81.9 · B03X 292 km: 39.0 · B03X 382 km: 52.0",
     submit:        "Verbinden & starten",
     required:      "E-Mail, Passwort und PIN sind erforderlich.",
     noBattery:     "Bitte wählen Sie zuerst eine Batterievariante.",
-    certTitle:     "Schritt 1 — App-Zertifikat",
-    certDesc:      "Mate benötigt das TLS-Zertifikat der Leapmotor-App (für alle gleich, nicht Ihr Konto). Laden Sie die beiden Dateien app.crt und app.key herunter von:",
-    certBtn:       "Zertifikat speichern",
-    certSaving:    "⏳ Speichern…",
-    certToPaste:   "Stattdessen PEM-Text einfügen",
-    certToFile:    "Stattdessen Dateien hochladen",
-    certBoth:      "app.crt und app.key sind beide erforderlich.",
-    certSaved:     "✓ Zertifikat gespeichert",
-    certCrtLabel:  "app.crt (Zertifikat)",
-    certKeyLabel:  "app.key (privater Schlüssel)",
     setupChoice:   "Mein Auto einrichten",
     back:          "Zurück",
     demoBtn:       "Demo ausprobieren",
@@ -415,7 +352,8 @@ const strings = {
     email:         "E-mail konta Leapmotor",
     emailPh:       "ty@przyklad.com",
     password:      "Hasło",
-    pin:           "PIN operacyjny",
+    pin:           "PIN operacyjny (ustawiany w aucie)",
+    pinPerCar:     "PIN operacyjny tego auta",
     pinPh:         "4-cyfrowy PIN",
     tz:            "Strefa czasowa",
     tzHint:        "Przejazdy i ładowania są pokazywane w tej strefie. Wykryto: {tz} — zmień, jeśli to nie tam jesteś.",
@@ -427,21 +365,12 @@ const strings = {
     batteryHint:   "Wybierz wariant baterii",
     batteryAutoSet:"Bateria wykryta (specyfikacja UE)",
     detectFail:    "Nie udało się wykryć pojazdu",
+    pinNotSaved:   "Bez wykrytego auta PIN nie zostanie zapisany. Gdy Mate znajdzie auto, wpisz go w Ustawieniach, w sekcji Pojazd.",
     manualEntry:   "Wprowadź pojemność baterii ręcznie (kWh)",
-    manualHint:    "B10 Pro: 55.0 · B10 Pro Max: 65.0 · B05 Pro: 55.0 · B05 Pro Max: 65.0 · T03: 36.0 · C10 RWD: 67.0 · C10 AWD: 81.9",
+    manualHint:    "B10 Pro: 55.0 · B10 Pro Max: 65.0 · B05 Pro: 55.0 · B05 Pro Max: 65.0 · T03: 36.0 · C10 RWD: 67.0 · C10 AWD: 81.9 · B03X 292 km: 39.0 · B03X 382 km: 52.0",
     submit:        "Połącz i uruchom",
     required:      "E-mail, hasło i PIN są wymagane.",
     noBattery:     "Najpierw wybierz wariant baterii.",
-    certTitle:     "Krok 1 — Certyfikat aplikacji",
-    certDesc:      "Mate potrzebuje certyfikatu TLS aplikacji Leapmotor (takiego samego dla wszystkich, nie Twojego konta). Pobierz dwa pliki app.crt i app.key z:",
-    certBtn:       "Zapisz certyfikat",
-    certSaving:    "⏳ Zapisywanie…",
-    certToPaste:   "Zamiast tego wklej tekst PEM",
-    certToFile:    "Zamiast tego prześlij pliki",
-    certBoth:      "Wymagane są oba pliki: app.crt i app.key.",
-    certSaved:     "✓ Certyfikat zapisany",
-    certCrtLabel:  "app.crt (certyfikat)",
-    certKeyLabel:  "app.key (klucz prywatny)",
     setupChoice:   "Skonfiguruj mój samochód",
     back:          "Wstecz",
     demoBtn:       "Wypróbuj demo",
@@ -455,7 +384,8 @@ const strings = {
     email:         "Email da conta Leapmotor",
     emailPh:       "utilizador@exemplo.com",
     password:      "Palavra-passe",
-    pin:           "PIN de operação",
+    pin:           "PIN de operação (definido no carro)",
+    pinPerCar:     "PIN de operação deste carro",
     pinPh:         "PIN de 4 dígitos",
     tz:            "Fuso horário",
     tzHint:        "Viagens e carregamentos são mostrados neste fuso. Detetado: {tz} — altere se não for onde está.",
@@ -467,21 +397,12 @@ const strings = {
     batteryHint:   "Selecione a variante da bateria",
     batteryAutoSet:"Bateria detetada (especificação europeia)",
     detectFail:    "Não foi possível detetar o veículo",
+    pinNotSaved:   "Sem um carro detetado, o PIN não é guardado. Quando o Mate encontrar o carro, defina-o em Definições → Veículo.",
     manualEntry:   "Introduza manualmente a capacidade da bateria (kWh)",
-    manualHint:    "B10 Pro: 55.0 · B10 Pro Max: 65.0 · B05 Pro: 55.0 · B05 Pro Max: 65.0 · T03: 36.0 · C10 RWD: 67.0 · C10 AWD: 81.9",
+    manualHint:    "B10 Pro: 55.0 · B10 Pro Max: 65.0 · B05 Pro: 55.0 · B05 Pro Max: 65.0 · T03: 36.0 · C10 RWD: 67.0 · C10 AWD: 81.9 · B03X 292 km: 39.0 · B03X 382 km: 52.0",
     submit:        "Ligar e iniciar",
     required:      "O email, a palavra-passe e o PIN são obrigatórios.",
     noBattery:     "Selecione primeiro a variante da bateria.",
-    certTitle:     "Passo 1 — Certificado da aplicação",
-    certDesc:      "O Mate necessita do certificado TLS da aplicação Leapmotor (é igual para todos os utilizadores, não é específico da sua conta). Transfira os ficheiros app.crt e app.key em:",
-    certBtn:       "Guardar certificado",
-    certSaving:    "⏳ A guardar…",
-    certToPaste:   "Colar o conteúdo PEM em vez disso",
-    certToFile:    "Carregar os ficheiros em vez disso",
-    certBoth:      "Os ficheiros app.crt e app.key são obrigatórios.",
-    certSaved:     "✓ Certificado guardado",
-    certCrtLabel:  "app.crt (certificado)",
-    certKeyLabel:  "app.key (chave privada)",
     setupChoice:   "Configurar o meu carro",
     back:          "Voltar",
     demoBtn:       "Experimentar a demonstração",
@@ -495,7 +416,8 @@ const strings = {
     email:         "E-mailadres van je Leapmotor-account",
     emailPh:       "jij@voorbeeld.nl",
     password:      "Wachtwoord",
-    pin:           "Bedienings-pincode",
+    pin:           "Bedienings-pincode (ingesteld in de auto)",
+    pinPerCar:     "Bedienings-pincode van deze auto",
     pinPh:         "Pincode van 4 cijfers",
     tz:            "Tijdzone",
     tzHint:        "Ritten en laadbeurten worden in deze zone getoond. Gedetecteerd: {tz} — wijzig het als je daar niet bent.",
@@ -507,21 +429,12 @@ const strings = {
     batteryHint:   "Kies je batterijvariant",
     batteryAutoSet:"Batterij herkend (EU-uitvoering)",
     detectFail:    "Kon het voertuig niet vinden",
+    pinNotSaved:   "Zonder gevonden auto wordt de pincode niet opgeslagen. Zodra Mate de auto heeft gevonden, vul je die in bij Instellingen → Voertuig.",
     manualEntry:   "Batterijcapaciteit met de hand invoeren (kWh)",
-    manualHint:    "B10 Pro: 55,0 · B10 Pro Max: 65,0 · B05 Pro: 55,0 · B05 Pro Max: 65,0 · T03: 36,0 · C10 RWD: 67,0 · C10 AWD: 81,9",
+    manualHint:    "B10 Pro: 55,0 · B10 Pro Max: 65,0 · B05 Pro: 55,0 · B05 Pro Max: 65,0 · T03: 36,0 · C10 RWD: 67,0 · C10 AWD: 81,9 · B03X 292 km: 39,0 · B03X 382 km: 52,0",
     submit:        "Verbinden en starten",
     required:      "E-mailadres, wachtwoord en pincode zijn verplicht.",
     noBattery:     "Kies eerst een batterijvariant.",
-    certTitle:     "Stap 1 — App-certificaat",
-    certDesc:      "Mate heeft het TLS-certificaat van de Leapmotor-app nodig (voor iedereen hetzelfde, niet van jouw account). Download de twee bestanden app.crt en app.key bij:",
-    certBtn:       "Certificaat opslaan",
-    certSaving:    "⏳ Opslaan…",
-    certToPaste:   "Plak in plaats daarvan de PEM-tekst",
-    certToFile:    "Upload in plaats daarvan de bestanden",
-    certBoth:      "Zowel app.crt als app.key zijn verplicht.",
-    certSaved:     "✓ Certificaat opgeslagen",
-    certCrtLabel:  "app.crt (certificaat)",
-    certKeyLabel:  "app.key (privésleutel)",
     setupChoice:   "Mijn auto instellen",
     back:          "Terug",
     demoBtn:       "De demo proberen",
@@ -535,7 +448,8 @@ const strings = {
     email:         "Correo de la cuenta de Leapmotor",
     emailPh:       "tu@ejemplo.com",
     password:      "Contraseña",
-    pin:           "PIN de operaciones",
+    pin:           "PIN de operaciones (configurado en el coche)",
+    pinPerCar:     "PIN de operaciones de este coche",
     pinPh:         "PIN de 4 dígitos",
     tz:            "Zona horaria",
     tzHint:        "Los trayectos y las cargas se muestran en esta zona. Detectada: {tz} — cámbiala si no es donde estás.",
@@ -547,82 +461,53 @@ const strings = {
     batteryHint:   "Elige tu variante de batería",
     batteryAutoSet:"Batería detectada (versión europea)",
     detectFail:    "No se ha podido detectar el vehículo",
+    pinNotSaved:   "Sin un coche detectado, el PIN no se guarda. Cuando Mate encuentre el coche, introdúcelo en Ajustes → Vehículo.",
     manualEntry:   "Introducir la capacidad de la batería a mano (kWh)",
-    manualHint:    "B10 Pro: 55,0 · B10 Pro Max: 65,0 · B05 Pro: 55,0 · B05 Pro Max: 65,0 · T03: 36,0 · C10 RWD: 67,0 · C10 AWD: 81,9",
+    manualHint:    "B10 Pro: 55,0 · B10 Pro Max: 65,0 · B05 Pro: 55,0 · B05 Pro Max: 65,0 · T03: 36,0 · C10 RWD: 67,0 · C10 AWD: 81,9 · B03X 292 km: 39,0 · B03X 382 km: 52,0",
     submit:        "Conectar y empezar",
     required:      "El correo, la contraseña y el PIN son obligatorios.",
     noBattery:     "Elige antes una variante de batería.",
-    certTitle:     "Paso 1 — Certificado de la app",
-    certDesc:      "Mate necesita el certificado TLS de la app de Leapmotor (el mismo para todo el mundo, no el de tu cuenta). Descarga los dos archivos app.crt y app.key de:",
-    certBtn:       "Guardar el certificado",
-    certSaving:    "⏳ Guardando…",
-    certToPaste:   "Pegar el texto PEM en su lugar",
-    certToFile:    "Subir los archivos en su lugar",
-    certBoth:      "Hacen falta tanto app.crt como app.key.",
-    certSaved:     "✓ Certificado guardado",
-    certCrtLabel:  "app.crt (certificado)",
-    certKeyLabel:  "app.key (clave privada)",
     setupChoice:   "Configurar mi coche",
     back:          "Atrás",
     demoBtn:       "Probar la demostración",
     demoNote:      "Solo datos de ejemplo — nada es real. Puedes salir cuando quieras.",
     demoStarting:  "Iniciando la demostración…",
   },
+  cs: {
+    title:         "Vítejte v LeapMotor Mate",
+    subtitle:      "Vyberte, jak chcete začít",
+    acctWarn:      "⚠️ Použijte účet Leapmotor vyhrazený pouze pro Mate. Nepoužívejte tento účet současně v žádné jiné aplikaci, doplňku, Dockeru ani integraci — navzájem si ruší relaci a data pak budou chybět nebo nebudou souhlasit.",
+    email:         "E-mail účtu Leapmotor",
+    emailPh:       "vy@example.com",
+    password:      "Heslo",
+    pin:           "Provozní PIN (nastavený v autě)",
+    pinPerCar:     "Provozní PIN tohoto auta",
+    pinPh:         "4místný PIN",
+    tz:            "Časové pásmo",
+    tzHint:        "Jízdy a nabíjení se zobrazují v tomto pásmu. Zjištěno: {tz} — pokud se nacházíte jinde, změňte ho.",
+    detectBtn:     "🔍 Najít moje auto",
+    detecting:     "⏳ Hledám…",
+    detected:      "Auto nalezeno",
+    carLine:       (model, vin) => `Leapmotor ${model} · VIN ···${vin.slice(-6)}`,
+    batteryLabel:  "Baterie",
+    batteryHint:   "Vyberte variantu baterie",
+    batteryAutoSet:"Baterie zjištěna (evropská specifikace)",
+    detectFail:    "Vozidlo se nepodařilo najít",
+    pinNotSaved:   "Bez nalezeného auta se PIN neuloží. Jakmile Mate auto najde, zadejte ho v Nastavení → Vozidlo.",
+    manualEntry:   "Zadat kapacitu baterie ručně (kWh)",
+    manualHint:    "B10 Pro: 55,0 · B10 Pro Max: 65,0 · B05 Pro: 55,0 · B05 Pro Max: 65,0 · T03: 36,0 · C10 RWD: 67,0 · C10 AWD: 81,9 · B03X 292 km: 39,0 · B03X 382 km: 52,0",
+    submit:        "Připojit a spustit",
+    required:      "E-mail, heslo a PIN jsou povinné.",
+    noBattery:     "Nejprve vyberte variantu baterie.",
+    setupChoice:   "Nastavit moje auto",
+    back:          "Zpět",
+    demoBtn:       "Vyzkoušet demo",
+    demoNote:      "Pouze ukázková data — nic není skutečné. Demo můžete kdykoli opustit.",
+    demoStarting:  "Spouštím demo…",
+  },
 };
 
 let currentLang = 'en';
-let certPasteMode = false;
-
-// ── Certificate step ──────────────────────────────────────────────────────────
-function toggleCertMode() {
-  certPasteMode = !certPasteMode;
-  document.getElementById('cert-mode-file').style.display  = certPasteMode ? 'none' : 'block';
-  document.getElementById('cert-mode-paste').style.display = certPasteMode ? 'block' : 'none';
-  document.getElementById('cert-toggle-mode').textContent  =
-    certPasteMode ? strings[currentLang].certToFile : strings[currentLang].certToPaste;
-}
-
-function showCertError(msg) {
-  const el = document.getElementById('cert-error');
-  el.textContent = msg;
-  el.style.display = msg ? 'block' : 'none';
-}
-
-async function saveCert() {
-  const s = strings[currentLang];
-  showCertError('');
-  const fd = new FormData();
-  if (certPasteMode) {
-    const crt = document.getElementById('paste-crt').value.trim();
-    const key = document.getElementById('paste-key').value.trim();
-    if (!crt || !key) { showCertError(s.certBoth); return; }
-    fd.append('crt_pem', crt);
-    fd.append('key_pem', key);
-  } else {
-    const crt = document.getElementById('file-crt').files[0];
-    const key = document.getElementById('file-key').files[0];
-    if (!crt || !key) { showCertError(s.certBoth); return; }
-    fd.append('crt_file', crt);
-    fd.append('key_file', key);
-  }
-
-  const btn = document.getElementById('btn-cert');
-  document.getElementById('cert-btn-label').textContent = s.certSaving;
-  btn.disabled = true; btn.style.opacity = '0.6';
-  try {
-    const resp = await fetch('api/setup/cert', { method: 'POST', body: fd });
-    const data = await resp.json();
-    if (!resp.ok || data.error) { showCertError(data.error || 'Error'); return; }
-    // Cert saved → reveal the login step
-    document.getElementById('cert-step').style.display = 'none';
-    document.getElementById('setup-form').style.display = 'block';
-  } catch (err) {
-    showCertError(err.message);
-  } finally {
-    document.getElementById('cert-btn-label').textContent = s.certBtn;
-    btn.disabled = false; btn.style.opacity = '1';
-  }
-}
 
 // ── Language switch ───────────────────────────────────────────────────────────
 function setLang(lang) {
@@ -642,12 +527,6 @@ function setLang(lang) {
   document.getElementById('inp-pin').placeholder         = s.pinPh;
   document.getElementById('detect-label').textContent    = s.detectBtn;
   document.getElementById('submit-label').textContent    = s.submit;
-  document.getElementById('cert-title').textContent      = s.certTitle;
-  document.getElementById('cert-desc').textContent       = s.certDesc;
-  document.getElementById('cert-btn-label').textContent  = s.certBtn;
-  document.getElementById('cert-toggle-mode').textContent = certPasteMode ? s.certToFile : s.certToPaste;
-  document.getElementById('lbl-crt').textContent          = s.certCrtLabel;
-  document.getElementById('lbl-key').textContent          = s.certKeyLabel;
   document.getElementById('choice-setup-label').textContent = s.setupChoice;
   document.getElementById('demo-cta-label').textContent     = s.demoBtn;
   document.getElementById('demo-cta-note').textContent      = s.demoNote;
@@ -663,6 +542,7 @@ function setLang(lang) {
   document.getElementById('btn-pt-PT').className = lang === 'pt-PT' ? active : inactive;
   document.getElementById('btn-nl').className = lang === 'nl' ? active : inactive;
   document.getElementById('btn-es').className = lang === 'es' ? active : inactive;
+  document.getElementById('btn-cs').className = lang === 'cs' ? active : inactive;
 }
 
 // ── Demo mode ─────────────────────────────────────────────────────────────────
@@ -754,7 +634,14 @@ function selectCarBattery(vin, v, reev) {
 function setCarPin(vin, pin) { CARS[vin].pin = pin; syncCars(); }
 
 function syncCars() {
-  document.getElementById('h-vehicles').value = JSON.stringify(Object.values(CARS));
+  const cars = Object.values(CARS);
+  document.getElementById('h-vehicles').value = JSON.stringify(cars);
+  // The account-wide fields are still posted, and setup_submit writes the first into the legacy
+  // `battery_capacity_kwh` — the pack a car without its own row is measured with. The multi-car
+  // branch left them empty, so that setting became the 65.0 fallback: a B10 Pro Max pack on an
+  // account whose first car may be an 81.9 kWh AWD. The first car's own answer belongs there.
+  document.getElementById('h-battery').value = cars.length ? cars[0].battery : '';
+  document.getElementById('h-is-reev').value = cars.length ? cars[0].is_reev : '0';
 }
 
 function buildCarCards(cars) {
@@ -762,20 +649,19 @@ function buildCarCards(cars) {
   const mainPin = (document.querySelector('input[name="pin"]') || {}).value || '';
   let html = '';
   cars.forEach(car => {
-    // Belt and braces, exactly as the single-car selector does it: this build must never draw a
-    // pack it isn't meant to offer, whatever the server handed over.
-    let options = car.battery_options || [];
-    if (!RESEARCH) options = options.filter(o => !o.reev);
+    const options = car.battery_options || [];
     CARS[car.vin] = {vin: car.vin, car_type: car.car_type,
                      battery: options.length ? String(options[0].v) : '',
                      is_reev: options.length && options[0].reev ? '1' : '0', pin: mainPin};
     html += `
       <div data-car="${car.vin}" style="background:#0b1220;border:1px solid #1e293b;border-radius:12px;padding:14px 16px;margin-bottom:12px">
-        <div style="color:#f1f5f9;font-size:15px;font-weight:700;margin-bottom:10px">🚗 ${s.carLine(car.car_type, car.vin)}</div>
+        <div style="color:#f1f5f9;font-size:15px;font-weight:700;margin-bottom:10px">🚗 ${s.carLine(car.car_type, car.vin)}</div>`;
+    if (options.length) {
+      html += `
         <div style="font-size:13px;font-weight:500;color:#cbd5e1;margin-bottom:8px">${s.batteryLabel}</div>
         <div style="display:flex;flex-direction:column;gap:8px">`;
-    options.forEach(opt => {
-      html += `
+      options.forEach(opt => {
+        html += `
           <div class="bat-opt" data-v="${opt.v}"
                onclick="selectCarBattery('${car.vin}', '${opt.v}', ${opt.reev ? 'true' : 'false'})"
                style="display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:10px;
@@ -783,9 +669,23 @@ function buildCarCards(cars) {
             <span class="bat-dot" style="width:14px;height:14px;border-radius:50%;border:2px solid #475569;flex-shrink:0"></span>
             <span style="color:#e2e8f0;font-size:13px">${opt.label}</span>
           </div>`;
-    });
+      });
+      html += `
+        </div>`;
+    } else {
+      // A model the map has never heard of has no list to draw: the card would be a "Battery pack"
+      // heading with nothing under it, and the pack is required — so its owner could not finish the
+      // wizard at all. With ONE car this case already falls back to a kWh field (buildManualInput);
+      // a card gets the same field and the same hint, feeding this car's own answer.
+      html += `
+        <div style="font-size:13px;font-weight:500;color:#cbd5e1;margin-bottom:8px">${s.manualEntry}</div>
+        <input type="number" class="manual-battery" min="10" max="200" step="0.1"
+               oninput="selectCarBattery('${car.vin}', this.value, false)"
+               style="width:100%;padding:10px 12px;border-radius:10px;background:#0f172a;
+                      border:1px solid #334155;color:#fff;font-size:14px;outline:none;box-sizing:border-box">
+        <p style="font-size:11px;color:#475569;margin-top:6px">${s.manualHint}</p>`;
+    }
     html += `
-        </div>
         <label style="display:block;margin-top:12px;color:#94a3b8;font-size:12px">${s.pinPerCar || 'PIN'}
           <input type="password" maxlength="4" inputmode="numeric" value="${mainPin}"
                  oninput="setCarPin('${car.vin}', this.value)"
@@ -800,10 +700,6 @@ function buildCarCards(cars) {
 }
 
 function buildBatterySelector(options) {
-  // Belt and braces: the server already filters the research-only packs out of this build, but this
-  // renderer draws whatever it is handed. Filtering here too means a future edit to the map can't
-  // quietly put one back in front of a user it isn't meant for.
-  if (!RESEARCH) options = options.filter(function (o) { return !o.reev; });
   const s = strings[currentLang];
   let html = `<div style="font-size:13px;font-weight:500;color:#cbd5e1;margin-bottom:8px">${s.batteryLabel}</div>`;
   html += `<div style="display:flex;flex-direction:column;gap:8px">`;
@@ -849,6 +745,15 @@ function buildManualInput() {
 }
 
 // ── Detection flow ────────────────────────────────────────────────────────────
+// The cars found belong to the account they were found on: a retry, or another email, detects again.
+function forgetDetection() {
+  for (const id of ['h-vin', 'h-car-type', 'h-vehicles', 'h-battery']) document.getElementById(id).value = '';
+  document.getElementById('h-is-reev').value = '0';
+  Object.keys(CARS).forEach(vin => delete CARS[vin]);
+  document.getElementById('detect-result').style.display = 'none';
+  document.getElementById('btn-submit').style.display = 'none';
+}
+
 async function detectCar() {
   const user = document.getElementById('inp-email').value.trim();
   const pwd  = document.getElementById('inp-password').value.trim();
@@ -869,7 +774,9 @@ async function detectCar() {
   document.getElementById('detect-label').textContent = s.detecting;
   btn.disabled = true;
   btn.style.opacity = '0.6';
-  document.getElementById('detect-result').style.display = 'none';
+  forgetDetection();
+  const email = document.getElementById('inp-email');
+  email.readOnly = true;            // the answer must be for the email shown when it arrives
 
   try {
     const resp = await fetch('api/setup/detect-vehicle', {
@@ -885,6 +792,7 @@ async function detectCar() {
         <div style="background:#ef444422;border:1px solid #ef444455;border-radius:12px;padding:14px 16px">
           <div style="color:#fca5a5;font-size:13px;font-weight:600;margin-bottom:6px">✗ ${s.detectFail}</div>
           <div style="color:#fca5a5;font-size:12px;opacity:.8;margin-bottom:14px">${data.error || ''}</div>
+          <div style="color:#fbbf24;font-size:12px;margin-bottom:14px">${s.pinNotSaved}</div>
           ${buildManualInput()}
         </div>`);
       document.getElementById('h-battery').value = '';
@@ -947,6 +855,7 @@ async function detectCar() {
         <div style="color:#fca5a5;font-size:13px;font-weight:600;margin-bottom:10px">
           ✗ ${s.detectFail}: ${err.message}
         </div>
+        <div style="color:#fbbf24;font-size:12px;margin-bottom:14px">${s.pinNotSaved}</div>
         ${buildManualInput()}
       </div>`);
     document.getElementById('h-battery').value = '';
@@ -955,6 +864,7 @@ async function detectCar() {
     document.getElementById('detect-label').textContent = s.detectBtn;
     btn.disabled = false;
     btn.style.opacity = '1';
+    email.readOnly = false;
   }
 }
 
@@ -965,7 +875,22 @@ function showResult(html) {
 }
 
 // ── Form validation ───────────────────────────────────────────────────────────
+// The form posts ONE of two shapes: `vehicles_json` when the account has more than one car, and
+// the account-wide `battery` when it has one. This read only the second — and the multi-car branch
+// returns before anything fills it — so from v3.13.0 an account with two cars was answered "select
+// a battery variant first" on a form where every pack WAS selected, with no way past it (#280).
+// Validate what is actually being sent: every car must carry its own pack, not just the first.
 function validateSubmit() {
+  const cars = document.getElementById('h-vehicles').value.trim();
+  if (cars) {
+    let list = [];
+    try { list = JSON.parse(cars); } catch { list = []; }
+    if (list.length) {
+      if (list.every(c => c.battery)) return true;
+      alert(strings[currentLang].noBattery);
+      return false;
+    }
+  }
   const battery = document.getElementById('h-battery').value.trim();
   if (!battery) {
     alert(strings[currentLang].noBattery);
@@ -1005,31 +930,73 @@ const initLang = navigator.language.startsWith('it') ? 'it'
                : navigator.language.startsWith('pt') ? 'pt-PT'
                : navigator.language.startsWith('nl') ? 'nl'
                : navigator.language.startsWith('es') ? 'es'
+               : navigator.language.startsWith('cs') ? 'cs'
                : 'en';
 setLang('{{ prefill.language if prefill else "" }}' || initLang);
 
 // ── Landing choice ────────────────────────────────────────────────────────────
-// "Set up my car" reveals the cert/login form (cert step first unless already present);
+// "Set up my car" reveals the login form once the application material is in place;
 // the account form is never shown to a demo-curious user until they choose to configure.
+async function saveApplicationBundle() {
+  const file = document.getElementById('application-bundle').files[0];
+  const result = document.getElementById('application-bundle-result');
+  if (!file) { result.textContent = 'Seleziona un file ZIP / Select a ZIP file'; return; }
+  const form = new FormData(); form.append('bundle', file);
+  try {
+    const response = await fetch('api/setup/application-bundle', {method:'POST', body:form});
+    const data = await response.json();
+    if (!response.ok) { result.textContent = data.error || 'Install failed'; return; }
+    document.getElementById('application-bundle-step').style.display = 'none';
+    await chooseSetup();
+  } catch { result.textContent = 'Connessione non disponibile / Connection unavailable'; }
+}
+
 async function chooseSetup() {
   document.getElementById('choice-step').style.display = 'none';
   document.getElementById('back-link').style.display = 'inline-block';
   try {
     const r = await fetch('api/setup/cert-status');
     const d = await r.json();
+    if (!r.ok) throw new Error('Setup readiness unavailable');
     if (d.present) {
       document.getElementById('setup-form').style.display = 'block';
+    } else if (d.manual_upload_required) {
+      // Only where this build cannot complete its own material: the bundle carries
+      // private parameters a user has no way of producing, so it is never the ordinary path.
+      document.getElementById('application-bundle-step').style.display = 'block';
     } else {
-      document.getElementById('cert-step').style.display = 'block';
+      // The build installs its own material at startup, so this is a build that could not: say
+      // so. The user is never asked for a certificate (01/10/2026).
+      showManagedSetupError(d.state || 'unavailable');
     }
   } catch {
-    // On error, fall back to showing the login form (cert may be bundled)
-    document.getElementById('setup-form').style.display = 'block';
+    showManagedSetupError('unavailable');
   }
 }
 
+function showManagedSetupError(state) {
+  document.getElementById('setup-form').style.display = 'none';
+  let box = document.getElementById('managed-setup-error');
+  if (!box) {
+    box = document.createElement('p');
+    box.id = 'managed-setup-error';
+    box.setAttribute('role', 'alert');
+    box.className = 'text-amber-300 text-sm mb-4';
+    document.getElementById('back-link').insertAdjacentElement('afterend', box);
+  }
+  const italian = (document.documentElement.lang || navigator.language || '').startsWith('it');
+  box.textContent = currentLang === 'cs'
+    ? 'Automatické nastavení není k dispozici. Distribuce musí před přihlášením poskytnout platný aplikační materiál. Nenahrávejte osobní certifikáty. Stav: ' + state
+    : italian
+    ? 'Configurazione automatica non disponibile. La distribuzione deve fornire materiale applicativo valido prima del login. Non caricare certificati personali. Stato: ' + state
+    : 'Automatic setup unavailable. The distribution must provide valid application material before login. Do not upload personal certificates. Status: ' + state;
+  box.style.display = 'block';
+}
+
 function backToChoice() {
-  document.getElementById('cert-step').style.display = 'none';
+  document.getElementById('application-bundle-step').style.display = 'none';
+  const managedError = document.getElementById('managed-setup-error');
+  if (managedError) managedError.style.display = 'none';
   document.getElementById('setup-form').style.display = 'none';
   document.getElementById('back-link').style.display = 'none';
   document.getElementById('choice-step').style.display = 'block';

@@ -3,6 +3,2024 @@
 All notable changes to LeapMotor Mate are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [4.27.0] — 2026-11-11
+
+See [the notes](docs/releases/v4.27.0.md).
+
+- **The trip in progress has its chart on the Trips page, live** ([#477](https://github.com/ProtossBlaster/leapmotor-mate/pull/477), @arekm). While the car
+  drives, a card at the top of Trips says when the trip began, the distance so far and the charge level, with
+  the Trip data chart, updated every 30 seconds. When the trip ends the page reloads once, when you are not
+  using it, and keeps your place.
+- **A page that reloads itself keeps your place once its blocks have loaded** ([#476](https://github.com/ProtossBlaster/leapmotor-mate/pull/476), @arekm). Battery
+  health, a trip and the other pages that reload themselves every 30 seconds no longer end up higher than
+  where you were reading.
+
+## [4.26.0] — 2026-11-08
+
+See [the notes](docs/releases/v4.26.0.md).
+
+- **The "←" of a page leads back to where it was opened** ([#473](https://github.com/ProtossBlaster/leapmotor-mate/pull/473), @arekm). A trip opened from the
+  Overview or from Similar trips leads back there with its row in view; a charge opened from a trip leads back
+  to the trip, and one opened from the Map leads back to the Map at the same centre and zoom. The ‹ › arrows
+  keep the way back, and the Map keeps its view on a reload.
+- **A trip opened from a search leads back to the results, at its row** ([#474](https://github.com/ProtossBlaster/leapmotor-mate/pull/474), @arekm). Trips keeps
+  its search in the address, so a reload shows the same search; on Trips and on Charges, *Back to calendar*
+  opens the month the calendar showed.
+- **Each car has its own SoH reference** ([#472](https://github.com/ProtossBlaster/leapmotor-mate/issues/472)). With two cars, battery health measured both against
+  one reference, and setting it for one car changed the other's.
+
+## [4.25.0] — 2026-11-07
+
+A security release. See [the notes](docs/releases/v4.25.0.md), *Upgrade impact* above all.
+
+- **A page on another site cannot drive Mate.** Through DNS rebinding a page could drive a Mate with no
+  password, unlock included. With no password, Mate now answers only on the names a home network uses (an IP
+  address, `localhost`, a name without dots, `.local`, `.lan`, `.home`, `.home.arpa`, `.internal`) and on the
+  ones named in the new `MATE_ALLOWED_HOSTS`.
+- **The add-on's port 4000 has the standalone guards**: forms and frames from other sites are refused there.
+  The Home Assistant panel (ingress) is unchanged.
+- **The Home Assistant token goes only over a verified connection** to a public name; a private address, a
+  Tailscale address or a home-network name may keep a self-signed certificate.
+- **Web libraries moved off versions with published advisories**: FastAPI 0.162.2 (Starlette 1.10.0),
+  python-multipart 0.0.33, Pillow 13.0.0, Jinja2 3.1.6, cryptography 50.0.2. A 400 MB field on the login page
+  no longer fills the memory.
+- **Changing the password signs everyone else out**; the car's address is text, never markup.
+- **The desktop app needs MateDesktop 1.2.3**, which carries the new libraries; 1.2.2 does not take this update.
+- **The desktop app on a Mac starts Mate again**: 4.24.0's lock waited for itself on macOS, and the web never opened its port.
+
+## [4.24.0] — 2026-11-07
+
+- **Czech is the ninth language** ([#461](https://github.com/ProtossBlaster/leapmotor-mate/pull/461), @petrw1).
+- **The elevation lookup has a switch** ([#464](https://github.com/ProtossBlaster/leapmotor-mate/pull/464), @petrw1):
+  *Settings → Trip defaults → Elevation and trip temperature*. Ticked by default; unticked, no trip is sent to
+  Open-Meteo by itself, and *Calculate elevation* still looks one trip up on request.
+- **A bad GPS reading does not move a parked car** ([#467](https://github.com/ProtossBlaster/leapmotor-mate/pull/467), @arekm).
+  Readings that lose their minus sign no longer move a parked car across the Greenwich meridian or the
+  equator; a repeated reading counts once; a reading with no usable coordinate is no position.
+- **Home Assistant and ABRP get no zeros the car did not send** ([#468](https://github.com/ProtossBlaster/leapmotor-mate/pull/468), @arekm):
+  no 0, 0 location without a GPS fix, and unknown instead of 0 bar for tyre pressures the car does not send.
+- **A parked car drawing from its battery is not charging** ([#469](https://github.com/ProtossBlaster/leapmotor-mate/pull/469), @arekm).
+- **A charge the car pauses stays one charge**, and the reading stored after a command judges a charge as the
+  poller does ([#470](https://github.com/ProtossBlaster/leapmotor-mate/pull/470), [#471](https://github.com/ProtossBlaster/leapmotor-mate/pull/471), @arekm).
+- **A new Docker install on a Mac starts** ([D#452](https://github.com/ProtossBlaster/leapmotor-mate/discussions/452)): on an empty
+  bind-mounted folder with Docker Desktop, 4.23.0 restarted for ever; the README now has a Compose file for
+  the published image.
+- **Error messages are shown as text, never run** ([#462](https://github.com/ProtossBlaster/leapmotor-mate/pull/462), @petrw1), and
+  **a database backup is restored a piece at a time, up to 4 GiB** ([#463](https://github.com/ProtossBlaster/leapmotor-mate/pull/463), @petrw1).
+
+## [4.23.0] — 2026-11-06
+
+- **The Map shows where the car is** ([D#459](https://github.com/ProtossBlaster/leapmotor-mate/discussions/459), @Coooogz).
+  A marker gives the car's last known position, as on the Overview, and follows the car while the page is
+  open; the map's view does not move. A box on the row under the map, *Last Known Position*, switches it
+  off, and the choice is remembered like the frequent places' one.
+
+## [4.22.0] — 2026-11-05
+
+- **Recent Trips are the rows of the Trips page** ([#457](https://github.com/ProtossBlaster/leapmotor-mate/pull/457), @arekm).
+  On the Overview a recent trip gave its date, start time, duration, distance and consumption; it is now
+  its row on Trips without the route: where it started and ended, the battery before and after, the energy
+  it used and where that figure came from. The Overview prices no trip, so its rows show no cost.
+- **A trip row gives the energy it used.** On Trips each row gives its kWh between the distance and the
+  consumption, the figure its day's heading adds up. A range-extender's row has none, as its totals have none.
+- **A trip row lays out by the room it has, not by the window.** Beside the sidebar, at 800 to 1,024 px, the
+  start and end places of a trip were cut short or left without room; they now read whole, and a place
+  still cut short gives its full name on hover.
+
+## [4.21.0] — 2026-11-03
+
+- **Free charges have their own slice in Home vs Public** ([#450](https://github.com/ProtossBlaster/leapmotor-mate/pull/450), @hubcasale). A charge typed Free
+  was counted as Public; it now has a lime slice and a *Free* tile of its own, shown only when there is
+  one. A Home charge marked free stays under Home. The legend of both rings on Charges is one compact
+  tile per kind: the sessions, the name, and under them the kWh and the share.
+
+## [4.20.0] — 2026-11-03
+
+- **Trips says the energy used** ([#456](https://github.com/ProtossBlaster/leapmotor-mate/pull/456), @arekm).
+  A fifth tile gives the energy all trips used, Statistics' Energy Used, and a day's heading, the month
+  strip and a searched period's total give their kWh. The energy card gives the cloud's *Total
+  consumption* beside the distance and the average, and the Report's tile beside it is called the same.
+  The tiles' icon sits above the figure at every width. A range-extender's Trips page is unchanged.
+- **A month's kWh adds up to Energy Used** ([#455](https://github.com/ProtossBlaster/leapmotor-mate/pull/455), @arekm).
+  Statistics' months and years, the Trips calendar and the monthly Report sum their trips by Energy
+  Used's rule, exactly, instead of multiplying a rounded average back by the kilometres; a trip that used
+  energy without moving now counts in its month. The *Avg consumption* tile on Trips leaves out a cloud
+  0.0 kWh the battery does not vouch for.
+
+## [4.19.0] — 2026-11-03
+
+- **The fan has as many speeds as the car declares** ([#447](https://github.com/ProtossBlaster/leapmotor-mate/pull/447), @arekm; [#445](https://github.com/ProtossBlaster/leapmotor-mate/issues/445), @Tommy73LMB05).
+  A car whose cloud entry declares more than seven fan speeds, such as a B10 with 1–9, gets them on the
+  Vehicle page, the Commands slider and Home Assistant's *Fan Level* number, and a new temperature or
+  recirculation at fan 9 keeps 9 instead of sending 7. The cloud library's climate check takes the
+  declared top, up to 9 ([MATE-API#9](https://github.com/ProtossBlaster/MATE-API/pull/9)). A car that
+  declares nothing, or seven speeds or fewer, keeps 1–7.
+- **A trip's regen counts the time each reading stands for** ([#454](https://github.com/ProtossBlaster/leapmotor-mate/pull/454), @arekm).
+  Each driving reading of regen counted the poll interval, but readings come further apart, so every trip
+  recorded too little regen. A reading now counts the time since the previous fresh frame on the car's
+  clock, or one interval where that cannot be told. Trips recorded before keep their figure.
+
+## [4.18.1] — 2026-11-02
+
+- **The Location tracker in Home Assistant reads the zone of the car's coordinates** ([#453](https://github.com/ProtossBlaster/leapmotor-mate/issues/453), @scoprire87).
+  The `Location` device_tracker Mate publishes over MQTT sent Home Assistant the state `home` whenever
+  the car reported a position, wherever it was, and Home Assistant shows that state instead of the zone
+  of the coordinates. It now reads `home`, `not_home` or the name of the zone the car is in; with no GPS
+  it still reads `not_home`. The same symptom was reported in [#81](https://github.com/ProtossBlaster/leapmotor-mate/issues/81).
+
+## [4.18.0] — 2026-11-01
+
+- **Each car has its own operation PIN, so the PIN typed in Settings is the one commands use** ([#449](https://github.com/ProtossBlaster/leapmotor-mate/pull/449), @arekm).
+  On a single car, the PIN typed in Settings → Vehicle was saved as the install's, while commands used
+  the car's own PIN written by the setup wizard, so a new PIN changed nothing. Mate now keeps only a PIN
+  per car: the form names the car, and with two cars there is no "All cars" entry. An install-wide PIN
+  from an earlier version becomes the own PIN of every car without one, and on a single car it also
+  replaces the car's own. A command to a car with no PIN is not sent, and the Ready automation uses the
+  PIN of the car that turned on.
+- **A car's function config from the cloud is kept, and the diagnostics bundle shows it** ([#446](https://github.com/ProtossBlaster/leapmotor-mate/pull/446), @arekm).
+  The bundle's vehicle abilities section has one more line, `funcConfig`, with the fan's and the
+  temperature's range the cloud's vehicle list gives the car, or `null` when the list has none.
+
+## [4.17.0] — 2026-10-28
+
+- **The charging panel says when the charge ends** ([D#444](https://github.com/ProtossBlaster/leapmotor-mate/discussions/444), @banolka).
+  The Charges page's *Charging status* showed only the minutes left the car sends. Under them it now
+  shows the time the charge ends: the moment the car measured those minutes plus the minutes, in the
+  time zone every other time is shown in, with its day when it falls on another one. A reading a few
+  minutes old does not push the end later.
+
+## [4.16.3] — 2026-10-27
+
+- **A wallbox that moved house is found again** ([#442](https://github.com/ProtossBlaster/leapmotor-mate/issues/442), @JoseRMorales).
+  Mate learns where the wallbox is from the charges it measured, and a charge far from there never got
+  the wallbox counter. After a move every home charge was far, none was measured, and the location
+  could not follow: 25 charges in a row at the new house had no wallbox energy. A charge away from the
+  learned location now reads the counter on the side and keeps it only if the counter followed the
+  car: more than 2 kWh, never standing still while the car drew power. Those charges move the learned
+  location. Charges recorded before this version are not changed.
+
+## [4.16.2] — 2026-10-27
+
+- **The map takes the screen it is on** ([D#438](https://github.com/ProtossBlaster/leapmotor-mate/discussions/438), @Tommy73LMB05).
+  The Map page's map was 560 px tall and as wide as the pages' 1152 px column on every screen: on a 28"
+  monitor it left a band of empty page under it, on a 14" laptop the legend row with *Trips shown* and
+  *Stations shown* sat below the fold. It now takes the page's whole width and ends where the legend row
+  still fits, 400 px at least, so on a phone or a very low window the page scrolls as before. Resizing
+  the window resizes the map. Only the Map page changes width; every other page keeps its column.
+
+## [4.16.1] — 2026-10-27
+
+- **A T03 shows its charge target** ([#436](https://github.com/ProtossBlaster/leapmotor-mate/issues/436), @sarifarm).
+  A T03's status carries no charge limit, so right after a save the Charges page's target card showed
+  nothing, and the MQTT `charge_limit` stayed unknown. Its charge plan carries it: in @sarifarm's log
+  the plan answered the target on 21 reads out of 21, and read back what Mate had written. Mate now reads
+  it there when the status has none; a car whose status carries the limit keeps reading it there.
+
+## [4.16.0] — 2026-10-26
+
+- **The Overview map draws today's last trip** ([PR #440](https://github.com/ProtossBlaster/leapmotor-mate/pull/440), @arekm). The Last Known Position map
+  drew only where the car is. It now also draws the route of the car's latest trip, while it is under way
+  and for the rest of the day it ended, with the lines a trip's own page draws. The map asks every few
+  seconds, so it sends the route it already has and gets the points again only when they change. The
+  car's dot loses the white square behind it. The trip's page, the Map page and the report's month map
+  draw their routes with one shared script, unchanged to look at.
+- **A computer clock a little behind the car's no longer blocks commands** ([D#437](https://github.com/ProtossBlaster/leapmotor-mate/discussions/437), @Letraz).
+  Before a command Mate checks the car's latest reading, and refused any reading dated after the
+  computer's clock (`state_timestamp_invalid`). A Windows PC synchronised with NTP ran up to 25 s
+  behind the car's readings, and every command sent while the car was awake was refused. A reading
+  dated up to 60 s after the clock is now taken as current; one further ahead is still refused.
+
+## [4.15.12] — 2026-10-25
+
+- **On a T03 the target card says it is the official app's upper limit** ([#436](https://github.com/ProtossBlaster/leapmotor-mate/issues/436), @sarifarm).
+  The Charges page's target card writes its number into the car's charge plan, and its description
+  said that target is not the upper limit in the car's own app. On a T03 it is: @sarifarm set 92 % and
+  then 90 % from the card, and the official app showed each as its upper charging limit. A car with the
+  simple charge scheduler now reads so, in every language; a car with the weekly scheduler keeps the
+  old description.
+
+## [4.15.11] — 2026-10-24
+
+- **An odometer the car did not send is not published as 0 km** ([PR #358](https://github.com/ProtossBlaster/leapmotor-mate/pull/358), @arekm). The
+  poller keeps an absent odometer as 0 in memory, for the state machine and the recorder, and the
+  database has stored it as empty since 4.7.2; MQTT and ABRP read the number in memory, so MQTT
+  published a retained 0.0 and ABRP sent odometer 0. The T03 leaves the odometer out of some readings:
+  two diagnostics bundles show it, in #338 and #400. A reading without an odometer now publishes nothing
+  on the odometer topic, so the broker keeps the last value, as for a reading without a range (#365),
+  and ABRP gets no odometer field. An odometer the car sent, 0 included, is published as before.
+
+## [4.15.10] — 2026-10-23
+
+- **A temperature the car did not send is not 0 °C** ([#435](https://github.com/ProtossBlaster/leapmotor-mate/issues/435), @matttiaromano). The web's fresh
+  reading, taken after a command or a refresh, stored the battery temperature, the cabin's and the A/C
+  target as `float(x or 0)`, so a car that does not send them got 0 °C. The T03 sends no battery
+  temperature: one fresh reading during a charge made that charge's coldest battery 0 °C, and Battery
+  health left it out as a cold charge, three of four in #435. The poller has kept an absent temperature
+  empty since #144; the web now follows the same rule, and a real 0 °C stays 0. The zeros already
+  stored stay in the database: for a car that has never reported a battery temperature other than 0,
+  Battery health no longer takes them as readings.
+
+## [4.15.9] — 2026-10-22
+
+- **Battery health counts the charges of a T03** ([#435](https://github.com/ProtossBlaster/leapmotor-mate/issues/435), @matttiaromano). The page leaves out an
+  AC charge whose SoC rose faster than 0.8 points a minute between two readings, to skip the jumps a
+  battery makes when it recalibrates. The T03 reports its SoC in whole points, so every point it gains
+  appeared between two readings 30 s apart, about 2 points a minute: every AC charge of a T03 was left
+  out, and the page had no figure. A rise of one step of the SoC's own resolution (a whole point, or a
+  tenth on a precise SoC) no longer counts as a jump; a real leap still does. On a B10 the same rule
+  clears a charge left out for a single 0.1 step between two readings 6 s apart. The page works from the
+  stored charges, so earlier charges count too.
+
+## [4.15.8] — 2026-10-21
+
+- **The official setup wizard offers the range-extender packs** ([BetaTester #13](https://github.com/ProtossBlaster/MateBetaTesterOnly/issues/13), @ebagnoli).
+  Since 4.7.0 the server hands the wizard every pack, range-extenders included, but the page took them
+  out again on every build but the BetaTester. A C10 or a B10 with a range extender could not pick its
+  pack (28.4 or 18.8 kWh) in the official wizard; an owner moving from the beta got it back only because
+  the restore carries the setting. The page now draws every pack; a browser test checks both pickers, the
+  one for a single car and the per-car cards.
+- **The diagnostics bundle shows what the cloud answered** ([#432](https://github.com/ProtossBlaster/leapmotor-mate/pull/432), @arekm). With *System info*
+  ticked, a new section after *polling* counts the answers per endpoint by HTTP status and cloud code,
+  then lists every login, renewal and refused answer, oldest first, at most 200 lines: time, endpoint,
+  status and code, never a parameter, a VIN or a token. It comes from the record Mate already kept of
+  each answer (the last 10,000). A car picture answered without its package is now recorded as refused
+  (`not_a_zip`) rather than as an accepted `[0]`.
+
+## [4.15.7] — 2026-10-20
+
+- **Battery health counts a joined charge whole** ([#430](https://github.com/ProtossBlaster/leapmotor-mate/pull/430), @ElRoscaoJr). A charge the car
+  reported in pieces and that is joined into one session (by Mate after a short pause, or by hand with
+  *Join with previous*) had its energy read only up to the start of its second piece, which the window
+  took for the next charge. The Battery health page then left the session out, when the first piece alone
+  was under the 12-point minimum, or estimated the pack from part of it. The window now skips the
+  session's own pieces and still stops at the next independent charge. On the test instance's database 3
+  of 4 joined sessions change: one from 72.5 kWh / 108.0 % (its first piece, 13.8 of 33.7 points) to
+  68.1 kWh / 101.5 %, and one enters the chart; the headline figure is unchanged.
+- **The BetaTester build is closing by 20 November 2026.** The guide to moving to the official build
+  (`docs/BETA-TO-OFFICIAL.md`) says so, no longer tells research-diary users to stay, and lists the
+  settings to type again after the restore: the restore drops every secret in the backup (MQTT password,
+  Home Assistant and ABRP tokens, map keys), not only the Leapmotor login.
+
+## [4.15.6] — 2026-10-18
+
+- **The MQTT plug sensor shows the cable the pages show** ([#429](https://github.com/ProtossBlaster/leapmotor-mate/issues/429)). Since 4.10.0 the pages show
+  the cable when the charge session says so (signal 1149) or when the AC port reports one on a parked car
+  (signal 47 at 1): a car that has finished its charge, or waits for its schedule, ends the session with
+  the cable still in. The MQTT `plug_connected` sensor and `evcc/plugged` kept publishing the session
+  alone, so such a car read *Plugged* on the Overview and OFF in Home Assistant. Both topics now publish
+  the cable as the pages do, from one rule (`events.cable_in_port`) the events read too; the session the
+  poller opens and closes charges on is unchanged. A test holds the sensor and the pages to one answer.
+- **The Overview shows the car picture at once, also while charging** ([#427](https://github.com/ProtossBlaster/leapmotor-mate/pull/427), @arekm). While the
+  car charges, the picture is an animation that took about 2.5 s to compose on Home Assistant's 4 cores,
+  and the card stayed empty meanwhile. The page now shows the car with its cable in first
+  (`/api/car-picture?still=1`) and puts the animation in its place once it has come. After a restart, the
+  first picture comes from the package on disk while the once-per-start download runs alongside, so a
+  new colour shows on a later load; with no package on disk, or on a manual refresh, the request waits
+  for the download, as before.
+
+## [4.15.5] — 2026-10-18
+
+- **The Battery health page keeps the views you picked** ([#426](https://github.com/ProtossBlaster/leapmotor-mate/pull/426), @arekm). The page reloads
+  itself every 30 s when left open, and the reload put its two charts back on *Time*, *%/day* and *per
+  stop*. The views picked now go into the page's address (`?capacity_by=distance&drain=lost&drain_per=date`,
+  only those not at their default), as a calendar keeps its month, so the reload, a link or the browser's
+  Back draws them again. The page still reloads itself; opening it from the menu shows the defaults. The
+  calendars' own address code is now the same helper, `lmKeepInAddress`.
+- **The chart of a charge in progress is redrawn without a blink** ([#422](https://github.com/ProtossBlaster/leapmotor-mate/pull/422), @arekm). At every
+  30 s update the card showed for 0.07 to 0.17 s without its chart, and the page under it jumped up by
+  the chart's height and back. The panel now settles at once (`settle:0ms`), so the new chart is drawn in
+  the step that swaps it in.
+- **A restart keeps the outside temperature the car had** ([#425](https://github.com/ProtossBlaster/leapmotor-mate/pull/425), @arekm). When Open-Meteo refused
+  the first lookup after a restart (it answers 503 when it sheds load), there was no outside temperature
+  for up to 20 minutes. The sampler now starts from the reading on the car's newest position, if that
+  position is younger than 20 minutes; the first poll still asks, and how often Mate asks is unchanged.
+
+## [4.15.4] — 2026-10-13
+
+- **A parked car whose GPS the cloud sends as zero keeps its outside temperature.** With the outside
+  temperature switched on, a reading with no GPS fix (0,0) was not looked up on Open-Meteo: the last
+  value stayed as it was, only in memory, so after a restart of Mate there was none and the Overview,
+  after some hours of readings without one, hid the row. With no fix, Mate now asks about the car's
+  last real position, but only while the odometer reads what it read there; a car driven since is not
+  guessed at. On 13 October the cloud sent a parked B10's six GPS signals as zero for more than 14
+  hours.
+
+## [4.15.3] — 2026-10-12
+
+- **The wallbox's line stays with the charge** ([#419](https://github.com/ProtossBlaster/leapmotor-mate/pull/419), @arekm). With the wallbox enabled and
+  Home Assistant configured, the poller keeps the wallbox's power and counter, which it already read at
+  every poll of a home charge, in a new table, `ha_samples`. The green *Wallbox (AC)* line of a charge's
+  chart (Charges page, Wallbox page, panel of the running charge) is drawn from these readings alone, so
+  it no longer disappears when Home Assistant purges its history, and opening a chart asks Home
+  Assistant nothing. Once after the update, in the background, the lines of the finished charges marked
+  Home or not yet confirmed are copied from what Home Assistant's history still holds; a charge older
+  than that history keeps no line. Without a wallbox or Home Assistant nothing is asked, as before.
+- **A custom-kWh helper that reports in Wh is priced in kWh** ([#419](https://github.com/ProtossBlaster/leapmotor-mate/pull/419)). Its figure was read as
+  kWh, so 7,000 Wh were priced as 7,000 kWh. Costs already stored are not recomputed.
+- **On a phone, the times under a charge's or a trip's chart no longer run into each other.** The axis
+  prints as many times as its width holds: 4 or 5 on a phone, as before on a computer and a tablet.
+
+## [4.15.2] — 2026-10-12
+
+- **The chart of a charge appears when its row opens, and draws no more readings than it has pixels**
+  ([#417](https://github.com/ProtossBlaster/leapmotor-mate/pull/417), @arekm). An opened row asked for its chart only when the chart's place scrolled
+  into view, so on a phone, with the chart below the screen's edge, nothing came until a scroll; the
+  opening now asks for it. The chart draws at most one reading per pixel of its width: every K-th
+  one, the last, and those on either side of a pause, each a real reading at its own time, so a pause
+  still breaks the line. A charge with no more slots than the chart has pixels draws every reading,
+  as before. The same chart on the Wallbox page and in the panel of the running charge is thinned the
+  same way.
+- **An opened charge row comes into view with its chart** ([#418](https://github.com/ProtossBlaster/leapmotor-mate/pull/418), @arekm). A row opened by
+  hand near the bottom of the screen grew below its edge. Once its chart is drawn, the page now
+  scrolls as little as shows the whole row, or brings its top to the top of the screen when the row
+  is taller than the screen. A row already in view, and rows opened by Expand all or by a link, stay
+  where they are.
+- **Diagnostics: "SoC by day" counts a day's own kilometres** ([#338](https://github.com/ProtossBlaster/leapmotor-mate/issues/338)). The section took a
+  day's highest odometer minus its lowest, so a reading without an odometer (stored as 0), or a reading
+  of the other car on the account filed under this one before 4.14.1, made a T03's day read
+  "drove 9228 km". A reading without an odometer no longer counts for the km; one more than 1,500 km
+  from the day's median odometer is left out of the day's km and SoC and counted apart on its line.
+- Manuals: the 4.15.0 section gives a C10's voltage, about 720 V, where it said "an 800 V car".
+
+## [4.15.1] — 2026-10-11
+
+- **A charge ends when the energy stops, and a full battery says "Charge complete"**
+  ([#414](https://github.com/ProtossBlaster/leapmotor-mate/pull/414), @arekm). A car keeps its charge session open for a while after the energy stops,
+  with the cable in (for minutes on the B10s and up to hours on the T03s in the bundles #414 replayed).
+  Mate ended the charge only with the session, so until then the Overview said "Charging" and the charge's end and duration
+  counted that time. A charge now ends at the later of the first reading after its last charging
+  sample and its last SoC rise. With the cable in, nothing going in and the SoC within one point of
+  the car's charge limit (100 % if it reports none), the Overview reads "Cable connected · 100%
+  (Charge complete)" and the Charges page "Fully charged". The session's close is kept in a new
+  column, `charges.closed_at`; the wallbox counter and the custom-kWh helper are read up to it, as
+  before. Signal 3736, which no car in #414's data sends as a completion, is no longer read; it stays in
+  the diagnostics as `charge_completed_raw`.
+- **A row that ends on another day says which** ([#415](https://github.com/ProtossBlaster/leapmotor-mate/pull/415), @arekm). A charge from 23:05 to
+  06:40 the next day read "23:05 → 06:40"; it now reads "23:05 → 09 Oct 06:40", in the reader's
+  language: in the Charges and Trips drawers, the merge preview, the similar-trips page and a merged
+  trip's later pieces. A row within one day reads as before.
+
+## [4.15.0] — 2026-10-11
+
+- **A charge is a row that opens, like a trip; the Charges calendar opens several days**
+  ([#412](https://github.com/ProtossBlaster/leapmotor-mate/pull/412), @arekm). The day drawer drew a card of some 650 px per charge; each charge is now a
+  row, with a thumbnail of its power and SoC curve beside it, that opens under itself: the energy, a
+  line with the battery's temperature, the outside temperature and the average power, the chart, the
+  note on one line and the actions. Its editors (type, 🆓, ✎, 🧭 🔄 ✏️, the place) stay on the row and
+  work without opening it. Expand all / Collapse all beside the day's date. Shift-click, a drag or a
+  held day opens several days, with the totals of the range and of each day, as in the Trips calendar.
+  The chart under a charge reads Home Assistant off the event loop, and a Home Assistant that just
+  failed to answer is not asked by the next chart for a minute.
+- **The charging panel shows the power of a charge under 3 A** ([#409](https://github.com/ProtossBlaster/leapmotor-mate/issues/409)). "Charging status" and
+  the Overview's charging chip computed the power only from 3 A up: at a C10's 718 V a 1.7 kW home
+  charge carries 2.4 A, so they read 0.00 kW while the chart below drew the power. The same floor 3.18.3
+  took out of the poller (#307); now gone from the page too.
+- **A charge window saved on the Scheduling page shows on the Overview at once** ([#395](https://github.com/ProtossBlaster/leapmotor-mate/issues/395)). Since
+  3.10.0 the Overview read the window the poller filed under each car, refreshed every 30 minutes, so a
+  save the car had confirmed showed the old window until then.
+
+## [4.14.2] — 2026-10-11
+
+- **A password Leapmotor refuses is named, and Mate waits an hour**
+  ([#411](https://github.com/ProtossBlaster/leapmotor-mate/issues/411)). Since 4.x Mate keeps only the
+  number of a refused sign-in, and `302010108`, "incorrect account or password" (matched by @arekm against
+  the 3.x diagnostics, as in kerniger/leapmotor-ha#74), read as a passing failure: the startup login asked
+  again every 5 minutes, the cloud-history worker every 5 minutes on its own, and the Overview said "the
+  Leapmotor cloud refuses the login" without pointing at the password. On @DJ-Elo-Ostfriesland's install
+  that made 257 refused sign-ins in one day. Mate now names the code: it waits an hour before offering the
+  same password again, the Overview reads "the password was rejected" with "Check the Leapmotor account in
+  Settings", and the log says "check credentials". A password changed in Settings is still tried at once.
+
+## [4.14.1] — 2026-10-10
+
+- **A reading stays with the car it was read from**
+  ([#338](https://github.com/ProtossBlaster/leapmotor-mate/issues/338)). On an account with two cars,
+  the check after a command and the 🔄 Refresh button asked twice which car was meant: once to read
+  it, once to write the reading. Switching car in the sidebar while the cloud answered filed one car's
+  reading under the other. On @dommi1966's install, right after a command to the T03, the T03's 53 % and
+  9,275 km were filed under the A10, which then showed a day "driven 8,527 km" and a standby loss of 39 %
+  a day it never had. The car is now chosen once, and the reading goes under that car; a car the account
+  no longer lists is neither read nor written. A row already filed under the wrong car stays where it is.
+
+## [4.14.0] — 2026-10-10
+
+- **Mate no longer writes a charge's note; 🧭 looks its address up instead**
+  ([#406](https://github.com/ProtossBlaster/leapmotor-mate/pull/406), @arekm). With the default settings Mate wrote a note on every charge it closed (the station's
+  address, the times, the outside and battery temperatures), and to find that address it sent the
+  position of every charge closed away from home to OpenStreetMap's Overpass, even with ⚡ Charging
+  stations and the address lookup switched off. Both stop: the note is the user's, as a trip's is
+  since 4.13.0, and notes written before stay as they are. The times are in the card's heading, the
+  temperatures on the charge's chart and the address on its 📍 line (4.13.1). Where that line has no
+  address and no charging place names the charge, 🧭 beside it asks the provider chosen in Settings ▸
+  Address lookup at once (`POST /api/charges/{id}/address`), whatever the card's switch says, and
+  draws the line again; when no address comes, a row under it says why. Settings ▸ Address lookup
+  loses *Write the note by itself*; the setting stays in the database, unread. The refuel's 🧭 is
+  unchanged. The 🧭 in a trip's summary also says why no address came: the provider has nothing there,
+  or how asking it failed, in the provider's or the network's words.
+- **A network error without words still names itself** in the row under 🧭, where it read "Asking
+  Nominatim failed: " with nothing after it.
+- **Docs: Mate inside Home Assistant through hass_ingress** ([#407](https://github.com/ProtossBlaster/leapmotor-mate/issues/407)). The README and `.env.example`
+  name hass_ingress's `ingress` mode and the addresses to put in `MATE_FRAME_ANCESTORS`. The README
+  said that with a password, logging in inside a frame does not work and to log in in a regular tab
+  first; it now says what was measured: in a frame on the same site as Mate logging in works, and in a
+  frame on another host the login page comes back even after logging in in a tab.
+
+## [4.13.1] — 2026-10-09
+
+- **A charge shows where it happened**
+  ([#405](https://github.com/ProtossBlaster/leapmotor-mate/pull/405), @arekm). Beside 📍 a charge card shows the station with its address after it; without a
+  station, the place assigned to the charge, else the charging place whose radius holds its point,
+  marked "(charging place)", else the address — a home charge included. The addresses come from 4.13.0's
+  `addresses` table and background pass, which now also looks up the charges that ended in the last
+  three days (a merged charge at its first piece's point); a trip and a charge in one cell cost one
+  request. The Settings ▸ Address lookup switch is renamed "Look up the addresses of trips and charges"
+  and stops both. The Charges and Events searches find a charge by its address, town or postcode; a
+  charge's rows in Events are named as its card; the charges CSV gains `place` and `address`; every
+  route that redraws the 📍 line names the charge the same way. Also fixed: the start of a merged trip
+  was not looked up when its first piece had ended before the three days and its last inside them.
+
+## [4.13.0] — 2026-10-09
+
+- **Trips show where they started and ended**
+  ([#404](https://github.com/ProtossBlaster/leapmotor-mate/pull/404), @arekm). A trip's row reads "A → B", the Trip summary names both ends, and so do the trip's
+  start and end rows in Events. An end inside a charging place shows the place's name, marked
+  "(charging place)"; elsewhere it is the address, kept in a new `addresses` table, one row per
+  geohash-8 cell shared by every trip and car. The ends of trips that ended in the last three days are
+  looked up in the background, with the provider set in Settings ▸ Address lookup: at most 4 requests a
+  minute, 1.1 s apart, a failure asked again from 15 minutes up to 6 hours, an address found asked again
+  after 90 days. A new switch there, "Look up where trips start and end", turns it off; after the
+  update it starts as "Write the note by itself" was. 🧭 beside a missing address in the Trip summary
+  looks that trip's ends up at once, on any trip, whatever the switch says. The Trips and Events
+  searches find a trip by either end's name or full address; the trips CSV gains `start_place` and
+  `end_place`; a view showing an OpenStreetMap address credits it once. Mate no longer writes a trip's
+  note by itself: the automatic trip note and its 🧭 are gone, "Write the note by itself" covers charges
+  only, and the notes written before stay as they are. The demo seeds its addresses.
+
+## [4.12.1] — 2026-10-08
+
+- **A reload stays on the month being looked at**
+  ([#403](https://github.com/ProtossBlaster/leapmotor-mate/pull/403), @arekm). The Trips, Charges, Wallbox and Refuels calendars keep the month on screen in the
+  page's address (`?month=YYYY-MM`), so a reload — the user's, the Wallbox page's own every 30 seconds
+  when idle, or the Charges page's at the end of a charge — and the browser's Back from a trip come back
+  to that month, with the day or range that was open; they used to go back to the current month. "Jump
+  to today" takes the month out of the address. A day picked replaces the `?highlight=` link the page
+  was opened by, so a reload opens the day picked. On Refuels, a refuel added or deleted redraws the
+  month on screen, not the current one.
+
+## [4.12.0] — 2026-10-08
+
+- **The Trips calendar opens a range of days**
+  ([#402](https://github.com/ProtossBlaster/leapmotor-mate/pull/402), @arekm). Shift-click a second day, drag the mouse across the days, or on a phone hold a day
+  and tap another: the drawer opens with one heading for the whole range — battery, driving time,
+  kilometres and the rest of a day's figures — and then each day with trips, newest first, under its
+  own heading. A range stays inside the month on screen; a day's date under it opens that day alone,
+  with its 🔗 merge button, which a range does not have. The other calendars keep one day per click. A
+  line under the Trips calendar names the three gestures, and in a day with a charge the two battery
+  figures say what each one counts.
+- **A calendar's drawer shows the day picked last** ([#402](https://github.com/ProtossBlaster/leapmotor-mate/pull/402), @arekm). Two days picked in quick
+  succession sent two requests side by side, and a slow answer for the first could fill the drawer
+  under the second day's ring, on all four calendars. A new pick now replaces the request still on
+  its way, and a failed day's "Try again" strip goes once another day is asked for.
+
+## [4.11.2] — 2026-10-06
+
+- **The sunshade carries the official app's name in every language**: Sunshade, Pare-soleil,
+  Sonnenblende, Parasol, Zonnescherm, Osłona przeciwsłoneczna, Cortina — the names @arekm listed from
+  the app in #391; Italian («Parasole») went out in 4.11.1. The pages called it the panoramic roof on
+  the Vehicle and Commands tiles, and something else again in the confirmations, the Events and the
+  notice shown while driving. The Vehicle tile now says "open" and "closed" in the sunshade's own
+  words, which agree with the new names in Spanish, Portuguese and Polish; in Polish, on a phone, the
+  name breaks as «PRZECIW-SŁONECZNA» instead of running past the tile. The EN, FR, DE and ES manuals
+  and the English README follow. Home Assistant's entities (`Sunshade`, `Sunshade Position`) are
+  unchanged.
+
+## [4.11.1] — 2026-10-06
+
+- **In Italian, the sunshade is the «Parasole»**, the name the official app gives it. The Italian
+  pages called it three things: «Tetto panoramico» on the Vehicle and Commands tiles, «tendina» in
+  Events and in the confirmations, «parasole» in the notice shown while driving. They now say
+  «Parasole» everywhere — the tiles, the confirmations («Aprire il parasole?»), the Events rows
+  («Parasole aperto al 40%») and their filter — and the Commands tile reads «Aperto» / «Chiuso».
+  The Italian manual and README follow. The other languages and the Home Assistant entities
+  (`Sunshade`, `Sunshade Position`) are unchanged.
+
+## [4.11.0] — 2026-10-06
+
+- **The T03's windows are offered and sent again**
+  ([#400](https://github.com/ProtossBlaster/leapmotor-mate/issues/400), @dilianpenchev-a11y, @arekm). Since 4.0.0 the windows command
+  asked for the ability code the B10 and the C10 declare, 12; a T03 declares 36, so Mate hid "Open
+  windows" and "Close windows" on a T03, and the slider it left ended in "Command not sent:
+  ability_absent for 230". Either code now lets the command through, and a car that declares 36 takes a position from 0 to 100, the T03's own
+  scale; the others keep 0 to 10. Where the car's list does refuse the windows, the slider now hides
+  with the two buttons, and the log keeps why a command was not sent instead of the error's type. The
+  support bundle lists what the account may do with the car — its rights, its modules and whether the
+  car is shared with it — beside what the car declares. Not yet tried on a T03.
+- **Mate starts on a NAS shared folder**
+  ([#401](https://github.com/ProtossBlaster/leapmotor-mate/issues/401), @awooganl). From 4.0.0 Mate stopped at start with "Private
+  directory permissions required" when `/data` was a folder that does not keep file permissions, as a
+  NAS shared folder with its own ACLs can be: every file there reads as open to everyone, and a change
+  of mode does not take. Mate now tells such storage from a folder that is really open — which, on an
+  ordinary disk, it still refuses — starts, and says once in the log that who can read the account
+  files there is decided by the folder's own permissions. The one-time backup taken before the 4.0.0
+  migration copies contents only, so a change of mode the storage refuses no longer stops it. Measured
+  on a FAT disk, which behaves the same way: 4.10.0 stopped within a second; this version answered at
+  once, and its backup held the database, the certificates and the account files. Not yet tried on a
+  Synology.
+- **The sunshade as the percent the car shows**
+  ([#391](https://github.com/ProtossBlaster/leapmotor-mate/pull/391), @arekm). The roof tile on the Vehicle page and the sunshade tile on
+  Commands say how far it is open; stopped part-way, the Commands tile offers both Open and Close, the
+  two positions the car acts on. The Events page lists where the sunshade stopped, and Home Assistant
+  gets a `Sunshade Position` sensor in %, beside the `Sunshade` binary sensor as it was.
+- **A drive the cloud reads as 0.0 kWh keeps that figure**
+  ([#394](https://github.com/ProtossBlaster/leapmotor-mate/pull/394), @arekm). The cloud files some short drives at 0.0 kWh; Mate took
+  the answer for a miss, asked again every five minutes for six hours, and ended with no energy. Where
+  the battery read the same at both ends of the drive, the zero is now the trip's figure and counts in
+  every average; where the battery fell or was not read, a zero is still no answer, and so is a
+  negative total. A merged trip is judged as its whole group, and a month's zero goes through the same
+  check against Mate's own trips as any other total.
+- **The info marks open on a tap, and READY has one**
+  ([#399](https://github.com/ProtossBlaster/leapmotor-mate/pull/399), @arekm). The ⓘ beside the outside temperature on the Overview and
+  beside the Wallbox's maximum current had only the browser's tooltip, which a tap — and the Home
+  Assistant app — never opens; they now open like the others. A new ⓘ beside READY says what the state
+  means. In [#398](https://github.com/ProtossBlaster/leapmotor-mate/pull/398), also @arekm, a browser test waits for the page before it reads it.
+
+## [4.10.0] — 2026-10-05
+
+- **A day's battery and driving time in the Trips drawer**
+  ([#392](https://github.com/ProtossBlaster/leapmotor-mate/pull/392), @arekm). An open day's heading says how much battery its trips used, from
+  the first to the last — or, with a charge in between, what the trips used and what the charges
+  added — and how long the day was driven, reconstructed trips left out as Statistics leaves them. A
+  missing reading leaves the battery figure out. Every figure in a day's heading and in the month strip
+  says what it is, on a tap too; each trip row gives its battery change, on a phone as well, where the
+  trip's times no longer shrink to nothing at 390 px.
+- **"Revert to estimate" only where there is an estimate to go back to**
+  ([#396](https://github.com/ProtossBlaster/leapmotor-mate/pull/396), @arekm). On a trip with none kept aside the button asked for confirmation
+  and changed nothing; on a real history it leaves 57 of the 467 trips that showed it.
+- **A charge schedule waits for the car's word, and every command logs what it sent**
+  ([#395](https://github.com/ProtossBlaster/leapmotor-mate/issues/395), @ViriatusOG). Since the independent client an accepted command read
+  "Cloud accepted; physical execution not confirmed", whatever the car did. A charge schedule and a
+  navigator destination, which no signal of the car shows, now ask the cloud for the car's answer once
+  a second, for the time the cloud gives the car — on a B10, 30 s asleep and 5 s awake: "Schedule
+  saved" when the car says yes, the amber "did not confirm in time" when it stays silent, and then
+  Mate keeps the times it had. Every command writes one line in the log: what it carried, without a
+  destination's address and coordinates, and what the cloud answered.
+
+## [4.9.2] — 2026-10-04
+
+- **An end says its time came after the state before**
+  ([#390](https://github.com/ProtossBlaster/leapmotor-mate/pull/390), @arekm). "Locked · 4 min" read
+  as four minutes locked, while they were the time the car had been unlocked: an end row names the
+  state that began, and its figure belongs to the one that ended. It now reads "Locked · after 4 min",
+  in all eight languages; a trip's and a charge's end keep their bare figure. On a phone some rows take
+  a second line: in Italian, 29 more of 1,759 at 390 px.
+- **A row you go back to lands on screen, on a slow phone too**
+  ([#389](https://github.com/ProtossBlaster/leapmotor-mate/pull/389), @arekm). Back from a trip with the
+  map on, two holds of the scroll fought, and a phone slow to draw left the row below the screen. One
+  row is held at a time now, and where it goes is asked again every frame.
+- **The Events page reads only the days it shows**
+  ([#385](https://github.com/ProtossBlaster/leapmotor-mate/pull/385)), and a later part of a long list is
+  cut from the list already composed while nothing has been written: on a real history, each later
+  part of the whole list from 0.156 s to 0.001 s. A merged trip reaching into the days shown, and a
+  session rebuilt with the host clock stepped back, are kept by their whole group — @arekm's fix to my
+  first version, before any release had it.
+- **Lighter on a Raspberry Pi**: reading the history at first start counts the positions once per
+  catch-up instead of twice a round. **With a retention period set**, a trip still open keeps its
+  events as it keeps its positions; they used to be pruned under it.
+- Test and CI only, @arekm: workers take queued tests (#387), and two browser test files wait only
+  where they must (#388).
+
+## [4.9.1] — 2026-10-03
+
+- **The Events list does not drift under the reader**
+  ([#385](https://github.com/ProtossBlaster/leapmotor-mate/pull/385)). The list lays out only what is
+  on screen, and a line not yet drawn declared 32 pixels until it was. Measured in Chromium at 390 px
+  and 1280 px, that is right for an event row and wrong for both headings — an hour separator is 16,
+  a day heading 39 — so each heading coming into view replaced 32 with its true height, the list got
+  shorter, and the browser's scroll anchoring made up the difference. One day heading and two hour
+  separators are a 25-pixel jump. Each kind now declares what it will take. Found by a browser test
+  that had been failing one CI run in four and was twice written off as flaky: it failed with
+  `341.796875` against `366.796875`, which is those 25 pixels exactly.
+- A page render with no charges to join no longer opens a write connection before finding out there
+  is nothing to do. Nothing leaked; it was paid for on every render.
+- The 4.9.0 notes said the one-time cloud-energy pass put two trips of 412 back on the estimate. It
+  put back one: the other is a merged parent, whose figure is attributed over the whole group's
+  distance and is correct there. Corrected in the notes; the code had always done the right thing.
+
+## [4.9.0] — 2026-10-03
+
+- **One plug-in is one charge** ([#374](https://github.com/ProtossBlaster/leapmotor-mate/issues/374),
+  @Andreexylus). The car declares the cable gone the instant the current stops — measured on a B10,
+  cable in at 19:30 and out the next morning, untouched in between, recorded as six charges with
+  pauses of 60 to 180 s — which is also what a load-balancing wallbox, a solar-surplus charger and a
+  utility pacing the load look like from inside the car. The pieces are now joined without being
+  asked, by the same operation the **Join with previous** button performs and with every guard it has
+  (same car, both finished, neither already joined, no other charge in the gap, no trip overlapping
+  it, the charge level not fallen, the same place), inside a six-minute window: the worst pause ever
+  measured here, rounded up, against the thirty the button allows, which stays where the call belongs
+  to the person who was there. Nothing is rewritten — **Split** puts the pieces back as the car
+  reported them, and a charge you split is never joined again, because each charge is examined once
+  behind a cursor. At the first start the cursor is at the beginning, so the nights already stored
+  come back together: on the reference database 35 charges become 28.
+- **A drive's official energy cannot be twice its battery's**
+  ([#298](https://github.com/ProtossBlaster/leapmotor-mate/issues/298), @arzthilfe). A 7 km drive
+  read 41.4 kWh/100km on the consumption chart: the cloud said 2.90 kWh where the battery lost 1.07.
+  The guard that refuses twice the battery delta also required an efficiency above 60 kWh/100km, and
+  41.4 is not. Measured over 412 trips carrying both figures, the ratio converges as the charge-level
+  fall grows — 90th percentile 1.54 below half a point, then 0.96, 1.08, 0.99 and 1.00 — so below a
+  full point the ratio is the quantization and both conditions stay, and at a full point and above
+  the battery stands on its own. Trips already converted go back on the charge-level estimate once,
+  at the first start, with the "settled" mark cleared so a cloud that later returns a sane figure is
+  not locked out.
+- **The kilometres measured out of contact say how many of them came back**
+  ([#298](https://github.com/ProtossBlaster/leapmotor-mate/issues/298)). Trips imported from
+  Leapmotor's own history that fall inside a silence are now reported beside the measurement, on
+  Statistics and on the month in the Trips calendar — never subtracted from it: those kilometres were
+  covered out of contact all the same, and the silence still cannot be divided. A cloud record with
+  0 km accounts for nothing; a trip crossing the edge of a window is left out.
+- **The capacity setting says why the official app's kilowatt-hours read higher**
+  ([#362](https://github.com/ProtossBlaster/leapmotor-mate/issues/362), @riri19). 40.10 kWh over
+  59.8 points is 67.06 — the gross pack — while Mate counts the usable one. The same energy, measured
+  against a different 100 %.
+
+## [4.8.0] — 2026-10-03
+
+- **An Events page lists what the car did, moment by moment** ([#385](https://github.com/ProtossBlaster/leapmotor-mate/pull/385), @arekm). Locked
+  and unlocked, doors, windows, cable, V2L, climate, defrost, rapid heat and cool, READY, and beside
+  them the trips, the charges and the commands you sent. A beginning and an end are two rows joined
+  by a line in the group's colour, as in a graph of git history, and the end says how long the state
+  lasted and answers its own question — READY off: how far the car went and the charge before and
+  after; cable disconnected: the energy charged and how long a wallbox made it wait. A map beside the
+  list places every row with a position, and the filters — a word, the group pills, a date range and
+  single kinds — live in the address, so a link or a reload keeps them. A change counts only once two
+  consecutive frames hold it, because the cloud sends one-frame blinks, and the time is the first
+  frame's: the second confirms the change, it does not move it. The events are derived from the
+  `positions` Mate already stores, so an existing install reads its whole history back a slice per
+  poll and the page says how far it got; they are kept as long as the positions are. The roof
+  sunshade is deliberately not among them: it is opened and closed by hand and nothing closes it when
+  the car is locked, so it draws one line reading "open" for days — seven of them, at its longest, on
+  the car this was measured on — across a page about everything else.
+- **A trip ends when the car does, not when it is put in P.** Going to pick someone up — not
+  switching off, just Park and a wait — closed the trip after six readings of P, about a minute, and
+  opened a second one when you drove on: one errand came out as two drives, and the cloud's official
+  energy figure belonged to neither, because getEC measures a driving session from switch-on to
+  switch-off and covers both halves together. The six readings now only count once the car itself
+  says the drive is over (READY 1 → 0). Measured on a B10 over four months, 390,182 polls and 566
+  trips: of the 409 pauses between two consecutive trips, 34 have READY=1 in every frame — the car
+  was never switched off — with a median of 4.8 minutes, against 36.7 minutes for the 375 where a
+  READY=0 appears; 74 trips (13%) shared one power-on session with another, which is what had made
+  the official figure unavailable for them. Nothing changes for a car that does not report READY, nor
+  when the Park reading is a frame the cloud has been repeating for half an hour. A trip whose car
+  keeps reading ON without moving is closed after half a day, where it stopped moving: the longest
+  standstill ever recorded with the car on and fresh frames is 48 minutes.
+- **A cloud record without distance no longer stands between a trip and its official figure.** The
+  Leapmotor history import writes a trip per cloud record, including the 0 km ones kept for a
+  manoeuvre, and a session holding one of those refused the conversion with no way out: merging the
+  two real halves left the 0 km row inside the session and outside the group, so it refused again. 9
+  of that car's 74 shared sessions were blocked by such a row alone.
+- **An attempt Mate put off no longer hides why the cloud is unreachable** ([#381](https://github.com/ProtossBlaster/leapmotor-mate/issues/381), @maxencedelesgues-droid).
+  Mate keeps a minute between two sign-ins; at the parked cadence the poll that falls inside it
+  failed with "Login temporarily deferred after a recent attempt" — our words about our own timer —
+  and that was the last verdict written, so the Overview and the setup page showed it in place of the
+  failure that actually keeps the car away, the one 4.7.18 had just learned to name in a word. The
+  link settings now keep the reason already on record when the new one is only a deferral; the state
+  and the next attempt still move, and with nothing on record the deferral is still said.
+
+## [4.7.18] — 2026-10-03
+
+- **A restored backup goes into the live database, not over it** ([#383](https://github.com/ProtossBlaster/leapmotor-mate/issues/383), @matttiaromano). The
+  restore wrote the backup to a temporary file and replaced the live database with it; the poller
+  holds the database open, and on Windows a file another process holds cannot be replaced, so every
+  restore on MateDesktop for Windows answered HTTP 500 ("[WinError 5] Accesso negato", measured on
+  Desktop 1.2.0 with 4.7.17). The restore now copies the backup's pages into the live database with
+  SQLite's own backup API; the relaunch that follows still runs the migrations. Same machine, same
+  backup: 200, every row in place. A refused backup no longer leaves its temporary file behind on
+  Windows. The Windows CI job now runs the restore tests.
+- **A cloud transport that fails says why** ([#381](https://github.com/ProtossBlaster/leapmotor-mate/issues/381), mate-api 0.1.0a15). Every network, DNS
+  or TLS failure read "Cloud transport failed", and a sign-in that failed before any answer said
+  "stage=transport": an install whose Home Assistant could not resolve the cloud's name wrote 9,049
+  such lines. The transport now names the failure in one word from a fixed vocabulary (dns_failure,
+  timeout, connection_refused, connection_reset, network_unreachable, certificate_rejected,
+  tls_failure, http_protocol, invalid_response, redirect_refused, response_too_large), with no host,
+  address or text from the system: "Cloud transport failed: dns_failure", "stage=transport
+  (dns_failure)". The diagnostics bundle prints the last sign-in failure when there was one.
+- **The update instructions no longer point at Watchtower** ([#383](https://github.com/ProtossBlaster/leapmotor-mate/issues/383)): the project has been
+  archived by its author. Pull the image and recreate the container, as the instructions already said.
+
+## [4.7.17] — 2026-10-03
+
+- **The Overview shows the cable while the charger holds the charge, and says the charge is not running**
+  ([#382](https://github.com/ProtossBlaster/leapmotor-mate/pull/382), @arekm). A wallbox on a schedule takes
+  the cable and gives no current until its window opens; the car then reports no charge session (signal
+  1149 at 0) while its AC port reports the cable (signal 47 at 1), for hours, and the Overview showed no
+  cable. The pages now read the cable from the session or from the AC port while the car is parked: the
+  tag over the car, the car picture, the Commands page badge, the "Fully charged" badge on the Charges page
+  and the wallbox tile. The tag reads "Cable connected · 87% (Not charging)", or "(Charge complete)"; the
+  word under the car and the State of the status card say "Parked". Measured on our B10 against the
+  wallbox's own log over four months: the port followed the physical cable in every observed case. The
+  charge session, the database and the Home Assistant sensor are unchanged.
+
+## [4.7.16] — 2026-10-02
+
+- **A write that finds the database busy no longer stops every write after it** ([#338](https://github.com/ProtossBlaster/leapmotor-mate/issues/338)).
+  When a write of the poller's connection waits longer than its 5 s for a lock someone else holds, it
+  fails, and the transaction it opened stays in place; the next read inside it pins the database as it
+  was, and once any other connection writes — the bridge logs every cloud request on its own — each later
+  write fails at once with `database is locked`, until the process restarts. @dommi1966's install lost
+  1,061 minutes that way on 02/10 (3,814 failures, nothing stored, two charges closed at stale values, a
+  trip missing), 118 on 30/09 and 170 on 01/10. Every poll of a car now begins by ending a transaction a
+  failed write left open, and says so in the log. Who held the lock for the first five seconds is still
+  unknown; it no longer costs more than the poll it hit.
+- **A car whose configuration carries no charge plan reads it where the earlier library did** ([#380](https://github.com/ProtossBlaster/leapmotor-mate/issues/380)).
+  @ViriatusOG's T03 on 4.7.15: the schedule saved and the car shows 23:30, on, but the Charges page read
+  the plan back empty. Mate reads the plan from the car's configuration (commonConfig, key 3) and a
+  T03's carries none; the earlier library read it from getAppointment cmdId 190. A car whose
+  configuration says whether its schedule is on and when it starts keeps reading it there; getAppointment
+  is asked only when it does not, and what each answered goes to the log once per car. Every reader goes
+  through it: the Charges page, the charge limit, the Overview's window and the Home Assistant commands.
+- **Report is called Reports** ([#370](https://github.com/ProtossBlaster/leapmotor-mate/pull/370)), as every other entry in the menu (@arekm): the menu
+  entry and the page title in the eight languages, the manuals and the README. The page is unchanged.
+
+## [4.7.15] — 2026-10-02
+
+- **A T03 saves its charge schedule and sets its charge limit again** ([#380](https://github.com/ProtossBlaster/leapmotor-mate/issues/380)). Command
+  190 rewrites the car's whole charge plan, so Mate reads it first and refuses when a field is missing —
+  the guard that keeps a B10's own flags as the car sent them (#343). A T03 has the simple scheduler (a
+  start time and a target, no window, no days) and its plan never carries every field: since 4.7.7, when
+  the T03 left the earlier library, the Charges page refused to save its schedule or set its limit
+  ("complete current charging configuration is required"). With the simple scheduler Mate now completes
+  the plan as that library did — every day, an 08:00 end, circulation 0, recharge 0 — and keeps what the
+  car reports; whether the schedule is on and when it starts are never filled. A car with the full
+  scheduler keeps the guard. The Home Assistant commands already completed a missing plan and are
+  unchanged.
+
+## [4.7.14] — 2026-10-02
+
+- **The chart of a running charge is on the Charges page, live** ([#379](https://github.com/ProtossBlaster/leapmotor-mate/pull/379), @arekm). While the
+  car is charging, the *📈 Charging data* chart of that charge sits among the cards at the top of the page
+  and grows with every poll: when it began and the charge level so far, the car's power with the minutes
+  left, the charge level and the temperatures. At home it draws the wallbox's line beside the car's: home
+  is the type set at the charge's start (a place recognised by GPS, or the always-at-home setting), or,
+  untyped, the wallbox delivering power while the car is plugged in. A pause with the cable in reads
+  0 kW. When the readings stop or the cloud re-serves an old frame, the LIVE badge gives way to the age
+  of the last reading.
+- **The Monthly Report is called Report** ([#370](https://github.com/ProtossBlaster/leapmotor-mate/pull/370)): on the current month its driving-energy
+  card opens on Today, and a page named after the month read as a mistake (@arekm). The menu entry and
+  the page title drop "monthly" in the eight languages; the page itself is unchanged.
+
+## [4.7.13] — 2026-10-02
+
+- **A T03 takes commands again** ([#378](https://github.com/ProtossBlaster/leapmotor-mate/issues/378)). Before a command Mate checks the car's last
+  reading: when it was taken, that the car stands still, that it is not in ON3. It read them as
+  numbered signals, and a T03 sends them by name: with 4.7.12 every T03 command failed with
+  `KeyError('signal')`, with 4.7.11 it was refused for a reading without a time, and until 4.7.10 a
+  T03 could not be read at all. They are now read by name. A reading without its time is still
+  refused, and a moving car or one in ON3 still blocks.
+- **The web stores no position from a reading without a charge level.** The Refresh button and the
+  check after a command store a position too, and stored a missing SoC as 0%. The poller has refused
+  such a reading since 1.21.4; both now follow one rule.
+- **The positions stored at 0% that the car never read are removed, once**: a 0% beside a range above
+  5 km, or a 0% after a reading above 5% with the car not moved since. A battery that ran down keeps
+  its zero.
+
+## [4.7.12] — 2026-10-01
+
+- **A T03's readings arrive** ([#368](https://github.com/ProtossBlaster/leapmotor-mate/issues/368)). Asked as a T03, the cloud answers with the car's real
+  readings in named fields (soc, totalMileage, expectedMileage…: 56%, 2,314 km, 160 km on the T03 of
+  #368), the shape the old status address answers in. 4.7.11 handed them on as numbered signals, so
+  the poller called the car asleep and the web stored 0%, 0 km and 0 °C. A map in names now reaches
+  the poller and the web as named fields; a B10's map (98 keys, 3 named) stays numbered.
+- **The positions stored at 0% with no odometer since 4.7.11 are removed, once**: no real reading has
+  that shape (0 of a B10's 384,034 positions). *Corrected on 2 October: this entry said at first that
+  the newest would have turned the first real reading of a parked car into a charge from 0%. It would
+  not have: since 1.21.4 Mate does not reconstruct a charge that starts below 1%.*
+- **A diagnostic bundle leaves out coordinates that come by name**: it removed them by signal number
+  only, and a T03 bundle from 4.7.11 posted in a public issue carried the car's exact position.
+
+## [4.7.11] — 2026-10-01
+
+- **A T03 is read again** ([#368](https://github.com/ProtossBlaster/leapmotor-mate/issues/368), [#338](https://github.com/ProtossBlaster/leapmotor-mate/issues/338)). Since 4.7.7 every installation runs
+  Mate's own cloud client, and the T03s the previous library had kept reading got "No data found" at
+  every poll, so Mate recorded nothing: the client tells the cloud in every request that the car is a
+  B10, and the signal service answers a car asked as the wrong model with "No data found" (measured
+  on a B10, read only). A car never read as a B10 is now asked as the model the cloud lists it as,
+  then at the address the previous library used; the way that answers is kept for that car, and cars
+  that are read today are read as before. Tested against the real cloud on a B10, not on a T03.
+- **A charge's chart is Charging data, in bands like a trip's** ([#367](https://github.com/ProtossBlaster/leapmotor-mate/pull/367), @arekm): the power
+  with the car's own countdown, the charge level, and the battery's and the outside temperature, on
+  one time axis with one hover box; the AC-vs-DC comparison on the Wallbox page is the same chart.
+  Without the car's range, which climbs with the charge level through a charge (r >= 0.998 on 29
+  charges of a B10). The trip chart shares its drawing code, identical to the pixel on our data.
+
+## [4.7.10] — 2026-10-01
+
+- **A C10 range extender on an AC charge keeps the charge current it measures, and the power
+  from it** ([beta #13](https://github.com/ProtossBlaster/MateBetaTesterOnly/issues/13), @ebagnoli).
+  Mate 4.0.0 dropped both while the cable was in, on the strength of frames from July in which the
+  pack current read ~0 A through an AC charge. Home Assistant has shown Charge Current and Charge
+  Power as unknown on every charge since, and every charge has recorded a peak of 0.0 kW. His
+  bundle of 1 October shows the sensor measuring: 1,373 polls charging on AC from 19 to 26 September,
+  none under 2 A (2.6 to 18.8 A), and a frame at -16.299 A and 340.9 V taken while Mate logged no
+  current at all. The rule is gone, with the table it was the only row of; charge detection on this
+  car is unchanged. Charges recorded since 4.0.0 keep their 0.0 kW peak: their current was not
+  stored.
+
+## [4.7.9] — 2026-10-01
+
+- **Earlier months of trips can be imported from the cloud, from September 2026.** The history
+  worker asks the cloud from the first day of the current month, so an installation made on the 1st
+  never saw the month before it: a new MateDesktop on 1 October imported one trip. The cloud trip
+  history card in Settings now offers the earlier months, from September 2026 to last month. One
+  choice is enough: the chosen month and every one after it are asked once each, as whole months in
+  the user's time zone, and the months that end later come in on their own. Nothing is asked while
+  the import itself is off, and nothing earlier than September 2026 is offered: measured on
+  1 October, the cloud returns no single trip before 1 September 2026. A line under the menu says
+  what the choice adds. The card, still in English in six of the eight languages, is translated.
+- **Battery health and the charge power curves no longer read every position**
+  ([#363](https://github.com/ProtossBlaster/leapmotor-mate/pull/363), @hubcasale). Their queries ask
+  the charging-sample predicate under `vehicle_id = COALESCE(?, vehicle_id)`, which no index could
+  serve, so each one read the whole positions table. A partial index matching the predicate is built
+  once at start. On a 382,578-position database: battery health 1,408 ms → 53 ms (1,589 → 59 on the
+  image's SQLite 3.46.1), one power curve 30 → 3.6 ms, outputs identical; the index takes 28–43 ms
+  and 0.6 MB there. The wallbox's "has a power curve" check loses a dead `OR`, and
+  `charges_with_power` gets an upper bound an index can use: a home charge with no sample went from
+  17.7 ms to 0.1 ms.
+- **A parking manoeuvre the car files on its own no longer hides its drive**
+  ([#364](https://github.com/ProtossBlaster/leapmotor-mate/pull/364), @arekm). A 0 km, 0 kWh cloud
+  record wholly inside a drive record that has both a distance and an energy is set aside for the
+  energy matching, so the drive's own record matches its trip. A record with kilometres but no
+  energy shelters nothing: a 1 km drive keeps Mate's estimate instead of reading 0.00 kWh/100 km.
+  The switch-off rule drops a check the usual end already makes (2 of 198 replayed closes reach it,
+  same end either way).
+- **Correction to the 4.5.4 notes**: the per-trip cloud history does not go back about a year. On
+  1 October 2026 it started on 1 September 2026.
+
+## [4.7.8] — 2026-10-01
+
+- **A new installation's poller no longer dies on its first statement.** Started together on an
+  empty data directory, the web creates the schema at import in a write transaction, and the
+  poller's `PRAGMA journal_mode=WAL` was refused at once — SQLite does not wait on a journal-mode
+  switch while another connection writes — so the poller exited with `database is locked`. Seen in
+  the Desktop 1.2.0 build's frozen-app check on macOS. The race predates 4.7.7, which made it likelier:
+  both processes now provision the application material behind one lock and leave it together. The
+  poller now asks again for up to 15 s and still reports a lock that never goes away. Only a new
+  installation meets it; an existing database is already in WAL.
+
+## [4.7.7] — 2026-10-01
+
+- **A new installation is never asked for a certificate.** The setup wizard still sent every new user
+  to a third-party repository for `app.crt` and `app.key`. That pair is the Leapmotor app's own TLS
+  certificate — one for everyone, the one inside every copy of the app — so it now ships with Mate,
+  hash-pinned next to the application profile (`poller/mate_api_runtime/application_certificate/`,
+  the copy recovered from the official app V1.16.4-1, valid to 06/03/2029), and a new installation
+  installs it at startup. The certificate step, its upload endpoint and the link are gone; where a
+  build could not install its own material the page says so instead of asking for files. An
+  installation that already holds a pair keeps it; a pair uploaded in the old export format, with
+  its PKCS#12 bag attributes in front, is the same certificate in another file and is rewritten as
+  the packaged copy, the previous files kept in the transaction backup. CI turns red six months
+  before the packaged pair expires.
+- **Everything runs on Mate's own cloud client.** The client has been Mate's own since 4.0
+  (MATE-API, V3 commands), but an installation whose qualification did not finish was put back on
+  the bundled third-party SDK. The SDK, the `MATE_API_V2` switch that selected it and the
+  qualification that chose between the two (`migration_activation`, `migration_preflight`) are
+  gone, together with every branch that only ran on the SDK. A `legacy` decision stored by an older
+  version changes nothing; the diagnostic bundle's `Cloud client` line reads
+  `independent (mate-api)` for everyone. `poller/requirements.txt` no longer installs the SDK.
+- **A range of 0 km beside a charged battery is not a reading** (#365, @arzthilfe). The C10 sends
+  its battery range (`3260`) as 0 in the frame it publishes as it goes to sleep, with the SoC still
+  at 83-100%, and the Overview read "100% · 0 km". His ten days: eight such stops, 1,996 polls,
+  while the smallest range the car reported otherwise was 180 km; six B10 bundles, a T03, a B03X and
+  382,288 stored B10 rows never carry it. The parser turned that zero — and an absent range — into a
+  measured 0 km. Now, as the SoC is already guarded the other way round, a range of 0 beside a SoC
+  above 5% is no reading (one rule, `capability_profile.battery_range_km`, for both writers); the
+  Overview keeps the last range the car did report, the way it keeps the last GPS fix; Home
+  Assistant keeps its retained value instead of turning `unknown`; the poll line prints a dash; and
+  the stored zeros are repaired once (`positions_zero_range_repair_v1`).
+- **The cost card counts a merged charge once** (#366, @marco783). Five priced charges on the
+  Charges page, "missing 1 of 6" on the Statistics card: a merge keeps the rows and the page folds
+  them into one charge, but the card counted rows, so the merged piece without a price of its own
+  was announced as a charge nobody priced. The card now counts charges as the page shows them, for
+  the prices and for the kWh; the euros and the kWh were always every piece's and do not change.
+
+## [4.7.6] — 2026-10-01
+
+- **A trip ends on the reading that shows the car switched off.** Mate closes a drive once Park has
+  held for about a minute — six consecutive readings at the ten-second driving cadence — and it wrote
+  the **sixth** of those readings as the trip's end, although the switch-off was already on disk four
+  readings earlier on average. It still waits the same minute and *when* it closes a trip has not
+  changed; what changed is which of the six readings the trip is stamped with. The end takes that
+  reading's time, charge level, odometer, position and fuel, and the route points written after it are
+  left out. Replayed over a second B10's history (603 closed trips, 381,295 position rows): the end
+  moves on **183 of the 197** trips that can be replayed, 7–54 s earlier (median 42 s); of the 85 that
+  have a cloud record of their own, **85 land closer** to the end of the car's own record, median gap
+  49 s → **9 s**; duration was inflated by a median 6.8% and up to 25.6%, the average speed understated
+  by the same proportion. Kilometres, kWh and consumption do not change; one distance moves by 10 m, no
+  trip is dropped, 0.7 ms per close. Only a measured switch-off counts — the first READY=0 after the
+  trip's **last** READY=1, inside the final run of Park readings — so stepping out and getting back in
+  to reverse into a space leaves the trip alone (239 such trips in that history, all unchanged).
+  Contributed by @arekm (#364).
+- **The Charges page opens at once.** Opening Charges, or a day in its calendar, ran a correlated
+  subquery over the whole position log for every charge on the page, including charges the page had
+  already filtered out. Measured on 381,076 position rows with byte-identical output:
+  `get_charges_calendar_month` **880 ms → 1 ms**, `get_charges_calendar_day` **878 ms → 1 ms**.
+  Contributed by @hubcasale (#363).
+- **A merged charge can change its place directly.** Giving a place to a charge that had been merged
+  was refused outright — it had to be separated, assigned and merged again. The place now cascades to
+  the group, and merging or unmerging no longer reloads the whole page or loses the day on screen.
+  Contributed by @hubcasale (#363).
+- **A Windows lock no longer refuses the byte it is about to lock.** `exclusive()` seeded a byte into
+  the lock file before acquiring the lock. On Windows `msvcrt.locking` is mandatory, so once a peer held
+  byte 0 that write was refused with `ERROR_LOCK_VIOLATION` — reported as `PermissionError [Errno 13]`
+  and raised outside the retry loop that handles contention. The byte was never needed. Only the
+  Windows path of the migration lock was affected.
+
+⚠️ Trips already closed do not change: the new end applies to drives recorded from this version on.
+ℹ️ On a one- or two-kilometre drive the cloud sometimes reports its energy as 0.0 kWh, and Mate prefers
+the car's own figure over its own estimate, so a few very short trips can now read `0.00 kWh/100 km`
+where they previously showed an estimate of a few hundredths.
+
+## [4.7.5] — 2026-09-30
+
+- **The car the cloud calls A10 is the B03X, and it now has its battery.** The Leapmotor cloud reports
+  the CHINESE project name of a car, and for the crossover sold in Europe as the **B03X** that name is
+  `A10` — renamed for Europe because "A10" read as an A-segment while the car is a B, the same
+  convention by which the B10 is a C and the C10 a D. Every table Mate keys on the model saw only what
+  the cloud sends, and none had a row for it, so two things happened to the first B03X to reach us
+  (#338): `default_capacity_for` answered the unknown-model **fallback of 65.0 kWh**, a pack this car
+  has never been built with and 25% above even its larger one; and the wizard offered no variant, so
+  its owner typed a figure by hand — **53.0**, which is the NAMEPLATE capacity, not the usable one.
+  That field decides every kWh, €/kWh and consumption figure an installation will ever print. The
+  usable figures, taken from the two sources that print both columns and agree on both variants:
+  **39.8 gross → 39.0 usable** (0.8 kWh, 2.0%) and **53.0 gross → 52.0 usable** (1.0 kWh, 1.9%) — and
+  the two buffers agree with each other, which is the cross-check the C10 RWD failed in #246. The
+  wizard now shows the **selector**, labelled B03X because that is the word on the owner's papers, and
+  the 52.0 default is only what a car nobody was asked about gets. ⚠️ **Nothing is migrated**: an
+  installation that already typed a capacity keeps it, as always — a B03X running on 53.0 reads about
+  2% low on energy until its owner changes it in **Settings → Battery**.
+- **The B03 is a different car, and it is deliberately not here.** `B03` and `B03X` are one character
+  apart and are not the same model: the B03 is the **A05**, the hatchback, 4175 mm against the B03X's
+  4270. They share the platform, the 2605 mm wheelbase, the motors and — per the press — the two
+  Gotion LFP packs, which is exactly what makes copying the row tempting. It stays out because the car
+  is not on sale yet (Italy at the end of 2026, the UK in 2027) and its specification is not
+  published: no usable figure in either source, no European WLTP, trims unannounced, and one report
+  that the smaller pack may not even reach Europe. An `A05` therefore takes the 65.0 fallback and the
+  log names it by model, which is how the A10 was found; the fix will be one row, read the same way.
+- **A guard the two tables never had**: a model's default pack must be one the wizard offers for that
+  model. A default outside the wizard's list is a pack no owner can pick and no page explains, applied
+  in silence. It holds for all five models today.
+- **The bundle says why an installation is still on the bundled SDK** (#338). @dommi1966's
+  installation has been on the bundled SDK for three releases while the activation
+  re-attempts every six hours and fails, and the bundle said only which client was running, never why.
+  Since 4.2.0 a `legacy` decision is **never a verdict on the account** — every model qualifies — so
+  it is always a qualification that did not finish, and the three facts that say so are not secrets:
+  the state, the reason and the time it last tried. The `Cloud client` line now carries them, e.g.
+  `bundled SDK · retained (qualification_failed), last tried 3.2 h ago`, and a
+  decision written by 4.4.0 with no timestamp at all reads `never attempted`, which is exactly what
+  pinned those installations. The account **identity is never printed** — it is an HMAC of the
+  account's own credentials and nothing in a support bundle needs it — and a `qualified` decision is
+  not described as "never attempted" although it stores no attempt time, on purpose.
+- ⚠️ **Not in this release, and named so it is not assumed**: the windows open-% scale has no B03X row
+  either, so a B03X uses the T03's 0–100 where the other B-family cars use 0–10. That is not measured
+  on this car, and a guessed scale writes wrong commands. There is also no validated maintenance
+  schedule for the B03X: its owner gets the "no pack" message, as before.
+- **No schema change**, no new setting, and nothing is rewritten in stored data on upgrade.
+
+## [4.7.4] — 2026-09-30
+
+- **A refused weather lookup is not asked again for twenty minutes** (PR #353, @arekm). A failed Open-Meteo lookup stored neither a time nor an anchor, so the check that decides whether to fetch stayed true and every poll asked again until one succeeded. On a day the free allowance runs out that is every answered poll, refused: on a live installation, 432 HTTP 429 replies in under four hours, each with a warning, until midnight UTC. Measured here on the real sampler over four hours of polls thirty seconds apart with the service refusing: **480 requests before, 12 now**, parked or driving alike. The wait is `_RETRY_S`, equal to `_MAX_AGE_S` — as long as a good reading is already trusted — and it does not end because the car moved, since a refusal comes from the service or the network, not from where the car is; a clock set back ends it rather than stretching it. ⚠️ The cost, measured too: when the FIRST lookup after a start fails there is no outside temperature for twenty minutes, where the next poll used to ask again. An existing good reading is kept as before.
+- **The test suite looks up no host but this machine** (PR #354, @arekm). Nothing here ships to an installation; it protects one. Mate looks things up in threads no test watches — the update check on every page the web renders, the elevation and weather sweep behind a trip page, a closed charge's station note. Counted independently with a counter on the name resolver: one run asks **187 external lookups**, api.github.com 129, api.open-meteo.com 37, overpass-api.de 14, utility.arcgis.com 7. GitHub allows an address without a token 60 an hour, so two runs inside an hour use them up and a Mate behind that address then finds its own update check refused for six hours. No test needed an answer: with all 187 refused the suite is 4756 passed, 1 skipped, exactly as normal; with the guard in, the lookups reaching the resolver are zero.
+- **A READY the car did not send is stored as unknown** (PR #355, @arekm). READY (signal 1258) decides whether two trips share one power-on, which gates the automatic cloud energy read, the merge offer beyond the usual gap and where the energy window opens. Three places turned a frame without it into an answer, and **the one measured on real data is ours**: of 380 008 rows, 421 in 331 isolated stretches carry no READY because the web's write after a command or a Refresh left the column out, while the poller wrote `0` for the same absence — two writers, two rules. Measured on the real reconstruction: a stop in Park where READY is unreported kept two drives in ONE power-on at every gap up to 1000 s, while an observed `ready=0` splits them at 60 s; sixteen minutes parked came back as one power-on, which is what offers to merge trips that must stay apart. A poll without READY now says no more than a zero would — in Park it joins the runs around it only as briefly as a blip, so a couple of seconds to change a driving mode still keeps one drive whole. The poller stores NULL where the frame carried nothing, the web keeps the READY it read, and the status card shows a dash for a value the car never sent. **Nothing changes for a car that reports READY**: both versions of the reconstruction run over the whole real history give 597 trips and 597 identical sessions. ⚠️ Rows already stored are not rewritten.
+- **No schema change**, no new setting, and nothing is rewritten in stored data on upgrade.
+
+## [4.7.3] — 2026-09-30
+
+- **A session that runs out is renewed, not bought with a login** (PR #352, @arekm). 4.4.0 taught Mate to renew a session from the refresh token the cloud issues alongside the access token, and its notes said what that was worth: "about one login a week". It never happened. The function that renews was reachable from one place only — the one that fires when the cloud rejects a token mid-request — so a session that simply RAN OUT, which is what happens every two hours on every installation, went down another path and authenticated straight away, while the refresh token sat in the database good for another week. Measured by @arekm on a live installation: **fourteen logins in a little over a day, one every 119 minutes, and not one renewal**; roughly twelve a day against the one a week claimed. That matters because the cloud rations logins — 5–12 a day since 17 September on accounts it used to take hundreds from — and a refused login is a stretch with no frames at all, which is the picture in #296. `login()` is now the one place that decides between resuming a session that is still good, renewing one that has run out but carries a refresh token, and authenticating. A session saved for another account is never renewed (its token would keep the previous account alive); a refresh token the cloud turns down is dropped and offered once, so a day when the login fails too does not ask the same refusal on every read; the renewal runs under the login's own lock, and a session another process has already renewed is simply resumed; a renewal does not re-issue the account certificate, so a session whose certificate is expiring still goes through the login. On the same installation after the change: six renewals in a row overnight, one every two hours, each with the token the one before had rotated, and no login. ⚠️ A session saved by an earlier version carries no attempt time, so the first start after this update renews or re-authenticates once.
+- **A charging place carries its own type** (PR #351, @hubcasale). Places were scoped on purpose to a second home (disc #288) — somewhere you charge often, typed and priced without confirming it by hand each time — so every place typed its charges HOME. A workplace AC point or a free municipal charger is the same kind of place and had no way to say what it was: its badge read Home at 0,00 and the Home/Public split counted it as home charging. A place declares its own type now (Home/AC/DC/HPC/Free), and the type decides the money as well as the label: an AC place at 0,45 prices 10 kWh at 4,50, a Free place costs nothing whatever rate is left on it, a Home place is unchanged. Both sites that hardcoded `'HOME'` — the live AC auto-match and the manual picker — write the place's own type, and they are the only two. Assigning a place no longer answers with `HX-Refresh`: it redraws the place line and the type badge, as the type, cost and free routes already did, instead of throwing the page away and losing whichever day was open in Charges. The section's own help text went stale the moment this landed — it opened with "Private places" in all eight languages while the feature is now explicitly about a charger at work or a free municipal one — and says "your own places, each with its own type" instead. ⚠️ One added column, `charging_places.charge_type`, `NOT NULL DEFAULT 'HOME'` — every existing place and charge reads exactly as before.
+- **Two tests stopped expiring on 4 October.** The renewal tests dated every session they built from a fixed 27 September 2026 12:00 UTC while the code checks a refresh token against the real clock, so two of them would have turned red on 4 October at 12:00 UTC on every branch with nobody having changed anything. Measured by running the suite at a shifted clock: four passing at 11:59, two failing at 12:01. They build their sessions from the clock they run at now. (The first measurement counted 37 failures, not 2 — the other 35 were the measuring tool breaking the browser tests, found by shifting the clock by zero and watching them fail anyway.)
+- **Verified beyond the pull requests' own tests.** #352's four guards were mutated one at a time — the drop of a refused token, its commit, the account check, the "still ours" check — and each turns a test red. For #351, the five types are exactly the keys of `db_reader`'s `CHARGE_TYPES`, the column goes in through the race-tolerant `_add_column` added in 4.7.1 for #338, and a new test pins that the money follows the type, which the PR's own tests did not cover.
+
+## [4.7.2] — 2026-09-30
+
+- **Kilometres driven while Mate could not see the car** (PR #347 + PR #350, @arekm). When the odometer moved while Mate was not watching, the jump is the only trace of that drive — and two things stopped Mate rebuilding it. A frame that arrives without its odometer is read as `0`, and the recorder moved its baseline on every poll, so such a frame left the baseline at 0 and the kilometres before the next real reading were recorded nowhere: not as a trip, not as a stretch, nowhere. The baseline is now the last reading that actually carried an odometer, and it carries the SoC and the time of that same reading with it. And the reconstruction only ever looked on a poll where the car was PARKED, so plugging in the moment you get home meant the jump was never examined; it now looks while charging too, and because the poll has opened the charge session by then those kilometres are kept as an offline stretch without the SoC of its ends — a charge in between means the battery difference is not what the drive spent. Two smaller repairs travel with them: a row the web writes after a command or a Refresh now keeps the clock of the frame it read (without it the row read as *news* to everything that tells a re-served frame from a new one, and the Overview stopped saying how old the data was), and a charge never ends after the moment Mate first read the frame it ended on (#208, with the car's clock running ahead). Measured by @arekm: 60 of that test file's 87 cases fail on the code before the fix, and 27 public diagnostics bundles replay with the same trips, charges and kilometres. ⚠️ One new index, `positions(vehicle_id, id)`, built once at start — about a third of a second on a million rows.
+- **A reading the car did not send is stored as unknown, not as zero** (PR #345, @arekm). The parser turned an absent speed (signal 1319) or odometer (1318) into `0`, and `positions` kept it, so in the history a measured standstill and a frame that said nothing about speed were identical — and so were a missing odometer and one that had not moved. Both are stored as NULL now when the frame did not carry them; the numbers in memory stay 0, because the state machine and the recorder compare them as numbers. Three readers change with them, and four figures an 0 used to mislead now skip it: the daily distance in the diagnostics bundle, the vampire-drain split, the odometer axis of battery health, and the range extender's engine trail. ⚠️ Rows already stored are not changed.
+- **A trip ends on the last reading written, not the latest by our clock** (PR #348, @arekm). A trip is closed on the last `positions` row inside it, picked by the latest time on Mate's clock — and since #339 that row gives the end odometer, SoC and position as well as the end time. A host clock stepping back during a drive (an NTP correction, a Pi waking up) did not just shift a timestamp; it chose a different row to end the trip on. It takes the last row WRITTEN now. On a clock that never steps back the two orders pick the same row: on a real database of 34 trips they agree on every one, and 27 public bundles replay unchanged.
+- **A trip counts the frame it opened on as its own** (PR #349, @arekm). The recorder saves every frame to `positions` before the state machine decides what it means, so the row of the frame that opens a trip is written a moment before the trip exists — and the trip took a later clock read as its start, leaving its own opening row outside it. A trip now starts when the poll that opened it began. What it changes: a trip that heard only its opening frame, repeated until the frozen-drive guard fired, lasted 30 minutes instead of 0. The trip tests' rig read one fixed time per poll, so the opening row and the trip shared a timestamp there and the defect could not appear; it can tick on every read now, as a real clock does.
+- **A charge the car stopped flagging is still a charge** (#341, @arzthilfe). 4.7.1 fixed a power chart that stopped when a session was recorded as two rows joined together — a real defect, and not his: all 42 of his charges are single rows. His bundle carries the session in his screenshot, the night of 28→29 September: `22:17:21 plug=1 chg=1 A=-2.3` at 11 A, then `22:17:52 plug=1 chg=0 A=-1.7` when the wallbox went to 8 A, and `chg=0` with the current still negative all night, `State: charging` throughout, SoC 78.9 → 92.2 by morning. **146 of that session's 1177 polls carry the flag: 12.4 %.** The car's flag needs a pack current of at least the charge-detection setting (2.0 A by default) and at 8 A his C10 reports 1.7 A. The SESSION is right — the state machine also holds it on the cable, which is why it is one row with no unmerge button — but the thirteen queries that read it back by the raw flag lost seven hours of it: the power chart, the active window the wallbox comparison and the HOME cost align on, the time-of-use split, the dynamic-tariff cost, the energy below a given SoC, and the three that ask whether a charge has samples at all. One rule answers for all thirteen now: the flag, OR a charging-sign pack current while the car is stationary. Measured on a real 375 000-row history: of the 8581 unflagged rows carrying a charging-sign current the motion gate excludes 8580, and the one it keeps sits 69 s inside a session whose flag had not caught up; no parked sample anywhere sits between -0.5 A and 0, so the floor is below everything measured rather than fitted to it. ⚠️ On a car that always flags its charges that single sample is the whole difference.
+- **A long label no longer lands on its own value** (#340, @jcconca). In Spanish the Summary card read `Cuentakilómetros1930`, with `km` on a line of its own, and `Temperatura de consigna` / `24 °C` both wrapped. The rows distribute the FREE space between label and value, and a label that fills its half-width cell leaves none: measured in a browser at the two widths in the screenshots and three more, the gap is **0.0 px** on three of the rows at 320, 360, 381, 414 and 1149 px. The same markup in English has room to spare at every one of them. Each row now keeps a gap, the label may shrink so it wraps rather than push, and the value never wraps — a reading and its unit are one number.
+- **An installation kept on the old cloud client is asked again** (#338, @dommi1966). His 4.7.1 bundle is the only one of the public set reading `Cloud client : bundled SDK`. Mate takes that decision once and stores it against a release marker that has read `4.4.0` since 4.4.0, so whatever it decided then has been returned untouched at every start through 4.5, 4.6, 4.7 and 4.7.1 — and his FIRST bundle showed 747 `database is locked` lines and a skipped schema check, exactly the state that makes the decision fail, since it copies the database into a staging area and performs a live cloud login inside a 15-second subprocess. There is no longer any such thing as an account that does not qualify (since 4.2.0 every model does, and 4.4.0 removed the literal `['B10']` that kept the others out — #327, #330), so every stored "keep the old client" decision is a check that did not finish: a timeout, a locked database, a login the cloud refused that minute. None is a verdict about the account. It is asked again now, though not on every start — the check logs in and that cloud rations logins (#296) — so a failure is honoured for six hours, and a decision stored before this rule carries no attempt time at all and is re-examined at once. ⚠️ A decision that SUCCEEDED is untouched.
+- **The €/kWh on a charge says which kilowatt-hours it divides by** (#346, @Tommy73LMB05). An HPC session read 17,45 €, +41,2 kWh in the battery (DC) and 0,37 €/kWh, while the Overview's average price in the battery read 0,405. Reproduced by running Mate's own code on his three figures: 17,45 / 47,28 (what the column delivered, typed in) = 0,369; 17,45 / 41,2 (what reached the pack) = 0,424, blended to 0,405 because he plugged in at 16,6 %. Both are right, and the split is deliberate — one divides by what billed you, the other by what a trip actually consumes. What was missing is the word: the rate sat directly under *+41,2 kWh in the battery* while dividing by 47,28, and nothing on screen said so. Two correct numbers under one unit is a defect even when both are right. The card names the basis beside the rate now, read from the same place the figure itself is decided. The tooltip on the battery price had the same hole — it explained the gap for a charge "billed on a meter's kWh", a home wallbox, and his is a public session with the column's figure typed in — widened in all eight languages.
+- **A charge flag Mate reads from the car goes back as the car sent it** (#343, @jcconca). 4.7.1 made a refused charge schedule name the flag and what it held, "so that a diagnostics bundle carries the answer with no extra cloud call" — and it did, four days later, in his: `Command not sent: invalid charge flag circulation=2`. So the flag is **circulation** and the value is **2**, on a real C10, not `recharge` as everyone had assumed; his last accepted send was 27 September at 22:00 with circulation=1, and every nightly automation of his since has failed with that sentence. Command 190 re-sends the car's WHOLE plan, and only `chargeEnable` and `chargesoc` are Mate's to choose — `circulation` and `recharge` are read out of the car's own configuration and written straight back, so checking those two against {0, 1}, a domain that was assumed and never measured, stopped him changing the one field he did ask about. They accept any integer the car published now. An integer, and only an integer: an absent value, an empty one, a string or a boolean mean the value could not be READ, a different thing from a value the car said, and each is still refused by name and with the value. `chargeEnable` keeps 0/1 — it is a switch, and nothing reads it off the car to echo back. Fixed upstream in MATE-API 0.1.0a14 and re-vendored byte for byte, so all three routes to that command pass through the one contract — PR #344 had patched two of them.
+- **No schema change** beyond that one index, no new setting, and nothing is rewritten in stored data on upgrade. An older Mate reads this database unchanged.
+- PR #344 is not in this release: its diagnostic half is already in 4.7.1, and the measurement above shows `recharge` was never the flag it set out to repair.
+
+## [4.7.1] — 2026-09-29
+
+- **A trip interrupted by a cloud outage no longer stays open** (PR #339, @arekm — closes D #331). When the cloud refuses Mate mid-drive the recorder goes offline, and on its return only one case looked at the open trip: the car still driving after a brief silence. Parked by then, the trip stayed open with no end, no distance and no consumption until the poller restarted, and the next drive opened a second trip beside it; driving again after more than half an hour, a new trip was opened on top of the old one; charging, the trip closed on the charging frame, so its end time, SoC and odometer swallowed the whole outage. The open trip is now always resumed or closed, bounded by the same half hour that already ends a frozen drive, and the kilometres driven in the dark go where Mate already puts kilometres it did not see — a reconstructed trip when parked, the new trip's offline gap when driving, an offline gap when a charge starts. Two consequences: GPS retention keeps a car's points from its open trip's start (an outage can outlast the retention, and the trip is closed on those readings) — **per car**, so another car prunes as if it did not exist — and every trip an earlier version left open is settled on that car's first poll, each on its own points.
+- **A column another Mate process added no longer stops the schema migration** (#338, @dommi1966). `ensure_schema` is run by the poller AND by the web; on an install being upgraded both read the table's columns at boot, both see the same one missing, and both issue the same `ALTER TABLE … ADD COLUMN`. Whoever arrives second gets `duplicate column name` — not a failure, the column is there — but raised it left the function, and every migration **below that line** never ran for that process. His web log carries exactly one such line, on `ac_port_mode`, which sits two thirds of the way down: the climate columns, the REEV columns, `fuel_liters`, `frame_ts`, `abilities` and every trips / trip_positions migration come after it. All 57 ADD COLUMN steps now tolerate that one message and nothing else — a missing table, a bad type, an index the table cannot take all still stop the migration.
+- **A merged charge's power chart covers the whole session** (#341, @arzthilfe). A charge the car reported as two rows is read back as one session everywhere else — header, kilowatt-hours, duration all walk parent and pieces — but the curve took the parent row's own start and end, and the guard that stops an orphan charge absorbing a later one counted this session's **own** second piece as "the next charge". Measured on the reported shape (19:00 plug-in at 11 A, the wallbox turned down to 8 A at 22:17, cable out at 07:09): the curve carried **40 of 98 samples**, ended at 22:15, and held one power value — the 8 A half of the night was not drawn at all. Only the curve widens: the cost and energy readers price each piece separately and the session sums them, so widening those would bill the same kilowatt-hours twice.
+- **A refused charge schedule says which flag, and what it held** (#343, @jcconca). Three flags travel in that command — `chargeEnable`, `circulation`, `recharge` — and all 24 combinations of {flag} × {`2`, `-1`, `None`, `True`, `False`, `"1"`, `1.0`, `""`} gave the same `invalid charge flag`. Two of the three are not Mate's to choose: `circulation` and `recharge` are read from the car and written straight back, so a car publishing anything else stopped its owner with a message naming none of them. It now reads `invalid charge flag circulation=2`; the refusal is already logged, so a diagnostics bundle carries the answer with no extra cloud call. Flags only — no VIN, no token, nothing to redact. Fixed upstream in MATE-API (0.1.0a13) and re-vendored byte for byte.
+- **The logo at the top of the page goes home** (#342, @matttiaromano). On a phone the menu is behind the hamburger, so returning to Overview took two taps on the one control every other app makes a one-tap shortcut. A link now in both bars, relative so the Home Assistant ingress prefix still holds.
+- **No schema change**, no new setting, nothing written to stored data on upgrade, and an older Mate reads this database unchanged.
+
+## [4.7.0] — 2026-09-29
+
+- **The range-extender pages ship on the official build.** Nineteen places gated on the research build are now open on every build: the REEV page, the petrol figures in the trips list and on a trip's page, the fuel totals on the day / month / period cards, the Overview and Statistics summaries, and the efficiency-against-temperature chart — and with them the **REEV battery packs in the setup wizard**, which was the gate worth missing least: without it an owner on the official build reached the battery step with no pack that matched the car and no way to finish. Still BetaTester-only: the research diary, the encrypted pack and its consent, the `?demo` preview, and the ⚡ electric rate on a generator drive (`reev_elec_kwh_100km`), which reads 46, 82.7, even 386 kWh/100 km on real trips and has never been held against a dashboard.
+- **The petrol on a trip is the car's own figure.** Leapmotor's per-trip history carries `driveReevOil`, staged since 4.5.3 and read by nothing; Mate worked the litres out itself from the tank level at the two ends of the drive. The two disagree: on the one drive whose figure an owner can also read in the official app (19 September, 77 km) the app says **4.9 L**, the cloud record says 4.9, and Mate's arithmetic says **3.886** — **20.7% low**. Both are measurements the car makes and neither can be declared physically right here, but one of them is what the owner sees in their own app. The tank stays as the fallback for a drive the cloud has no record of, and each figure now says where it came from — *Leapmotor history* or *From the tank* — in the slot the electric figure already uses.
+- ⚠️ **On update, some old trips will read differently.** The cloud's window is about 28 days, so a long range-extender history mixes the two bases — recent drives on the cloud's figure, older ones on the tank's, about 20% apart. The label on each figure says which answer is on screen.
+- **An empty cloud record no longer blocks the real one.** The cloud deposits records describing nothing — zero kilometres and zero litres: 41 of 98 on the owner's history, and one of them overlapped the tail of the calibrated drive. Two records on one trip made it ambiguous, the safety rule refused **both**, and the pack's only real litre figure disappeared. Dropping records that carry neither a distance nor any petrol took the matches from **30 to 34**. A record with zero kilometres but real petrol is kept — that is the generator charging the pack while parked. ⚠️ Measured on the **fuel** path only: applied to the energy matching on a battery-only database it takes it from 114 matches to 62, the same shape with the opposite sign.
+- **A drive that burned nothing now says `0 L · all electric`** instead of showing nothing at all, which is what a drive whose tank was never read shows. The car's counter (signal `3263`) counts **millilitres**; reading the identical value at both ends of a drive is a measurement saying the generator never ran. On 150 real trips, **79** are exactly that — every one precisely 0.0, none in the 0–5 mL band — and 33 more have the cloud answering 0.0. Trips Mate genuinely cannot answer fell from **112 to 33**. The percentage gauge gets no such treatment: signal `3235` moves in steps of 0.1, about 47 mL of a 47.5 L tank, so a needle that did not move is compatible with a small burn. No total moves — the same history sums to 8.6 L and 0.3 L/100 km before and after.
+- **A trip closed by crash recovery keeps its end odometer and its end fuel.** That path closes a trip from its recorded points, which carry neither, and its UPDATE named neither column: a trip read `odo 3233 → —` (the tail of #298), and a range extender kept its starting tank reading and lost the end, so the subtraction had one side and answered "unknown" for ever. Eleven of the owner's 150 trips are in that state, identified by this path's own fingerprint — it rounds the distance to three decimals where the normal path rounds to two, and no trip in any other group has three. Counted across twelve owners' bundles it is not rare: 7 closures in 158 on one 4.1.0, 1 in 36 on a 4.5.2, 52 in 158 on an old 2.5.6. ⚠️ Both apply from here on; trips already closed that way keep their empty end.
+- **Regen is braking, not the car's own generator.** Mate counts regen as energy flowing into the pack while unplugged — exactly right on a battery-only car. On a range extender the generator refills the pack **while driving, unplugged**, with the same sign, so petrol burned to make electricity was recorded as recovered braking energy. Split by whether the millilitre counter moved, on the one drive of that owner's month where the generator ran: **3.761 kWh of 4.226 — 89%** — arrived while it was burning. Across the 50 drives in the window the share is 6.4%, because it ran on exactly one: the figure is right on a pure-electric drive and almost entirely wrong on a generator drive, 49 of 50 measuring 0.0%. Deliberately a lower bound — braking while the generator runs goes with it, because the pack current carries no way to split the two. ⚠️ One owner, one generator drive: the 89% is what could be measured, not a constant.
+- **Nothing changes on screen for that** — regen is already hidden on a range extender in all seven places it appears — but one number changes on battery-only cars too: the same rule recomputes the regen a restart used to lose. A trip closed by crash recovery read **0.00 kWh recovered**, because that total lives in the poller's memory and a restart empties it. Every input was already stored per poll, so it is rebuilt exactly, over the real interval between readings, skipping any gap longer than five minutes.
+- **A locked database no longer turns the daily clean-up into a loop.** From a NAS install (#338) whose database would not accept writes: the prune marked the day done only on success, so it never marked it and tried again on every poll — 266 attempts in four hours, piling work onto the database that was already the problem. The day is now spent by the **attempt**, remembered in memory as well, because on that install nothing could be written at all, the marker included.
+- In Italian, petrol is **«Consumati»** rather than «Bruciato» on the trips card, the monthly report and the statistics notice. German and Dutch already said *consumed*; the other five languages keep their own verb.
+- **No schema change**, no new setting, nothing written to stored data on upgrade, and an older Mate reads this database unchanged.
+- Also in: CI checks out the desktop shell's dependency contract, so the test that catches an import the shipped shell does not declare runs there instead of only on a maintainer's machine.
+
+## [4.6.0] — 2026-09-29
+
+- A trip's **top speed is the car's own figure** where the cloud's record of that drive is matched to the trip — the same matching that already decides the official consumption. Mate's readings are about eleven seconds apart, so a shorter peak was never in them: across 38 comparable drives the sampled peak was below the car's figure on 37, by 2.4 km/h at the median, and on a B10 the gap reached 21 km/h. A trip without that record keeps the sampled figure and marks it with an ⓘ.
+- A trip's points now **keep four readings of their own poll** — battery power, the coldest cell's temperature, the range estimate and the outside air — written from the same frame as the `positions` row. The GPS retention prunes `positions` and has never touched a trip's own points, so what the trip page shows no longer depends on how long position history is kept.
+- The trip page gained, from those readings: **Max power** and **Max regen** (voltage × current, out of the pack and back into it; hidden on a range extender, like the regen figure); **battery** and **outside temperature** as the lowest-to-highest range of the drive rather than an average; a grey line under the duration splitting it into **driving, stopped and no data** as whole minutes that add up to it; and the **median** of the same speed readings under the average. **Ascent / descent** is listed in that order, and **SoC** and **odometer** read as one line each, start → end with the change in brackets — which on a range extender replaces the research-only "recharged by generator" row with the same fact stated rather than interpreted.
+- The chart under the map is now **Trip data**: one chart in three bands on one time axis (speed and power, SoC and range, altitude and battery temperature) with one cursor and one hover box, at most two scales per band in their line's colour. The legend switches each line on and off, a band with every line off folds away, the choice is remembered in the browser, and the hover box heads each point with the time of day in Mate's zone — formatted by the browser, so a drive across a clock change reads right on both sides.
+- ⚠️ Schema: four nullable columns on a trip's points. Trips recorded earlier get those readings once at startup, from the `positions` row of the same poll and only while it still exists — so **with a GPS retention set, old trips mostly do not get them**: measured on 593 trips and 47,936 points, 90 days gives 71%, 30 days 20%, 7 days 3.2%, and the default (keep everything) 100%. Every trip from this release onward has them regardless. The backfill runs once and is remembered; on a 692 MB database with 479,360 points it took 1.39 s without ever blocking a concurrent reader, in `delete` journal mode as well as WAL.
+- Going back to 4.5.5 reads this database unchanged and ignores the four columns.
+- Nearly all of the above is PR #337 by @arekm. Two things were changed on top of it: the chart's browser test read the hover box before ApexCharts had filled it (8 runs in 25 failed; it waits for the title now), and `_whole_minutes` handed out one minute per part when every part was zero instead of sharing the duration, which no caller could reach.
+- Italian was the only one of the eight languages that left *regen* in English: the trip page's `Regen` and `Regen max` are now **Recupero** and **Recupero max**, which is what the other six translated languages already did.
+- Also in: the diagnostics bundle now names the **SQLite journal mode** the database really settled on, and the poller logs a warning when it is not WAL — a filesystem that cannot honour WAL makes readers block writers, which surfaces as `database is locked`. And the manuals say that the `MATE_AUTH_PASSWORD` variable **overrides** the stored password rather than replacing it.
+
+## [4.5.5] — 2026-09-28
+
+- The Overview's "OTA updates" row is removed. It read **None** whenever the account's message inbox held no update notice, and it was never a statement about the car: Leapmotor tells the installed and waiting versions only to the account that OWNS the car, while Mate is required to run on an account the car is SHARED with (README requirement #1 — about one active session per account, so the phone's official app and Mate would evict each other in a loop). Such an account receives no vehicle notices at all, only sharing invitations, so the row read "None" for ever — and "None", under a label saying *OTA updates*, reads as "you are up to date". Measured against the live cloud on a B10 through that shared account, the vehicle-update endpoint answers `code [40, 40]`, so the row could not be filled with the real version either. Its three translation keys are gone from all eight languages.
+- ⚠️ The **OTA Update Notice** entity is withdrawn from Home Assistant, so an automation built on it will stop having an entity. It was fed by the same inbox, and counted across three real owners' diagnostics bundles — 44 successful scans between them — it found **zero** update notices (on one of them, 561 scans failed against 20 that worked). A sensor that cannot turn on is not a quiet sensor but a promise of a notification that will never arrive. It is withdrawn properly: Home Assistant discovery configs are *retained*, so merely ceasing to publish would have left the entity frozen on every installation with no way for its owner to remove it — Mate publishes an empty payload to that config topic once and clears the two state topics, so it disappears instead of lingering.
+- Gone with them: the inbox scan (one cloud request every ten minutes), its throttle, the language patterns that tried to recognise an update message, and the reader the web used. Three settings (`ota_available`, `ota_title`, `ota_time`) are left unused in the database and harm nothing.
+- No schema change, nothing written to stored data, and nothing else about what Mate collects or shows changes.
+
+## [4.5.4] — 2026-09-28
+
+- The cloud's own per-trip fuel figure can now leave the car. Since 4.5.3 every installation stages Leapmotor's per-trip history (`/carownerservice/mileage/daily/detail/page` — the data the official app's per-trip panel is drawn from), and each record carries `driveReevOil`: the petrol that one drive burned according to the car's own cloud. Nothing could read it — the diagnostics pack carried the *aggregate* cloud endpoints (`getEC`, the six-week rank, `mileage/energy/detail`) and not the per-trip one, so the field sat in the staging table. The encrypted pack now carries those records as `cloud_trip_records.csv`, allow-listed: the cloud `accountId` dropped, the VIN masked, and `started_at`/`ended_at` derived as ISO timestamps beside the raw millisecond fields, because matching a cloud record to the trip Mate recorded is what fixes the unit — `driveReevOil` may be in litres or in millilitres like signal `3263`, and that is a factor of a thousand nobody has measured.
+- It exports what is *stored*, not another live probe. The existing cloud probes authenticate at export time, and on the one readable pack available every one of the five came back `{"code":3,"message":"Token is invalid","data":null}` — one expired token turns the whole probe into five empty answers. A staged table needs no token.
+- The plain diagnostics text — the file most owners send — now has a cloud-trip-history section: how many drives are staged, over what window, how many carry `driveReevOil` and how many carry it above zero, how many cloud trips were promoted into the trip list, and the last sync summary. Counts and ranges only, because that file is attached to public issues. Present-and-zero is counted apart from absent on purpose: a battery-only car reports the field on every drive with the value `0.0` while a car whose history never arrived reports nothing, the two are indistinguishable in a total, and they lead to opposite conclusions — one of them is not a Mate defect. Measured on a B10 with 183 staged drives: present on all 183, `0.0` on all 183.
+- Nothing about what Mate shows changes, no schema or setting changes, nothing is written to stored data and nothing new is asked of the cloud.
+
+## [4.5.3] — 2026-09-28
+
+- One read connection per thread, not one per read. `db_reader` opened a brand-new SQLite connection on every read: `get_setting` costs ~124 µs not because the query is hard but because the connection is new and its page cache is cold, and 119 queries in that module go through it while one page render calls dozens of readers. The connection is let go when the database path moves or when the file under that path is replaced, so a restore from backup is picked up rather than silently ignored. Sharing it holds nothing back — it is read-only and each statement gets its own read transaction, so a commit from the poller is visible on the very next read, which is the difference from the cached *value* tried and rejected in 4.5.2.
+- Asking whether the cabin was used is no longer a scan of the charge. The battery health estimate probes each charge for a sample with the heater or cooler running; `SELECT 1 … LIMIT 1` looks cheap and is the opposite, because with no index on those columns finding no match means reading every frame in the window — 618 ms for 33 charges on a real database, plan `SCAN positions`, with the cabin in use in none of them. A partial index over the 2081 rows out of 374 511 where it was makes those 33 probes cost 0.10 ms.
+- Three more readers ask the clock once, not once per row: the standby-drain card read the timezone twice per park closed (1608 reads for one card), the polling strip 578 times for 288 windows — with the zone already resolved at the top of the same function — and the battery chart once per charge dated.
+- The drain card no longer builds a row object per frame. Ninety days is 284 505 frames and each was becoming a `sqlite3.Row` with a name lookup per field: 494.3 ms on 4.5.0, 301.5 with the zone hoisted, **209.2** reading plain tuples off the cursor. The reply is identical, not merely equal — dumped to JSON from the old reader and the new one it diffs to zero lines.
+- Two latent defects this exposed, neither of which had ever reached anyone (both needed the shared connection to become reachable): thirteen read paths asked for the refuels table to be created on a read-only connection, wrapping that call and their own query in one `except`, so on a connection older than the table the query behind it would have been skipped and a total would have silently missed every litre of petrol entered; and the update check wrote `update_checked_at` to whichever database the path named when its thread got there, which matters because that write creates an empty database when the file is not there.
+- Measured on the add-on that reported the slowness, 90 days of history, before → after: Overview 0.213 → 0.048 s, Battery 0.129 → 0.012, Charges 0.278 → 0.035, Statistics 0.489 → 0.163, monthly report 0.323 → 0.156, Trips 0.422 → 0.231, Map 0.491 → 0.362, Settings 0.448 → 0.311, `/api/battery-health` 1.150 → 0.114, `/api/battery-vampire` 2.427 → 0.929, `/api/vehicle-status` 0.551 → 0.447. Nothing about what Mate shows has changed.
+- Measured and deliberately left alone: Settings, whose every database read adds up to 0.17 ms — the rest is rendering 149 KB of HTML; the map, whose query is 24.5 ms and already indexed, reading 47 936 points to draw 11 791 because the page draws every trip ever recorded; and `/api/vehicle-status`, which timed on its own is 517 ms and five queries — what is left there is Leapmotor's cloud answering, not Mate.
+
+## [4.5.2] — 2026-09-28
+
+- The same question is not asked once per row. `db_reader.get_setting` opens a new SQLite connection for every call, and the code was calling it inside loops: the time zone to display a date in, 1172 times for one Statistics page and 1280 for one monthly report; which car we are looking at, 87 times to draw one battery card. Both are resolved once per list now. A held value with a lifetime was tried for the time zone and was wrong — the poller writes that setting from another process, so a cached answer is stale the moment it does, and ten tests said so.
+- Matching a cloud record no longer scans every trip. For each cloud mileage record the matcher walked the whole trip history — over a million `min`/`max` calls per ten renders, and `get_trips(3)` for the Overview cost 92 ms on the add-on against 1.73 ms on 3.19.2 where this matching did not exist. Quadratic in the history, so it grew with every drive recorded, not with every release. The candidate window is found by halving a list sorted by start time, bounded below by the longest trip there is; the candidate set is identical. 2600 trips and 2600 records: 0.93 s → 0.11 s.
+- Asking whether V2L was used stops reading a week of frames. The card read every position row of the last seven days — 19 731 on a real database — to keep the last session: 57.4 ms of every page, on a card that also refreshes every 10 s. The window is now probed for the V2L marker first, over a partial index on it: 0.002 ms for the probe, 1.7 ms for the whole call.
+- The account certificate is read once, not fourteen times per request. One call to `/api/vehicle-status` parsed the RSA private key fourteen times — 21 ms each on a Mac, and RSA parsing is the slowest thing an aarch64 box does. The answer is held per (path, size, mtime) for both files; a re-issued certificate is read again.
+- The Battery page arrives before its two long sums. The health estimate integrates the power samples of every qualifying charge, and the vampire drain reads ninety days of position rows — about 250 000 — and groups them into parks. Neither is a query an index can help. The shell arrives and each section fetches itself: 3.526 s → 0.121 s on the add-on, with the figures filling in after. The capacity hint in Settings does the same, which is 0.927 s of that page.
+- A closed card does not keep dialling its broker. Deciding the colour of the MQTT status dot opens a real TCP connection — 1.011 s on the add-on — and the card asked for it every 30 s whether or not anyone had expanded it. The first reading still happens; the repeat runs only while the card is open. The same applies to the ABRP dot.
+- Measured on the add-on that reported the problem, 90 days of history, before → after: Battery 3.526 → 0.121 s, Statistics 2.679 → 0.448, Trips 1.696 → 0.406, Settings 1.613 → 0.413, monthly report 0.997 → 0.307, Charges 0.424 → 0.256, Overview 0.343 → 0.195. Nothing about what Mate shows has changed.
+- Known and left for their own work: the map page serialises the whole GPS track into the HTML (296 KB), `/api/battery-vampire` walks 250 000 rows in Python (2.322 s), `/api/battery-health` reads positions one charge at a time (1.073 s). None of the three blocks a page any more.
+
+## [4.5.1] — 2026-09-28
+
+- A page reads a setting once, not once per button. Deciding which controls a car may show walked all 52 of them and read three settings for each — 156 reads to draw one page, and every read opened its own SQLite connection. 17.17 ms per page on an SSD, and far worse on an add-on running from an SD card, which is why the add-on felt worse than Docker. Measured on one copy of a real database: the Overview goes from 0.081 s to 0.058 s. The jump came in with 4.0.0 (Overview: 3.19.2 32 ms, 4.0.0 59 ms).
+- Settings does not pay for a card nobody opened. 4.5.0 built the Cloud link card — 288 five-minute windows and seven days of counts, aggregated from every row of the last eight days — inside the page, on every load, open or not. It fetches its own body when opened now. Settings 0.422 s → 0.320 s on a real database, where 3.19.2 was 0.319 s.
+- The link tile's two last-poll lookups are bounded by the retention window. With no failure to find, one of them walked the whole table, on a tile that refreshes every 30 s.
+- The menu keeps its place. Seventeen items are taller than the window they sit in (822 px of nav in 524 px at 1280x800), and every page is a full load, so picking an item from the bottom threw the menu back to the top and the item just used was off screen again.
+
+## [4.5.0] — 2026-09-27
+
+- The Overview says whether its data can be trusted. A tile beside the heading, refreshed every 30 s on its own: two dots on one line, Mate → cloud → car, and the facts on a hover of each word — since when the poller has been running, what the session is doing and when it last answered, the last frame and what the car was doing. Nothing more is printed while nothing is wrong. Red is Mate not fetching, and the tile becomes the banner: the consequence, the last frame's time, the next attempt, the stored error, and the password hint only when the cloud blamed the password. For nine days in D #300 the same page read "last seen 9 h ago", which is also what a car asleep in a garage reads.
+- Home Assistant gets one entity for it: `sensor.<car>_data_link`, per car, carrying the same verdict (fresh, no_new_data, age_unknown, login_refused, fetch_failed) with since-when, the error and the next attempt as attributes. Published from every branch of the poll, including the startup wait, and it expires after 1260 s — so `unavailable` means the poller has stopped. One automation covers the case D #300 was: notify when it has been neither fresh nor no_new_data for an hour.
+- A "Cloud link" card in Settings: the last 24 hours as 288 five-minute windows, worst outcome per window, and seven local days of counts with logins split by process. The same table goes into the diagnostics bundle, where the answer to "is Mate getting data?" used to be counted by hand out of the log.
+- An age past a day is counted in days. Nine days without contact was printed as "216h ago".
+- The heartbeat keeps beating while a startup login is being refused. A poller waiting out a refusal reported as a dead process; ⚠️ `/healthz` now answers 200 in that state, where it answered 503, because the process is alive and a 503 only restart-loops the container through a cloud outage.
+- The energy label under a trip names its source instead of our endpoint (#332). "getEC" was the name of a cloud endpoint: it now reads "Measured by the car". "Leapmotor cloud" becomes "Leapmotor history", because both figures come from the cloud and what differs is which one — the trip as the cloud's history records it, or the energy the car metered over the window. Eight languages.
+- The diagnostics bundle's privacy test reads a log it controls. It asserted on a tail written by whatever else the test suite had logged first, so what the promise was checked against was an accident of test order; the part of the report the app does not compose for sharing now has a test that gives it a coordinate pair, a VIN and an address and reads what comes out.
+
+## [4.4.0] — 2026-09-27
+
+- An account of any model qualifies for the independent cloud client. The verdict of the qualification probe was compared against a literal `['B10']`, so every other account was kept on the bundled SDK — where the consumption reads went out unsigned until 4.3.0 (#327, #330) and where the cloud trip-history card does not exist (#298). The gate had been opened inside the child process and left shut in the parent.
+- The qualification is asked again. The decision is kept per release and the marker had read 4.0.0 since 4.0.0, so an installation refused once was never re-examined. Installations kept on the bundled SDK migrate at the next start.
+- A session is renewed instead of bought again with a login. The cloud states the access token's life (7200 s) and issues a refresh token good for seven days; Mate kept neither and capped every session at thirty minutes, which cost ~48 logins a day. Renewal brings that to about one a week, the first lever on the login wall behind #296 and beta #49.
+- mate-api 0.1.0a11 vendored.
+
+## [4.3.1] — 2026-09-27
+
+- Fix: a car that loses the cloud for a minute mid-drive no longer loses the drive. Coming back from a dropout with a trip still open resumes that trip instead of opening another, and the kilometres of the gap stay in it rather than being declared as belonging to no trip (D #331: nine dropouts in one morning, ten trips opened, one closed). A silence longer than the frozen-drive guard, or one that happens while parked, keeps the previous behaviour.
+
+## [4.3.0] — 2026-09-27
+
+- Fix: an installation running the bundled SDK sends its consumption reads signed again. Since 4.0.0 the Trips consumption chart, the Monthly Report's driving energy and the per-trip enrichment were refused by the cloud with `code 39, Information verification failed`, because the SDK's header builders had been replaced by the independent client's marker for both backends at once (#327).
+- Fix: a charge that keeps going below the charge-detection floor keeps the energy it delivered. The energy of a charge ending at 100% is anchored to the last sample with the cable connected and current still entering the pack, instead of the last sample the detection floor called charging — on a 1.7 kW wallbox that was 7.8 points of SoC and 6.4 kWh (#316). Charges already recorded are recomputed once, only where that anchor moved, each keeping the kWh-per-point scale it was written with.
+- Fix: a window with no driving is read as the empty answer it is, instead of three attempts, three session resets and three logins.
+- The Overview says "Data stale" instead of "Driving" for a frame the poller's frozen-drive guard gave up on, and the missed-charge scan can reconstruct a charge taken while out of contact when the car drove at most 3 km out of it — BEV only, with a conservative regeneration budget (PR #329, @kerniger).
+- Fix: a poll carrying no SoC no longer removes a charge from the missed-charge scan.
+- The diagnostics bundle names the cloud client it is running.
+
+## [4.2.1] — 2026-09-27
+
+- Fix: a new installation is offered the certificate step again. From 4.0.0 the setup page showed only the application-bundle upload — a ZIP carrying private parameters no user can produce — so Mate could not be set up from scratch (#328). The wizard asks for app.crt and app.key again and installs the rest from the profile packaged in the image; the bundle upload remains only where a certificate pair genuinely cannot finish the installation. Existing installations were never affected.
+- Document the verified China cloud API flow in docs/CHINA-API-RESEARCH.md, contributed by @kerniger (#326). Documentation only: Chinese-market accounts remain unsupported.
+
+## [4.2.0] — 2026-09-27
+
+- Cloud commands reach every vehicle model, not only the B10: what a car may do is the data its own cloud entry publishes (abilities, account rights, control module) and the cloud's own refusal, never the model name.
+- Add sentry mode as a cloud command where the account declares the right for it.
+- Accept the T03's full seven-field payload for switching the climate completely off, and keep the B10's bare payload; neither is reshaped, because each model ignores the other's form.
+- Stop hiding the climate on a car that does not declare the air-conditioning ability but cools anyway (#67).
+- Keep heated seats and heated steering hidden on models measured without that hardware (#144), and make the page, the injected stylesheet and Home Assistant agree on one rule.
+- Stop offering a command after the cloud answers that this vehicle has no permission for it, per account binding.
+- Collect the cloud's per-trip history on every model, including range-extender fuel per trip, with the session the installation already holds.
+
+## [4.1.0] — 2026-09-26
+
+- Show or hide frequent places on the map, remembering the choice in each browser (#315, PR323).
+- Configure private charging places per vehicle with a fixed tariff, map coordinates and matching radius (#288, PR324).
+- Match new live AC sessions only from fresh, unambiguous stationary GPS; save the place and tariff on each session.
+- Preserve historical charges, free sessions and manually entered costs; offer manual assignment for closed, unmerged charges and spending by place.
+- Guard against stale vehicle forms and merging different place/rate snapshots; avoid reporting priced group pieces as missing costs.
+- Translate the new controls into all eight supported languages. Additive database migration; no reconfiguration of credentials or cloud client.
+- Place costs are estimates without measured charger energy; public roaming/subscriptions and dynamic private-place tariffs are outside this release.
+
+## [4.0.1] — 2026-09-26
+
+- Fix cloud-history settings and trip labels displaying raw translation keys: move 14 misplaced strings into the runtime translation dictionary in all eight locales.
+- Validate locale structure and exercise the real translator to prevent the same regression.
+- No changes to cloud commands, migration decisions or stored data.
+
+## [4.0.0] — 2026-09-26
+
+- Automatic application-profile provisioning using existing certificates and verified public parameters.
+- Bounded staged qualification; shared account-wide backend selection and automatic compatibility fallback.
+- Preserve credentials, PIN, history, MQTT identities and Beta/REEV; no command replay between backends.
+- Integrate PR313 OCM IDs, PR314 command UI fixes, PR318 telemetry/REEV corrections and PR319 ability-48 regression.
+- Native released Desktop 1.0 compatibility checks and Windows migration tests.
+
+## [4.0.0-rc.1] — 2026-09-26
+
+### Italiano
+
+Release candidata della migrazione al client indipendente MATE-API. Comandi V3,
+login coordinato, importazione cloud opzionale, consumi EV coerenti e backup prima
+dell'aggiornamento. Docker e add-on usano la stessa immagine; Desktop lo stesso
+payload. I comandi sono qualificati solo per B10. Non aggiornare automaticamente
+installazioni stabili: seguire docs/MIGRATION-4.md e conservare il backup.
+
+### English
+
+Candidate migration to the independent MATE-API client: V3 commands, coordinated
+login, optional cloud trip import, consistent EV energy and pre-upgrade backup.
+Docker/add-on share the image; Desktop shares the payload. Command qualification
+is B10 only. Stable installations require an explicit migration and rollback plan.
+
+
+## [3.19.2] — 2026-09-25
+
+### Fixed
+
+- **A dropped poll no longer spends one of the few logins the cloud is still granting.** Three
+  bundles reaching 17-18/09/2026 (beta #49 and
+  [#295](https://github.com/ProtossBlaster/leapmotor-mate/issues/295) from
+  [@gm27271](https://github.com/gm27271),
+  [#296](https://github.com/ProtossBlaster/leapmotor-mate/issues/296) from
+  [@adoewa](https://github.com/adoewa), and one from
+  [@ebagnoli](https://github.com/ebagnoli)) carry the same three lines over and over: a
+  `Read timed out`, a session recovery, a refusal. The recovery was a **full login** — it dropped
+  the shared session, refresh token included, and knocked on the one endpoint the cloud started
+  rationing on 17/09: 5-12 accepted a day from an account it used to take ~310 from. A read
+  timeout is a blip, not a dead session. Recovery now spends the **refresh token** first: one
+  signed request against a different endpoint, the session kept, no login used. The full login
+  still runs when the refresh does not hold — which is also the case the recovery was written for,
+  a vanished account certificate, since the refresh is signed with that same certificate and fails
+  with it. This does not make the cloud answer: it stops spending a login on every network blip.
+  A brand-new account was refused identically (@gm27271, 24/09), so what is rationed is the
+  install and not whoever signs in.
+
+### Internal
+
+- **The price box that is on every charge now has a test.**
+  [@adoewa](https://github.com/adoewa) was told on
+  [#308](https://github.com/ProtossBlaster/leapmotor-mate/issues/308) that a charge's cost can only
+  be corrected on one entered by hand. That is true of the edit panel, and it left out the ✎ next
+  to the type badge, which has been on every charge card since v3.16.0 — a measured charge
+  included. Two tests now read the rendered card rather than the template, because what was wrong
+  was a claim about what the owner can see.
+
+### Unchanged
+
+- Nothing stored is recomputed or rewritten by this release.
+- No command is sent to any vehicle.
+
+## [3.19.1] — 2026-09-25
+
+### Fixed
+
+- **A charge in progress stays on screen when you turn the current down**
+  ([#307](https://github.com/ProtossBlaster/leapmotor-mate/issues/307),
+  [@arzthilfe](https://github.com/arzthilfe)). Turning a wallbox from 11 A down to 8 A mid-charge
+  emptied the Overview: only *"cable connected"*, no remaining time, no power, until the session
+  ended. His log holds the moment — the frame is **two seconds old**, so nothing was stale. What
+  flipped was the per-poll charging flag, because the charge-**detection** floor (his, the default
+  2.0 A) refuses a pack current of 1.6 A. That floor exists to notice a charge has *started*; asked
+  whether an open one is still running it answered no, and every charge block reads that flag. The
+  same "one threshold, two jobs" as the 0.00 kW power reading fixed in v3.18.3 — this is its other
+  half. The state machine and the database were right throughout: the session stayed open and kept
+  collecting. The cable is the guard: unplugged, the answer is the poll's again.
+- **Correcting a charge you typed in no longer retypes it**
+  ([#309](https://github.com/ProtossBlaster/leapmotor-mate/issues/309),
+  [@arzthilfe](https://github.com/arzthilfe)). A charge marked **Home** came back **AC** the moment
+  its owner edited a cost, a time or the SoC — and the type is what the price, the statistics and
+  the Charges filter are all keyed on. Both forms offered AC and DC only, so Home, HPC and Free
+  could neither be chosen on the way back in nor created in the first place. Both now offer the
+  five types Mate actually uses, and the type you pick is the type that is kept. The AC/DC tag
+  stays derived, because it describes the socket and not the place.
+- **Kilometres driven while the poller was down are declared instead of dropped.** Measured on a
+  real car: nine days of downtime in which it drove 80 km **and** charged. Mate wrote a
+  reconstructed charge for the battery and nothing at all for the distance — no trip, no offline
+  gap, the odometer simply higher than before. A drive whose SoC went up cannot be rebuilt as a
+  trip (the consumption would be impossible), but the kilometres were real: they are now recorded
+  as an offline gap, which is what that table exists for. The energy is left out on purpose —
+  charge and drive cannot be separated inside one SoC rise.
+
+### Internal
+
+- **Three things nothing was watching now have tests**: the README's version banner (the sixth
+  place a release touches — it read v3.15.9 for eight releases without a single red test, spotted
+  by [@jcconca](https://github.com/jcconca)), the parked-cadence slider, which stopped at 300 s
+  while the form accepted 600 and is now raised to meet it (noticed by
+  [@arekm](https://github.com/arekm)), and the bound that tells a real position from the `(0, 0)`
+  of a poll without a GPS fix.
+
+### Unchanged
+
+- Nothing stored is recomputed or rewritten by this release.
+- No command is sent to any vehicle.
+
+## [3.19.0] — 2026-09-24
+
+### Added (PR #310, @arekm)
+
+- **The Overview map follows the car.** It was drawn once, at page load: on a drive the status card
+  beside it said *"last seen 6 s ago"* while the marker stayed wherever the car had been when the
+  page was opened, until a reload. The map now asks a new local endpoint, `GET /api/last-position`,
+  at the poller's driving cadence and moves the marker. It reads only what the poller already
+  stored — **nothing here reaches Leapmotor's servers**, whatever the car is doing. One request at
+  a time, given one interval and abandoned after it, and none at all while the tab is hidden.
+- **It recentres on the car, and never under your hand.** The map pans only once the car comes
+  within a quarter of the view from an edge — before it reaches the edge, not after. A move that
+  arrives while you are dragging, flinging or zooming waits until the map settles, and a parked
+  car's GPS wander (under 5 m) never moves anything.
+- **The age is in the card's heading** — *"LAST KNOWN POSITION (8s ago)"* — instead of a popup that
+  covered the map above the car and was clipped near the edges.
+
+### Fixed (PR #310, @arekm)
+
+- **A position the map falls back to is dated by itself, not by the poll that had no fix.** When a
+  poll comes back without GPS the map keeps showing the last real position; its age, however, came
+  from the fix-less poll, so a position hours old was labelled *"0s ago"*.
+- **The `(0, 0)` of a poll without a fix is told from a real position in one place.** A car on the
+  equator or on the prime meridian keeps its coordinates: only the pair of zeros means "no fix".
+
+### Unchanged
+
+- Nothing stored changes: no trip, charge, cost or position is recomputed or rewritten.
+- The status card's own *"last seen"* and every other figure on the Overview read as before.
+- No command is sent to any vehicle, and the map's polling adds no cloud traffic of any kind.
+
+## [3.18.3] — 2026-09-24
+
+### Fixed (#307, @arzthilfe · #308, @adoewa)
+
+- **A slow charge showed 0.00 kW while it was charging.** The power reading refused to compute
+  below the *charge-detection* floor — the Settings value whose help text talks about the ~11 A of
+  a home AC charge — so one threshold both decided whether the car was charging, where a floor
+  belongs, and measured how much power flowed, where it printed a zero over a real figure. On
+  @arzthilfe's C10, turned down from 11 A to 8 A and tapering near 87 % SoC, 718.2 V × 1.599 A =
+  **1.148 kW** read as 0.00. The floor stays where it decides; the measurement is now the
+  measurement. Regen, the stuck-counter sum and the peak-power figure each keep their own guards.
+
+- **A four-decimal electricity tariff could not be typed.** The €/kWh field on the Costs page
+  stepped in whole cents, so a browser rejected 0.3024 €/kWh on submit and the price fell back to
+  0.30 — pricing every home charge about half a percent low, silently. @adoewa's charge cost him
+  18.10 € and Mate wrote 17.95. The field no longer rounds; `min` stays, and there is still no
+  maximum, which would block currencies that price a kWh in tens or hundreds.
+
+## [3.18.2] — 2026-09-24
+
+### Fixed (beta #49 @gm27271 · #296 @adoewa · #295)
+
+- **Session recovery retried every 60 seconds for as long as the cloud kept refusing.** Three
+  installs whose logs reach 17–18/09 break the same way, line for line: the cloud drops a poll,
+  Mate asks for a new token — the right move — and the cloud refuses it. It is not a blocked
+  account; logins keep being accepted now and then right through the outage. What the account
+  loses is the rate: the cloud took ~310 logins a day from one install until 16/09 and 5–12 a day
+  from the 17th. Against that, a fixed one-minute retry asked 1 440 times a day — 5 271 failed
+  attempts in four days for ~79 accepted on one install, 4 204 for 14 on another. The gap now
+  doubles per consecutive refusal and stops at half an hour (60s, 120, 240, 480, 960, 1800), so
+  four days cost ~196 attempts instead of 5 271 and the log keeps the shape of an outage instead
+  of a wall. One success puts it straight back to 60s. **The first retry is unchanged at 60
+  seconds**: this path also heals a vanished `/tmp` certificate or one dropped token, which the
+  first or second attempt fixes, and those installs behave exactly as before.
+
+  This does not bring a refused car back online — the refusal is the cloud's and stays the cloud's.
+  It stops Mate making it worse and stops the real cause being buried.
+
+### Documentation (#302 · PR #304 and PR #305, @jcconca · discussion #306, @juan-conca)
+
+- **The Charge Schedule JSON is documented in full**, in English and Italian: the five accepted
+  keys with their types, `days` as a Monday-first mask (the official app displays the week
+  Sunday-first), what merging does to the keys you omit, the one exception for `soc`, and what a
+  refused command leaves untouched. Each line was checked by running the handler, not by reading
+  it. Raised by [@jcconca](https://github.com/jcconca) in PR #304.
+- **The plan field behind the app's "keep charging past the window" checkbox is named.** Mate has
+  always read it and written it back unchanged, and it is still not settable through the JSON;
+  until now the documentation could not say which field it was.
+  [@juan-conca](https://github.com/juan-conca) identified it on a real car in discussion #306.
+- **The README's version banner is current again.** It had stood at v3.15.9 for eight releases —
+  no test covers it, so nothing went red. Spotted by [@jcconca](https://github.com/jcconca) in
+  PR #305.
+
+### Internal
+
+- Two dead locals in the poll loop's setup removed: they were assigned and never read after the
+  per-account state moved onto its own object, and the first of them carried a comment describing
+  the retry guard that this release changes.
+
+## [3.18.1] — 2026-09-24
+
+### Fixed (#303, @arzthilfe)
+
+- **The all-trips consumption average divided an energy wider than the kilometres beneath it.** On
+  the Trips page, the Monthly report and the period views, the *Consumption · all trips* card
+  divided the energy the cloud reports **for the whole period** by the kilometres of the trips that
+  carry a cloud figure **of their own** — and those are not the same driving. A trip keeps its
+  kilometres while carrying no cloud figure whenever it started before that feature was switched on,
+  did not settle within its six-hour re-fetch window, was not reached by the background sweep, or
+  had its reading refused as implausible. On the reporter's C10 the card printed **56.1 kWh/100 km**
+  — 30.3 kWh over 54 of the 156 km recorded — beside a tile that said 20.3 for the same driving, and
+  the error grows as coverage thins with nothing to stop it. The average now divides the energy of
+  **the same trips it counts the kilometres of**, which is what the month and day strips have always
+  done, and the line underneath still names the kilometres it speaks for. Where every trip carries a
+  cloud figure — nearly always — the number is unchanged. Nothing stored is recomputed.
+
+## [3.18.0] — 2026-09-23
+
+### Changed (#297, @arekm)
+
+- **A charge's energy reads the same on every screen.** The charge card has long said both figures —
+  what the charger delivered (the wallbox counter at home, the charger's own kWh typed in elsewhere:
+  the basis of the cost) and what reached the battery. Three places said something else, and now
+  read like the card and the month strip: the Overview's **Last charge** tile, **Total energy** on
+  the Charges page, and **Energy Charged** on Statistics.
+- ⚠️ **Energy Charged on Statistics changes meaning**: it is the energy the chargers *delivered*,
+  with the *in battery* figure beside it. It used to be the battery figure alone.
+- The rule that picks which figure leads moved out of the card's template into one helper,
+  `charge_energy_view`, which the card, its typed-figure line and the Overview tile all read.
+
+### Fixed (#297, @arekm)
+
+- **Totals over a joined charge were wrong.** They applied the rule to the group's summed columns,
+  so a plug-in the car reported in pieces was billed on whatever the meter caught: 12 kWh for a
+  12 + 5 session, and 30 counted where 35 was typed. The sum now runs over the pieces, each on its
+  own rule, and a typed figure counts once for the pieces it covers. New column
+  `charges.gross_kwh_from` records that scope — merging rewrites no row, so nothing else could —
+  with a migration that reads a legacy figure's scope from the costs it left behind.
+- On a joined charge the card leads with what it bills, under the word the totals use for that sum,
+  so the €/kWh beside it divides by the number above it.
+
+### Fixed (#295, @arekm)
+
+- **The charging efficiency was rounded twice, and its own 100 % check read the rounded number.**
+  25.01 kWh into the battery for 25.00 from the wall is 100.04 % — impossible, and exactly what the
+  check exists to withhold — but rounded to a tenth it became 100.0 and passed. And 85.48 % became
+  85.5, then 86 on the card, where v3.17.3 read 85. The ratio is returned unrounded now, the check
+  reads it unrounded, and each page rounds once for display.
+
+Charges already recorded are not recomputed. The figures that move are the ones listed above.
+
+## [3.17.4] — 2026-09-23
+
+### Fixed (#295, @gm27271)
+
+- **The home wallbox meter is read for as long as a charge is open, not only while the car's cloud
+  answers.** A charge opened at 20:35, the Leapmotor cloud failed at 20:38 and came back at 22:04;
+  the meter is in the house and never went away, but the per-poll read sat behind the charging
+  state, which a failed poll never reaches. 86 minutes of metering arrived as one step at the end,
+  where a counter that resets looks exactly like one that rose, and the session came out at
+  7.69 kWh from the wall against 10.03 kWh into the battery.
+- **A wallbox total measured through a blind spell is dropped, and the charge bills on its battery
+  energy.** The minutes a charge spends open at the wallbox with no reading taken are counted;
+  past ten minutes the meter figure is not a measurement of that charge. Home Assistant
+  unreachable, a poller restarted mid-charge while the cloud is dark, or a container stopped for
+  hours all land here. It is the same answer a runaway (#46) or a frozen (#215) counter already
+  gets, and it is decided on the clock, never by comparing the meter against the battery figure.
+- **A charging efficiency above 100 % is no longer shown anywhere.** A charge cannot put into the
+  battery more than the wall gave it. The charge card had hidden such a ratio since it was
+  written; the Wallbox page printed 130.4 % and coloured it green. One rule now serves the card,
+  the session rows and the rolled-up totals. Both kWh figures stay on screen — comparing them is
+  how this was reported — and only the ratio is withheld.
+
+Nothing stored changes and there is nothing to do after the update. Charges already recorded keep
+their figures; they only stop showing a ratio no page can claim.
+
+## [3.17.3] — 2026-09-19
+
+**Fixed (add-on #2, @termy91it):** the price typed by hand is back where it was, and the charges priced
+that way are no longer asked for again. v3.16.0 moved the total you paid out of the *Manual* type into
+a ✎ of its own — so that it no longer took the place of Home, AC, DC or HPC — and in doing so took away
+the way people used it: the type menu lost its *Manual* row, every charge already priced by hand came
+back as **❓ To confirm** and into the count at the top of the Charges page, and a price typed on a new
+charge no longer settled it. That was a regression. Now a charge whose price was typed by hand and that
+has no type reads **✎ Manual** again, as it did until v3.15.18, and it is not a charge to confirm: not
+on its badge, not in the count at the top, not in the Home vs Public card, not in the monthly report.
+The type menu has its **✎ Manual** row again, with the box for the total paid. Nothing to do after the
+update: the charges priced before v3.16.0 read ✎ Manual again with their price, which was never lost.
+The price stays separate from the type: picking a type keeps the price typed, and typing a price on a
+charge that has a type keeps the type. The Home vs Public card and the monthly report give the Manual
+charges a line of their own, and the search can filter them again.
+
+## [3.17.2] — 2026-09-19
+
+**Changed (@michapr, @gm27271, beta #31):** a trip's summary is laid out in **boxes**, on every car:
+distance and duration, then the electricity the trip used — energy, consumption and the price per kWh
+it was billed at — and, on a range extender, the fuel beside it with the litres, the L/100 km, what
+they cost and the **price per litre**, then the total with its cost per 100 km. It is the layout
+@michapr built on the beta, and the figures are the same ones from the same sources: only where they
+sit changes. On an electric car it is the same card without the fuel. On a generator trip the
+kilometres the generator drove keep the line that says they are a floor, and the electric rate stays
+off the card as before, because getEC over the whole distance is not what the car consumed. The
+electric-vs-generator bar of that layout is not included: its electric share would be the distance
+minus a floor, a ceiling drawn as a fact. The card fits the narrow column a 1024 px window gives it, in
+every language.
+
+## [3.17.1] — 2026-09-18
+
+**Fixed (#294, @synvoll):** a wrong Home Assistant URL could lock you out of Settings. With a URL that
+carries a path — a dashboard link, say — the wallbox card's connection test reached Home Assistant's web
+page instead of its API, took that page for a success and put it into Settings, scripts included: the
+page turned into "Could not load Home Assistant", and the field to correct the URL was on that page. A
+URL that answers with a web page is now reported as *not the Home Assistant API*, with the base address
+to use instead, and nothing that comes back from that address reaches the page as code any more — which
+also closes a way for whatever answered there to run scripts inside Mate.
+
+**Changed (@michapr):** a trip is kept from **200 metres**, no longer from 500. Shorter drives were
+deleted outright, so a 330 m trip to the bakery disappeared from the kilometres and from the list. Below
+200 m a movement is still a manoeuvre and is still dropped. A short trip keeps its distance and shows no
+average consumption, which over a few hundred metres would only be noise. Trips deleted before this
+version are not recovered.
+
+**Fixed:** a command left *retained* on the MQTT broker is no longer executed. Home Assistant sends its
+commands unretained, but anything else on the broker — a script, an automation publishing with retain —
+could leave one there, and Mate ran it again every time it restarted or reconnected: an unlock, a trunk,
+a climate start. A command now runs only when it is sent.
+
+## [3.17.0] — 2026-09-17
+
+**Added (#292, @Kuli1111):** **A/C Auto** in Home Assistant. The Commands page has always had the
+plain "turn the climate on" — the car decides cool or heat itself and works toward the target
+temperature — but the MQTT bridge never carried it: an automation could only start the climate in
+Quick Cool, Quick Heat or Quick Ventilation, each of which pins a mode. The button is published as
+**A/C Auto** and sends exactly what the page sends, target temperature included, taken from that
+car's own last reading. On a T03 it falls back to manual cooling, the one mode that firmware honours.
+
+**Added:** **Preheat Battery** in Home Assistant. The same gap, on the Quick action the Commands page
+has had all along and nobody had reported: it is now a button like the others, so an automation can
+warm the battery before a fast charge.
+
+**Added:** every charge now records **why it stopped** — cable unplugged, charge deferred to its
+programmed window, car gone quiet, driven away, cloud outage, or reconstructed after a blackout. The
+word is written when the charge closes and appears in the diagnostics bundle beside `recon=`, which
+is where a report like #289 has to be answered from. Nothing changes in the pages: charges already
+recorded keep an empty reason, and the column is filled from this version on.
+
+## [3.16.0] — 2026-09-16
+
+**Changed (PR #284, @hubcasale):** a price typed by hand no longer costs a charge its type. Until now
+the real total paid was entered by picking **Manual** on the type badge, and that value took the
+place of Home, AC, Fast or HPC in the same field: the charge stopped being findable by type, and its
+badge read *✎ Manual* instead of what it had been. The two are separate now — the total goes into a
+**✎** beside the badge and is kept in a column of its own (`cost_manual`, added on the first start),
+and the badge answers only "what kind of charge was this". Confirming a type no longer recomputes a
+price that was typed, and the cost on the card says which of the two figures it is showing: **est.**
+for the computed one, **billed** for the one you typed, with *Reset* to go back to the estimate.
+
+**Changed (PR #284, @hubcasale):** a charge left on the old **Manual** type reads **❓ To confirm**
+and keeps the price typed on it; one click on its badge puts back the type it really had, without
+touching that price. Mate does not guess that type: what the charge was before cannot be recovered
+from the row, and guessing it wrong would silently reprice real money.
+
+**Added (PR #284, @hubcasale):** a **Home vs Public** card on the Charges page, beside *AC vs DC* —
+Home, Public and To confirm, as a donut and three tiles which always add up to the number of charges
+written above them. A charge still waiting for its type is shown as waiting instead of being counted
+as public.
+
+**Fixed (#289, @juan-conca):** a charge could stay open all night and be booked at nineteen hours
+instead of four. When a car goes to sleep the Leapmotor cloud does not say so — it hands back the
+last frame it holds, over and over. If the current had just stopped with the cable still in, that
+repeated frame goes on reading "cable connected", which is what deliberately keeps a session open
+across a wallbox pause, so the charge stayed open until the car woke up the next morning — and it
+was not in the list at all until it closed. Mate now gives up on a charge held open only by a frame
+the cloud has repeated for thirty minutes, and dates it from the last reading taken while current
+was actually flowing. A pause arrives on fresh frames and is untouched, and so is a car still
+charging out of reach, whose frame keeps reporting current. Energy, SoC and peak power were always
+right and do not change; charges already recorded keep the duration they were given.
+
+## [3.15.18] — 2026-09-15
+
+**Fixed (#279, @pdifeo):** in a joined trip, the notes of the pieces after the first showed their
+start and end times in UTC, while the time of the trip above them was local. For an owner in Italy, a
+trip starting at 05:53 listed its later notes at 04:04 → 04:28 and 04:30 → 04:37, two hours early.
+Those notes, added in v3.15.10, reached the page with the times exactly as stored; they now go through
+the same conversion as the trip's own time, in whatever zone Mate is set to. Nothing stored changes.
+
+## [3.15.17] — 2026-09-14
+
+**Fixed (#282, @Coooogz):** a T03 west of the Greenwich meridian was drawn on the east side of it — a
+drive from a home 30 km west of the line to work 100 m east of it showed as 30 km heading east. The
+T03 sends its coordinates as named fields that already carry their sign, and Mate filed them only in
+the slots it keeps for the bare *magnitudes* a C10 or B10 sends; the slots for signed coordinates
+were mapped to field names no T03 response contains. So every T03 position lost its minus and took
+the hemisphere Mate remembered, which it could only have learned from positions already stored
+without one. Both copies of that map — the poller's and the Refresh button's — now put `latitude`
+and `longitude` in the signed slots. Nothing changes for a car east of Greenwich, and a C10 or B10
+does not go through this code. Positions already recorded keep the side they were stored on: near
+the meridian there is no telling which of them were really west.
+
+**Fixed (#283, @fabiodim):** the setup wizard accepted a certificate it could not read, and the only
+symptom was a login that failed from then on with `[SSL] PEM lib`. The upload looked for the text
+`-----BEGIN CERTIFICATE-----`, which a file cut short, a certificate flattened onto one line and a
+saved web page showing it all contain. The two files are now opened the way the login opens them
+before they are kept. A pair that does not open is refused with a message, in the wizard's language,
+naming what is wrong — the certificate, the key, or a key that belongs to another certificate — and
+the pair already saved is left untouched. A certificate saved earlier that cannot be read no longer
+counts as present either, so the wizard offers the certificate step again instead of skipping
+straight to a login that cannot work.
+
+## [3.15.16] — 2026-09-13
+
+**Added (beta #31, @michapr):** the trip's cost per distance, under the total it comes from —
+`12.87 €/100 km` beside the `12.48 €`. The card carried the total and the rate the electricity was
+billed at, but not the figure that lets two trips of different lengths be compared. It uses the same
+denominator as the Statistics card, so a reader in miles gets it per 100 mi, and on a range extender
+it spans both sources because the total does.
+
+**Changed (beta #31, @michapr):** the block of secondary readings at the foot of a trip — battery
+level start→end, odometer, speeds, elevation, temperature, GPS points — folds. It ships open, so
+nothing is hidden from a reader who never touches it.
+
+Both come from the layout @michapr built and attached to that discussion. His third idea — the
+electricity and the fuel side by side instead of stacked — was built, measured on the rendered page
+and reverted: it is right on his screen, where the card is the full width of a phone, and wrong on
+ours, where the card is the first column of a three-column page. Measured there, the two columns
+came out 87px wide at a 1024px viewport and 148px at 1600px, and the fuel area halves its own width
+again — about 70px for `5.4 L/100km`.
+
+## [3.15.15] — 2026-09-12
+
+**Changed (beta #31):** the trip page's summary card is arranged in three areas — the trip
+(distance, duration and the total cost, now the largest figure on the card), the electricity, and,
+on a range extender that burned something, the fuel. Every figure it showed before is still there:
+none is computed differently and none was dropped. The litres and the L/100 km moved out of the
+energy tile into the fuel area, where the generator's own distance joins them, beside the petrol
+that produced it and still marked as a floor. The block at the foot of the card keeps what lives
+nowhere else: the battery and tank start→end, the split between the kWh paid for at a plug and the
+kWh the generator supplied, and the note on what the electric figure measures.
+
+**Fixed:** on a range-extender trip where the generator ran, the card printed `Avg consumption` over
+a dash. That figure is withheld on purpose — a ΔSoC consumption means nothing once the generator
+refills the pack mid-drive — so the label is no longer printed either, and the electricity area
+takes a single column instead of leaving an empty cell beside it. A car with no tank keeps its
+`Avg consumption`, `Energy used` and `Regen` tiles and gains no section headings: with one source
+there is nothing to tell apart.
+
+**Not included:** the share of the distance driven on electricity against the generator, which the
+same request asks for. There is no "generator on" signal in the cloud, the generator's kilometres
+are counted from the fuel drop and are short in one direction only (54.0 against a dashboard's
+60.2), and subtracting them from the distance inherits that error — over 32 real trips, 8 of the
+remainders went to zero or negative.
+
+**Tests:** the eight that pinned the old arrangement were rewritten around the same questions, not
+removed: the generator's distance must still be legible rather than footnote type, neither fuel
+figure may be torn from its unit, a car with no tank must gain no fuel line, and the five figures
+that live in one place each must still have a place. Four new keys in all eight languages.
+
+**Upgrade impact:** template and translations only. No database schema, migration, dependency,
+stored data or MQTT change, and no figure on the page is calculated differently. Rollback to
+v3.15.14 requires no data conversion.
+See [release and rollback notes](docs/releases/v3.15.15.md).
+
+## [3.15.14] — 2026-09-12
+
+**Fixed (#280):** an account with more than one car could not finish the setup wizard. The wizard
+draws a card per car and posts the answers as `vehicles_json`, but the check that runs on submit
+read only the single-car `battery` field — which the multi-car branch never fills. The result was
+"Please select a battery variant first." on a form where every pack *was* selected, with no way
+past it. The check now validates what is actually posted: every car must carry its own pack. The
+defect dates back to v3.13.0, the release that introduced the per-car cards.
+
+**Fixed:** on a multi-car account the account-wide capacity setting was left empty and fell back to
+65.0 kWh — a pack nobody had chosen. It now mirrors the first car's own answer, range-extender flag
+included. Each car's own capacity was, and remains, stored per vehicle.
+
+**Fixed:** a car whose model Mate does not recognise drew a card with a `Battery pack` heading and
+nothing under it, so its owner had nothing to choose and, with the check above, no way forward. The
+card now offers the same manual kWh field the wizard already shows when a single car is not
+recognised, feeding that car's own answer.
+
+**Tests:** six scenarios run the wizard's own JavaScript, rendered from the real template, in Node:
+two cars through, the account-wide mirror, a car with no pack refused, its manual field accepted and
+posted, the single-car path unchanged, and an empty form still refused. A second test guards the
+same invariant without Node.
+
+**Upgrade impact:** template-only change. No database schema, migration, dependency, stored data or
+MQTT change. An installation already set up is unaffected: this is the first-run wizard. Rollback to
+v3.15.13 requires no data conversion and restores the block.
+See [release and rollback notes](docs/releases/v3.15.14.md).
+
+## [3.15.13] — 2026-09-11
+
+**Fixed (#276):** on the Maintenance page, the `+ Log` button of every service card did nothing.
+It was a disclosure with no content, so a click opened an empty box, while the form that records a
+service sat further down the card behind a second, grey `✎ Mark this service as done` line. The
+button now opens that card's form and places the cursor on the date. The duplicate line is gone and
+its wording remains as the button's tooltip. The defect dates back to the page's introduction in
+v1.22.0.
+
+**Tests:** four new tests render the real template over the real B10 service pack and check that
+each card has exactly one log control, that it opens that card's own form, that the form starts
+closed, and that no empty disclosure remains.
+
+**Upgrade impact:** template-only change. No database schema, migration, dependency, stored data
+or MQTT change. Rollback to v3.15.12 requires no data conversion and restores the previous two
+controls. See [release and rollback notes](docs/releases/v3.15.13.md).
+
+## [3.15.12] — 2026-09-10
+
+**Added (#277):** the software-update notice Mate finds in the Leapmotor account inbox is now
+published to Home Assistant as an `OTA Update Notice` binary sensor, with the message title and its
+send time as attributes. The value comes from the inbox scan the poller already performs every ten
+minutes, so the entity costs no additional cloud request. The notice belongs to the account, not to
+a car: on a multi-vehicle installation it is published under every VIN, exactly as the Overview
+shows it for whichever car is selected. It reports that an update message exists, not that a vehicle
+has an update pending, and carries no version number because the vehicle cloud publishes none.
+
+**Changed:** update detection is stricter. The previous keyword scan matched substrings, so `ota`
+matched inside unrelated words and a lone `upgrade`, `aggiornamento` or `mise à jour` matched
+membership offers and terms-of-service notices. Acronyms now match as whole words and a generic
+update word only counts next to a software or vehicle word, across the eight supported languages.
+The stricter match also applies to the Overview indicator.
+
+**Tests:** sixteen new tests cover the tightened detection in every supported language and the new
+entity, including its account-level scope, its attributes and a malformed timestamp.
+
+**Upgrade impact:** no database schema, migration, dependency or stored data changes. The new
+entity is created by MQTT discovery when the poller reconnects after the update. Rollback to
+v3.15.11 requires no data conversion; it removes the entity and restores the previous, looser
+update detection. See [release and rollback notes](docs/releases/v3.15.12.md).
+
+## [3.15.11] — 2026-09-09
+
+**Fixed (release metadata):** the application version now matches the published release and
+changelog after v3.15.10 shipped with its internal version still reporting 3.15.9. The joined-trip
+note correction from #279 is unchanged.
+
+**Tests:** the version-to-changelog release guard is included in the complete project suite.
+
+**Upgrade impact:** metadata-only corrective patch on top of v3.15.10. No database schema,
+migration, dependency or stored data changes. Rollback to v3.15.10 requires no data conversion.
+See [release and rollback notes](docs/releases/v3.15.11.md).
+
+## [3.15.10] — 2026-09-09
+
+**Fixed (#279):** joined trips now retain and display the automatic notes from every later
+segment instead of showing only the first trip's note. Additional notes appear chronologically
+with their segment times and remain stored on their original trip, so splitting the journey
+restores every note unchanged.
+
+**Tests:** focused note and merged-summary checks passed 14 tests. The complete suite passed
+3,280 tests with 8 intentional skips; the remaining output consists only of dependency
+deprecation warnings.
+
+**Upgrade impact:** normal patch update for Docker, Home Assistant and MateDesktop. No database
+schema, migration or stored data changes. Rollback to v3.15.9 requires no data conversion.
+See [release and rollback notes](docs/releases/v3.15.10.md).
+
+## [3.15.9] — 2026-09-07
+
+**Fixed (#278):** B05 live-status reads now use the same model-aware status-path fallback as
+the poller. Vehicle, Refresh, raw-signal diagnostics and charge-plan reads try the reported
+model once, retry through the working `c10` family path when necessary, then remember that
+path per VIN. The vehicle keeps its real model for commands, capabilities and battery sizing.
+Models whose own status path works are unchanged, and a failed fallback is not repeated on
+every request.
+
+**Changed:** Pillow is now an explicit dependency because the SDK it came with does not
+publish the documented `image` extra. AnyIO is constrained below 4.15 while FastAPI 0.115.0
+uses Starlette 0.38, avoiding their incompatible deprecated alias without a framework upgrade.
+
+**Tests:** the research-bundle location guard now distinguishes complete numeric coordinate
+values from the same digits inside timestamps. Release verification passed 3,298 tests with
+one intentional documentation skip and deprecation warnings treated as errors.
+
+**Upgrade impact:** normal patch update for Docker, Home Assistant and MateDesktop. No database
+schema, stored setting, command path or user data changes. Rollback to v3.15.8 requires no data
+conversion. See [release and rollback notes](docs/releases/v3.15.9.md).
+
+## [3.15.8] — 2026-09-06
+
+**Fixed (beta #44):** Statistics and Energy-by-date-range now aggregate merged trips as one
+logical journey, using the same group distance and efficiency as the Trips list. A reported
+1 km + 6 km group with 0.4 kWh previously counted as two trips, credited only 1 km of energy
+coverage and computed 0.06 kWh locally. It now counts once, covers 7 km and computes about
+0.40 kWh. Date windows follow the parent's start date, including groups crossing midnight.
+REEV measured/battery-only rules, missing values, SQLite rounding and exclusion of reconstructed
+blackouts from driving time are retained. Stored trip segments are never rewritten.
+
+**Fixed (beta #13):** encrypted research-bundle generation runs outside the web event loop.
+The download shows preparation/success/error feedback in all eight languages; duplicate clicks
+are ignored and concurrent exports receive HTTP 409 rather than starting more work. Local and
+cloud reads stay on the export's selected vehicle even if the sidebar selection changes.
+All existing bundle sections and encryption remain; cloud requests can still take minutes.
+Per-stage timings are included in metadata and web logs; final archive/encryption and total
+timing are recorded in logs only. No cloud endpoint, timeout or retry policy was changed.
+
+**Clarified (beta discussion #42):** cloud-covered distance and measured battery-only trip
+distance are not interchangeable. Statistics uses the latter for REEV when available; Trips
+and Report retain their existing cloud-coverage basis. REEV/standard unification is not part
+of this release.
+
+**Upgrade impact:** normal patch update for Docker and Home Assistant; MateDesktop receives
+the payload through its existing updater. No new dependency, shell installer, database migration,
+data deletion or settings reset. Existing merged histories may show corrected statistical totals.
+See [release and rollback notes](docs/releases/v3.15.8.md).
+
+## [3.15.7] — 2026-09-05
+
+**Security:** standalone Mate with an access password could be made to treat a protected page or
+API endpoint as though it were the public static directory. The affected Starlette version builds
+`request.url.path` from the unvalidated HTTP `Host` header, while routing still uses the real ASGI
+path; a crafted `Host` could therefore make the authentication middleware inspect one path and
+execute another. Mate now makes every authentication, setup and cross-site-write decision from the
+path supplied by ASGI routing. The released regression test reproduces the old unauthenticated
+`204` write and requires `401` after the fix.
+
+**Security (MateDesktop):** the desktop shell opens Mate at `127.0.0.1`, but the payload was
+listening on every network interface. That made a default Desktop install — which has no separate
+web password because it is meant to be local — reachable from another device on the LAN. In
+MateDesktop the web server now binds only to `127.0.0.1`; Docker and both Home Assistant add-ons
+continue to bind to `0.0.0.0` and remain reachable through their normal port mapping or ingress.
+Someone deliberately using the Desktop payload as a LAN server must use the Docker deployment
+instead.
+
+**Changed (CI):** continuous integration now installs the complete poller and web production
+requirements plus the test-only `httpx` dependency. This turns on the web/API/middleware tests
+that the former minimal environment silently skipped. The release was checked from an empty
+Python 3.12 environment: **3244 tests passed, 5 were intentionally skipped**, the Docker image
+built, standalone rejected the crafted request with `401`, add-on ingress writes still returned
+`204`, and the Desktop listener was `127.0.0.1`.
+
+**Upgrade impact:** this is a normal patch update. It changes no dependency, database schema,
+stored setting, API contract or container volume. Docker and Home Assistant users receive the
+usual image replacement and restart; their data remains in `/data`. MateDesktop receives the
+payload on its next launch and needs no new desktop-shell installer.
+
+## [3.15.6] — 2026-09-04
+
+**Fixed:** on a **range-extender**, the Statistics average called itself measured and was not.
+Mate writes a trip's consumption at the end of the trip from the battery percentage, and replaces
+it with the figure the car itself measured only once the cloud reports that trip — so every trip
+the cloud never covered was carrying an estimate into the one average whose wording promises
+measurements (@michapr, beta #43). Those trips are now out of that average and out of the Energy
+card on the same page. On his bundle that is **4 trips and 5 km of 625**: the number reads the same
+at one decimal, and the line under it now says 620 km instead of 625. The four it drops are 1-2 km
+hops reading 35.7 and 18.8 kWh/100 km, which is what a battery percentage does over one kilometre.
+Full-electric cars are unaffected — there the label promises nothing about the source and every
+trip carries a figure. The local total that catches a cloud period far below Mate's own trips is
+deliberately left counting everything, since a reference blind to the trips the cloud missed is the
+wrong yardstick for judging what the cloud reported.
+
+**Changed:** in all eight languages, "over battery-only kilometres" became "over the kilometres of
+**battery-only trips**". A trip the generator ran also covers kilometres on the battery, and
+nothing in the data says which — so the old phrase claimed a number Mate does not have
+(@michapr, beta #43).
+
+## [3.15.5] — 2026-09-02
+
+**Fixed:** on a **range-extender**, the Trips page printed two electric averages under one word.
+v3.15.4 moved every copy of the Energy card to the battery-only pair the Statistics page divides,
+and on the Trips page that card sat under a month strip that divides by the getEC kilometres — the
+basis the Trips page has used since beta #24 → #40, on purpose: that page is about the recorded
+trips, all of them. One July read **14.1 kWh/100 km over 252 km** on the card and **10.1 over
+395 km** on the strip above it (@michapr, beta #41). The Trips and Report copies of the card are
+back on the getEC basis, the one their own strips and tiles use, and their coverage line says
+"over N km" again. The Statistics card alone keeps the battery-only pair and its explanation,
+because that is what the rest of that page shows. Nothing changes on a full-electric car.
+
+## [3.15.4] — 2026-09-01
+
+**Fixed:** on a **range-extender**, the Energy card's average consumption was diluted by the
+kilometres an engine drove. getEC measures the energy that *leaves the battery*; on a series hybrid
+the generator can send power past the pack straight to the wheels, and getEC never sees that path.
+A mixed trip therefore carries a getEC figure and landed inside the denominator v3.15.2 introduced,
+while an engine moved most of it — measured across three owners' bundles, the trips with the
+generator running read 4.8 and 6.5 kWh/100 km against 14.3 and 16.1 on the same cars without it.
+No car does 4.8. One of @michapr's months read **10.7 over 992 km** on this card and **14.3 over
+625 km** on Statistics: two numbers for one month, 33 % apart (beta #41). Mate already blanks the
+efficiency of every trip the generator ran, so it already held the battery-only pair the Statistics
+card divides — the Energy card now divides that same pair, and the line beneath it ("over
+battery-only kilometres") describes the figure again instead of a mixed one. A full-electric car
+carries an efficiency on every trip, so both bases agree there and nothing about it changes.
+
+**Changed:** the Energy card now carries the same explanation the Statistics card has always had —
+why a range-extender's electric average covers only part of the driving — instead of leaving it in
+one place only.
+
+## [3.15.3] — 2026-08-31
+
+**Fixed (tests only):** nine of v3.15.2's new tests read helpers out of `web.main`, which imports
+FastAPI — a package the continuous-integration environment deliberately does not install. They
+failed there while every assertion that could run passed, which left v3.15.2 tagged with a red CI
+over a green codebase. They now skip where FastAPI is absent, the pattern the rest of the suite
+already uses. No change to Mate itself: same code, same behaviour, same image contents as 3.15.2.
+
+## [3.15.2] — 2026-08-31
+
+Ten fixes from the 30/08 audit and from beta #40, none of them changing how anything is meant to
+work — only making it do what it already said.
+
+**Fixed:** the **all-trips consumption** figure was an average over kilometres its energy never
+described, so it could sit *below* every month it averaged (beta #40, @michapr): 106.2 kWh spread
+over 1172 km read 9.1 kWh/100 km, where the same energy over the 992 km the cloud actually covered
+is 10.7 — between his July and August, where an average belongs. It now divides by the kilometres
+it speaks for, exactly as the monthly figures already did, and a line under it says how many those
+are. The distance beside it still shows what the car drove.
+
+**Fixed:** with two REEVs, the **second car's older refuels were never found**. The scan walks one
+car's tank log but remembered how far it got in a single setting shared by the whole install, so
+the first car to run it carried the others past their own history — and the mark only moves
+forward.
+
+**Fixed:** the **generator distance** printed a hard-coded "km" after an unconverted number, on
+pages that are otherwise unit-aware: an imperial install read miles everywhere and kilometres on
+those two lines.
+
+**Fixed:** a charge that **cost nothing** — the free tick, a band priced at 0, solar covering a
+whole session — rendered exactly like one nobody has priced: grey, and a dash.
+
+**Fixed:** with no GPS fix, Mate asked for the **weather at 0,0** — in the Gulf of Guinea — and
+stored it as the car's outside temperature.
+
+**Fixed:** a charge **imported at exactly 00:00** was moved to noon, into a different time-of-use
+band and out of round-trip with Mate's own export.
+
+**Fixed:** **CSV exports** wrote free-text columns straight out, and a cell beginning `=`, `+`, `-`
+or `@` is a formula to Excel and LibreOffice — including station names, which come from
+OpenStreetMap and can be edited by anybody.
+
+**Fixed:** the **car picture** was cached by byte count, so two cars whose image packages weigh the
+same were served each other's.
+
+**Fixed:** a **command sent to one car** was replayed onto whichever car you selected next, for up
+to thirty seconds.
+
+**Fixed:** **Climate Power** and **Fan Level** published an empty string when the car stopped
+reporting them, which Home Assistant logs as a conversion error rather than reading as unknown.
+
+## [3.15.1] — 2026-08-31
+
+**Fixed:** one physical charge could be recorded **twice**. On the poll that closes a charge, Mate
+finalised it and then, a few lines later, looked at that same poll again, saw a parked car with
+nothing open and a battery far above the previous reading, and filed the charge a second time as a
+"reconstructed" one. It needed a car-to-cloud link that had gone dark mid-charge, which is exactly
+when it happened: a 40 → 78 % session came out as 24.7 kWh *and* 20.8 kWh, so the charge count, the
+kWh totals, the calendar and the monthly report all carried that energy twice. A charge that closes
+on a poll now owns its own battery rise; charges that happened while the car was asleep are still
+reconstructed as before.
+
+**Fixed:** a charge that **ended while the cloud was unreachable** was left open, and the next
+plug-in was recorded inside it. Mate closed a charge when the car went from charging to parked or to
+driving — but a charge that ends during an outage goes charging → offline → parked, which is neither.
+Two sessions, possibly at two different places and on two different price bases, became one row
+carrying the first one's location, wallbox attribution and starting percentage. Such a charge is now
+closed on the last reading taken *while it was still charging* — the same answer Mate already gives
+for a car that drove away — and only once the cable is out, so a charging pause is still a pause.
+
+## [3.15.0] — 2026-08-31
+
+**Added:** a new **Solar kWh (manual)** pricing mode for Home, for owners with solar and no Home
+Assistant helper (#272). Type, charge by charge, how many kWh came off your own roof; Mate subtracts
+them from the energy the wallbox measured and bills only the rest. The charge card writes the sum
+out in full — *20.0 delivered − 8.0 solar = 12.0 paid* — so a number typed the wrong way round shows
+itself at once, and a figure larger than the wallbox measured is refused rather than quietly
+clamped. The field appears only on home charges the wallbox actually measured; where it mapped but
+missed one, a line says so instead of the field silently vanishing. As with every pricing mode, the
+energy Mate reports for the charge does not change — your figure only makes the cost.
+
+**Fixed:** a charge at a mapped wallbox could lose its **measured** energy and fall back to billing
+the battery estimate, purely because the car's link went dark. When the cloud loses a car it re-serves
+the last frame it had — same payload, poll after poll — and that frozen frame still reads "7 kW", so
+Mate kept crediting the car with energy it was no longer drawing while the wallbox counter, correctly,
+stood still. Past 3 kWh of that fiction — about 26 minutes at the default cadence — the meter was
+declared dead and its total discarded. Repeated frames no longer count as energy drawn; a genuinely
+stopped meter is still caught.
+
+**Fixed:** the help under the **typed charger kWh** field said the energy Mate reports "stays the one
+measured at the battery". That stopped being true when the typed figure became the energy reported
+for the charge, and two other places in the app already said so correctly. It now names the figure:
+the **gross** kWh, conversion losses included.
+
+## [3.14.27] — 2026-08-30
+
+**Fixed:** the map's **"Trips shown"** and **"Stations shown"** boxes could lock you out of
+themselves (#270). They live on the map's legend row and nowhere else — not in Settings, not in a
+URL — and that row only rendered when there was a map to draw. Set "Trips shown" to 1, land on a
+most-recent trip that carries no GPS point, and the empty-state card took the only box that could
+undo it down with it. The boxes now render either way; the empty state also says *which* emptiness
+it is, instead of telling you to go and drive when a filter is what hid the map.
+
+**Fixed:** the map's **"GPS points"** counter has shown a dash on every map Mate has ever drawn. It
+was filled by a line of script that looked for an element appearing further down the same document,
+so it never found it. It is counted server-side now and no longer depends on the map script running
+at all.
+
+**Fixed:** a merged charge with a **hand-typed total** priced the whole group at the wrong rate:
+10 + 5 kWh for €6.00 came out at €0.60/kWh instead of €0.40, because the readers that blend prices
+walked the individual rows while the cost belongs to the group. Three of them did it — the blended
+home price, the REEV paid-stock replay, and the Statistics average €/kWh — and all three now compose
+the group the same way the page does. Nothing is rewritten in the database: a confirmed cost stays
+exactly the number you confirmed.
+
+**Fixed:** with **time-of-use** pricing, a `0.00` nobody ever typed was read as *free* rather than as
+*no price set*, so charges you actually paid for were reported at zero — while the flat-rate mode
+read the same zero as *unknown*. The two modes now agree; a zero typed **inside a band** is still a
+real price, and the price form no longer pre-fills empty fields with `0.00`.
+
+**Fixed:** with **"I always charge at home"** on, charges were born with the Home badge and **no
+cost** — the pricing engine only ever ran on a confirmation, and a charge born already confirmed went
+through neither path. The period spend and the average €/kWh count only priced charges, so they
+excluded every single one: turning the option on quietly stopped you seeing what you spend. They are
+now priced by the same route as a manual confirmation, backlog included. A cost already entered is
+never touched, and a charge marked free stays free.
+
+**Fixed:** on an account with **two cars**, an MQTT climate command re-read the newest row of
+`positions` with no filter on the car. The cloud has no "change only the fan" command — the whole
+panel is sent back — so asking the C10 for more fan could carry the T03's mode and target
+temperature and change the rest of the panel with it.
+
+## [3.14.26] — 2026-08-30
+
+**Fixed:** the **Custom kWh** pricing mode (beta #13) could not be chosen. The Costs page offered it,
+but the save dropped it and the menu came back on *Fixed* — the mode list existed in three copies and
+only one of them had learned the new mode when it shipped in 3.14.24. The three are now one list, and
+a test pins the page's menu to it. Same cause, second symptom: with Custom kWh selected the menu
+marked **two** options at once (the browser shows the last, so it looked right).
+
+**Fixed:** on an account with two cars, the Statistics energy split, the consumption rank and the
+since-delivery totals were cached **per account instead of per car** — open them on one car, switch,
+and for up to six hours the other car showed the first one's kilowatt-hours and lifetime kilometres
+under its own name. The REEV page shares that cache and is fixed with it.
+
+**Fixed:** the **Refuels** page and both its calendars summed *every* car's refuels while the
+Statistics spend card summed only the selected one — two different numbers under the same word.
+Editing or deleting can no longer reach a refuel that belongs to the other car, and confirming a
+*detected* refuel now files it under the car that actually burned the fuel instead of the one in the
+sidebar (the detection row is deleted right after, so filing it wrong could never be repaired).
+
+**Security:** the shared Leapmotor session — access token, refresh token and the account's TLS
+**private key** — was the one secret written to the database in the clear, bypassing the encryption
+every other secret uses. The database backup is a copy of that file, and the export page tells you it
+contains *encrypted* credentials. It does now. Existing installs keep working with no re-login and
+are re-encrypted on the next save; if you have already shared a backup, sign out and back in to
+rotate the token.
+
+## [3.14.25] — 2026-08-30
+
+**Fixed:** the Statistics “Consumption vs outside temperature” tooltip no longer shows
+`undefined` for electric kWh or petrol litres. The chart stores the plotted consumption in its
+standard `y` value; the tooltip now reads that value and ignores trend-line points, which have no
+trip metadata. Added a regression test for both behaviours (beta #38).
+
+## [3.14.24] — 2026-08-30
+
+**The kilometres the generator drove are a figure now, not a footnote** (beta #31, reported by
+**@gm27271**). On a range-extender trip that distance was printed at the end of the note explaining
+what the electric figure measures — after 41 words of prose, joined to them by a `·`, at 10px in the
+same grey the sidebar prints the build number in. His words, after two weeks of the thread going the
+other way: *"let's display this distance in crappy comment after loads of text like today"*. It now
+has a line of its own, above the note: **⛽ 25 km with the generator running**.
+
+Nothing about the number changed — only where it sits. And because a figure on its own line claims a
+confidence a footnote does not, the line says what it is: **at least** that far. There is no
+"generator on" signal in the car's cloud, so those kilometres are counted from the samples where the
+odometer rises *and* the fuel falls; the stretches where the odometer has not refreshed yet cannot be
+judged, and the count comes out short in one direction only — 54.0 km against the 60.2 the
+dashboard showed on the drive it was measured against.
+
+Range-extender models on the BetaTester build; a car with no tank is unchanged.
+
 ## [3.14.23] — 2026-08-29
 
 **Three charts that drew the wrong thing, or nothing at all.** Three reports in one day, none of
@@ -1130,15 +3148,15 @@ now takes you to the charge.**
   the *shape* of the command that decides, not the value.
 
   This had been open for months, and not only here: every integration in the ecosystem sent one of
-  the two forms the T03 ignores (kerniger/leapmotor-ha#28, markoceri/leapmotor-api#9). It was
+  the two forms the T03 ignores (kerniger/leapmotor-ha#28 among them). It was
   genuinely hard to see, because the cloud answers "accepted" to all three — so no log, on anybody's
   machine, could tell a command that worked from one the car threw away. The only instrument that
   ever worked was somebody watching their own car.
 
   **Found and verified on-car by [@derekzoli](https://github.com/derekzoli)**, who tested the
   candidates on his own T03 on 6-7 August, confirmed the winner by re-reading the vehicle state a few
-  seconds later and watching the A/C actually stop — and then brought the answer back to the report
-  we had opened at markoceri/leapmotor-api#9, rather than keeping it. He also built his own app,
+  seconds later and watching the A/C actually stop — and then brought the answer back to the public report
+  we had opened, rather than keeping it. He also built his own app,
   [MyLeapCar](https://github.com/derekzoli/myleapcar), on the way there. Mate's own hunt (seven
   candidate payloads, offered to T03 owners since v2.1.6) had searched the same grid in the wrong
   direction and missed it; that page is now retired, along with its buttons.
@@ -2226,7 +4244,7 @@ The bundle reported the vampire-drain thresholds and **not that one**. It does n
   The shell only carries what it was built knowing about, and its updater's dependency guard reads
   `requirements.txt` — so it catches a new *package* and is blind to a new module of the standard
   library. Mate 3.4.10 started importing PIL directly and the contract never learned; it worked only
-  because Pillow arrives as an extra of `leapmotor-api[image]`. A test now re-runs the scan and goes
+  because Pillow arrived as an extra of the bundled SDK. A test now re-runs the scan and goes
   red before a tag rather than on someone's Mac. It skips where the two repositories are not side by
   side, which is everywhere except the machine releases are cut on.
 
@@ -3271,7 +5289,7 @@ Groundwork for the standalone Mac app, which packages Mate for people who run ne
 ## [2.5.8] — 2026-07-10
 
 ### Fixed
-- **Setting the charge limit no longer wipes a start-time-only charge schedule.** If you had scheduled charging enabled with only a start time (no end time and no specific days), changing the charge limit could silently **disable the schedule and reset its start time to 00:00**. The cause was in the underlying library's read-modify-write: it keyed on the day mask, and the cloud omits that mask for a start-time-only plan, so it fell back to an all-defaults branch. Mate now round-trips the current plan and changes **only** the target SoC — the schedule's enabled state, start/end window and days are preserved (leapmotor-api #18). Schedules that had specific days set were never affected.
+- **Setting the charge limit no longer wipes a start-time-only charge schedule.** If you had scheduled charging enabled with only a start time (no end time and no specific days), changing the charge limit could silently **disable the schedule and reset its start time to 00:00**. The cause was in the underlying library's read-modify-write: it keyed on the day mask, and the cloud omits that mask for a start-time-only plan, so it fell back to an all-defaults branch. Mate now round-trips the current plan and changes **only** the target SoC — the schedule's enabled state, start/end window and days are preserved. Schedules that had specific days set were never affected.
 
 ## [2.5.7] — 2026-07-10
 
@@ -4507,8 +6525,8 @@ This release makes Mate use the car's real **power-on (Ready) signal** to bound 
   slider; cool/heat lock to their preset temperature. The earlier "the B10 rejects the climate write
   (code -2)" turned out to be a stale/expired `start_time`, not a blocked endpoint — Mate now anchors
   the start to the next occurrence, so the write works. Read / write / edit / cancel all stay in sync
-  with the official Leapmotor app. (Reverse-engineered on-car; details shared upstream at
-  markoceri/leapmotor-api#5 and kerniger/leapmotor-ha#43.)
+  with the official Leapmotor app. (Reverse-engineered on-car; details shared at
+  kerniger/leapmotor-ha#43.)
 
 ### Changed
 - **Scheduling UX (charge + climate).** "Active" is now a clear master switch: turning it off resets
@@ -4952,7 +6970,7 @@ This release makes Mate use the car's real **power-on (Ready) signal** to bound 
 
 ### Fixed
 - **Tyre pressures were shown on the wrong wheels.** The B10 signal→wheel mapping is
-  corrected per markoceri/leapmotor-api's documented signal table — the pressure and
+  corrected per the documented signal table — the pressure and
   its low-pressure alarm now refer to the same (correct) wheel.
 - **Removed the bogus "outside temperature".** That signal (2101) is actually the
   driver-seat ventilation level; no ambient-temperature signal exists, so the value

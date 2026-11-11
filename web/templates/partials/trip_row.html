@@ -1,4 +1,7 @@
-{# Single trip row — reused by the day-drawer (plain and in 🔗 merge mode) and search results.
+{# Single trip row — reused by the day-drawer (plain and in 🔗 merge mode), search results and the
+   Overview's Recent Trips, which sets `route_thumb` false: its rows have no route. `back`, set by the Overview
+   and by a search, is the list's address: the trip page leads back to it, to this row (scroll-mt: below the
+   bars that stick).
    Expects `trip` in scope, plus the page-level `t`/`fmt_dur`/`is_reev`/`research` already in
    context (Jinja includes share the parent scope). `eff_cls` and the `dist`/`eff`/`nice`
    filters are global (see main.py), no extra wiring needed.
@@ -6,13 +9,23 @@
    "merge mode" toggle, but that toggle's whole-page connector scan doesn't fit a
    load-one-day-at-a-time calendar, so a merged trip's own row now always offers to split it
    back (reversible, low-risk enough not to need a confirmation step first). #}
+{% import 'partials/_soc.html' as soc %}
 {% set used = (trip.start_soc or 0) - (trip.end_soc or 0) %}
 {# NB: the drive-mode <option> list lives in THREE templates (this file's neighbours trip_detail,
    trips and settings) plus db_reader.DRIVE_MODES, which is also the validator — change one, change
    all four, or a mode saves and then vanishes from the picker. #}
-<a href="trips/{{ trip.id }}" data-trip-id="{{ trip.id }}" class="trip-row">
+{# The row lays out by its own width, not the window's (the trip-row rules in base.html): a sidebar or a narrower
+   card leaves it far less room than the window has. Where the trip started and ended (db_reader.trip_places) has
+   two copies, the middle column's and a line of its own for a narrow row, and the rules show one. #}
+{% from "partials/_place_name.html" import place_name with context %}
+{% macro places(row, cls) %}{% if row.start_place or row.end_place %}<div class="trip-places text-[11px] text-slate-400 {{ cls }}" data-trip-places><span{% if row.start_place %} title="{{ row.start_place }}"{% endif %}>{{ place_name(row.start_place, row.start_place_charging) if row.start_place else '—' }}</span><span class="text-slate-600">→</span><span{% if row.end_place %} title="{{ row.end_place }}"{% endif %}>{{ place_name(row.end_place, row.end_place_charging) if row.end_place else '—' }}</span></div>{% endif %}{% endmacro %}
+<a href="trips/{{ trip.id }}{% if back is defined %}?back={{ (back ~ '#trip-row-' ~ trip.id)|urlencode }}{% endif %}"{% if back is defined %} id="trip-row-{{ trip.id }}"{% endif %} data-trip-id="{{ trip.id }}" class="trip-row flex-wrap scroll-mt-32">
 
-  {% if trip.reconstructed %}
+  {% if route_thumb is defined and not route_thumb %}
+  {% elif trip.has_gps is defined and not trip.has_gps %}
+  <div class="trip-thumb flex items-center justify-center text-slate-500 text-[10px] text-center px-1"
+       title="{{ t('gps_unavailable') }}">{{ t('gps_unavailable') }}</div>
+  {% elif trip.reconstructed %}
   <div class="trip-thumb flex items-center justify-center text-amber-400/70 text-lg"
        title="{{ t('trip_reconstructed_hint') }}">✨</div>
   {% else %}
@@ -20,45 +33,66 @@
   {% endif %}
 
   <div class="min-w-0 flex-1">
-    {# Only a search result carries a date (set by the search route, #191's split) — in the day
-       drawer the date is the heading above these rows, and printing it here too would repeat that
-       heading once per trip. #}
+    {# Only a row standing on its own carries a date (a search result, the Overview: #191's split) — in
+       the day drawer the date is the heading above these rows, and printing it here too would repeat
+       that heading once per trip. #}
     {% if trip.date_label %}
     <div class="text-[11px] text-slate-500 leading-tight">{{ trip.date_label }}</div>
     {% endif %}
     <div class="text-white text-sm font-medium">
       {{ trip.started_at[11:16] if trip.started_at else '—' }}
-      <span class="text-slate-500 font-normal text-xs ml-1">
-        → {{ trip.ended_at[11:16] if trip.ended_at else '' }}
+      <span class="text-slate-500 font-normal text-xs ml-1 whitespace-nowrap">
+        → {{ trip.ended_at|end_time(trip.started_at) if trip.ended_at else '' }}
       </span>
       {% if trip.is_merged %}<span style="font-size:10px" class="text-yellow-400" title="{{ trip.merged_count }} {{ t('merge_segments') }}">🔗</span>{% endif %}
       {% if trip.reconstructed %}<span style="font-size:10px" class="text-amber-400/90 ml-1" title="{{ t('trip_reconstructed_hint') }}">✨ {{ t('trip_reconstructed') }}</span>{% endif %}
     </div>
     <div class="text-slate-500 text-xs">{{ fmt_dur(trip.duration_min) }}{% if trip.is_merged %} · {{ t('driving_only') }}{% endif %}</div>
+    {{ places(trip, 'trip-places-beside') }}
+    {% if trip.is_cloud %}<div class="text-slate-400 text-[10px]">{{ t('cloud_source') }}</div>{% endif %}
+    {# A narrow row has no battery column, so its figures, or why there are none, come here. #}
+    <div class="trip-soc-line text-slate-500 text-[10px]">{% if trip.start_soc is none or trip.end_soc is none %}{{ t('soc_unavailable') }}{% else %}<span class="whitespace-nowrap">{{ trip.start_soc|dec(1) }}→{{ trip.end_soc|dec(1) }}%</span> <span class="whitespace-nowrap">{{ soc.change(trip.start_soc, trip.end_soc) }}</span>{% endif %}</div>
   </div>
 
-  <div class="hidden sm:flex flex-col items-end gap-1 flex-shrink-0">
+  <div class="trip-soc flex-col items-end gap-1 flex-shrink-0">
+    {% if trip.start_soc is not none and trip.end_soc is not none %}
     <div class="soc-mini" title="{{ '%.0f'|format(trip.start_soc or 0) }}% → {{ '%.0f'|format(trip.end_soc or 0) }}%">
       <i class="soc-rem"  style="width:{{ (trip.end_soc or 0) }}%"></i>
       <i class="soc-used" style="left:{{ (trip.end_soc or 0) }}%;width:{{ (used if used > 0 else 0) }}%"></i>
     </div>
     <div class="text-slate-500 text-[11px]">
-      {{ (trip.start_soc or 0)|dec(0) }}→{{ (trip.end_soc or 0)|dec(0) }}%
+      {{ trip.start_soc|dec(1) }}→{{ trip.end_soc|dec(1) }}% {{ soc.change(trip.start_soc, trip.end_soc) }}
     </div>
+    {% else %}<div class="text-slate-500 text-[11px]">{{ t('soc_unavailable') }}</div>{% endif %}
   </div>
 
   <div class="text-right flex-shrink-0" style="min-width:84px">
     <div class="text-white text-sm font-bold">{{ (trip.distance_km or 0) | dist(1) }}</div>
-    {% if trip.efficiency_kwh_100km %}
+    {# The energy its day's heading adds up; a range-extender's totals have none, so neither has its row. #}
+    {% set kwh = trip_kwh_used(trip) %}
+    {% if kwh is not none and not is_reev %}
+    <div class="text-slate-400 text-[11px]">{{ kwh|nice }} kWh</div>
+    {% elif trip.cloud_zero_segment and trip.ec_kwh is not none %}
+    <div class="text-slate-400 text-[11px]">{{ trip.ec_kwh|nice }} kWh</div>
+    {% endif %}
+    {% if trip.efficiency_kwh_100km is not none %}
     <span class="eff-pill {{ eff_cls(trip.efficiency_kwh_100km) }} mt-0.5">
       {{ trip.efficiency_kwh_100km | eff }}
     </span>
     {% endif %}
-    {% if is_reev and research and trip.engine_ran %}
+    {% if is_reev and trip.engine_ran %}
     {# REEV Phase C — an engine-on trip, with BOTH energies. The ⚡ pill above is blank here by
        design (finalize_trip drops the efficiency once the generator refills the pack underneath),
        so without this line the row showed petrol only and the electricity the car also used was
-       invisible until you opened the trip — @michapr, beta #11. Same figures as the detail page. #}
+       invisible until you opened the trip — @michapr, beta #11. Same figures as the detail page.
+       🔑 TWO gates, not one, since 4.7.0. The ⛽ litres ship on every build: they were calibrated
+       against a drive whose figure the owner reads in his own app (@ebagnoli, 29/09/2026). The ⚡
+       rate did NOT come with them — it is the energy that left the PACK over ALL the kilometres, it
+       reads 46, 82.7, even 386 kWh/100km on real trips, and it is still waiting to be held against
+       a dashboard. It stays on the BetaTester build, exactly as on the detail page: showing it in
+       the list and hiding it one click later is the disagreement
+       tests/test_reev_detail_shows_the_electric_rate.py exists to stop. #}
+    {% if research %}
     {% if trip.reev_elec_kwh_100km is not none %}
     <span class="block mt-0.5 text-blue-400 text-[11px] font-semibold">⚡ {{ trip.reev_elec_kwh_100km | nice }} kWh/100km</span>
     {# What that number IS, on the row itself (@gm27271, beta #31). It is the energy that left the
@@ -80,7 +114,18 @@
     <span class="block mt-0.5 text-blue-400/50 text-[11px] font-semibold"
           title="{{ t('reev_elec_pending') }}">⚡ —</span>
     {% endif %}
+    {% endif %}
     <span class="block mt-0.5 text-amber-400 text-[11px] font-semibold" title="{{ t('reev_engine_ran') }}">⛽ {% if trip.fuel_l_100km is not none %}{{ trip.fuel_l_100km | nice }} L/100km{% else %}{{ trip.fuel_used_l | nice }} L{% endif %}</span>
+    {% elif is_reev and trip.fuel_used_l is not none %}
+    {# A drive the car MEASURED as pure-electric: `fuel_used_l` is 0.0, not None. Until 4.7.0 the
+       two looked identical here — nothing at all — so eight of the ten trips on @ebagnoli's 30 July
+       read exactly like the trips whose tank was never opened. `is not none` is the whole
+       distinction: an unknown drive still prints nothing. Dimmed, because a zero is not a
+       consumption, and the words underneath because "⛽ 0 L" on its own reads as a figure that
+       failed to arrive. (Silvio, 29/09/2026: «metti 0 L tutto elettrico sui viaggi a zero
+       misurato».) #}
+    <span class="block mt-0.5 text-amber-400/60 text-[11px] font-semibold">⛽ {{ trip.fuel_used_l | nice }} L</span>
+    <span class="block text-slate-500 text-[10px] leading-tight">{{ t('trip_fuel_all_electric') }}</span>
     {% endif %}
     {# Filled the tank mid-drive: litres = start − end goes negative, so there is no consumption to
        print and no way to work one out. The dash keeps the slot and the tooltip names the reason —
@@ -94,6 +139,14 @@
     {% endif %}
   </div>
 
+{{ places(trip, 'trip-places-under w-full -mt-2') }}
+{% if trip.energy_source %}<span class="trip-source text-xs text-slate-400">{{ t('trip_energy_source_' ~ trip.energy_source) }}</span>{# On a range-extender the slot above is empty by design — `select_energy` excludes REEV
+   cars, because the generator refills the pack mid-drive and the cloud's `totalEnergy` is not that
+   car's appetite — so the LITRES say where they came from there instead. They need to: the cloud's
+   figure and the tank's differ by about a fifth on the same drive (4.9 against 3.886 on the one
+   drive the official app also states), and two correct numbers under one unit with nothing naming
+   them is the defect. Gated on there BEING litres: the cloud answers 0.0 on an electric drive, which
+   is an answer, but a source beside no figure is noise. #}{% elif trip.fuel_source and trip.fuel_used_l %}<span class="trip-source text-xs text-slate-400">{{ t('trip_fuel_source_' ~ trip.fuel_source) }}</span>{% endif %}
 </a>
 {% if trip.is_merged %}
 <div class="merge-sep" style="padding:0 0 4px 56px">

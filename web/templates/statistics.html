@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import 'partials/_energy.html' as energy %}
 {# 0 = no idle reload — same reason as trips.html (#236, @michapr). The period you picked is held in
    the page, not the address, so a reload silently threw it away and put you back on the default
    while you were reading the numbers. Nothing here is live; the header's refresh button covers it. #}
@@ -210,11 +211,17 @@
       data: { datasets: datasets },
       options: { responsive: true, maintainAspectRatio: true,
         plugins: { legend: { labels: { color: '#94a3b8', boxWidth: 12 } },
-          tooltip: { callbacks: { label: function (c) {
+          tooltip: { filter: function (item) {
+              // Trend-line points have only x/y; show tooltips for trip points only.
+              return item.raw && item.raw.km != null;
+            }, callbacks: { label: function (c) {
             var p = c.raw;
+            // The plotted value is stored as y; p.e/p.l were the source fields and are not
+            // copied into the Chart.js point object, which made the tooltip print undefined.
+            var value = c.parsed && c.parsed.y != null ? c.parsed.y : p.y;
             return c.dataset.yAxisID === 'y1'
-              ? p.l + ' L/100km · ' + p.km + ' km · ' + p.d
-              : p.e + ' kWh/100km · ' + p.km + ' km · ' + p.d; } } } },
+              ? value + ' L/100km · ' + p.km + ' km · ' + p.d
+              : value + ' kWh/100km · ' + p.km + ' km · ' + p.d; } } } },
         scales: {
           x: { title: { display: true, text: '°C', color: '#64748b' },
                ticks: { color: '#94a3b8' }, grid: { color: '#1e293b' } },
@@ -257,6 +264,11 @@
   </div>
   <div class="text-slate-600 text-xs mt-1">
     {{ t('stats_offline_windows').format(n=totals.offline_gaps.count) }}
+    {# What the cloud's own trip history has since given back (#298). Beside the measurement, never
+       subtracted from it: those kilometres were covered out of contact all the same. #}
+    {% if totals.offline_gaps.recovered_km %}
+    · {{ t('stats_offline_recovered').format(km=totals.offline_gaps.recovered_km | dist(1)) }}
+    {% endif %}
   </div>
   <div class="text-slate-500 text-xs mt-2 leading-relaxed">{{ t('stats_offline_help') }}</div>
 </div>
@@ -305,7 +317,7 @@
     <span class="text-slate-400 text-sm">/{{ dist100_unit() }}</span>
     {# The split only when both halves cost something — a "+ 0,00" would be noise, and on a BEV
        there is no second half to name at all. #}
-    {% if is_reev and research and c100.elec_100km and c100.fuel_100km %}
+    {% if is_reev and c100.elec_100km and c100.fuel_100km %}
     <span class="text-slate-600 text-sm mx-1">=</span>
     <span class="text-sky-400 text-sm">{{ cost100_val(c100.elec_100km) | money }}</span>
     <span class="text-slate-500 text-xs">{{ t('stats_cost100_elec') }}</span>
@@ -338,7 +350,7 @@
     {% if c100.elec_missing %}
     · <span class="text-amber-500">{{ t('stats_cost100_noelec') }}</span>
     {% endif %}
-    {% if is_reev and research and c100.fuel_missing %}
+    {% if is_reev and c100.fuel_missing %}
     · <span class="text-amber-500">{{ t('stats_cost100_nofuel') }}</span>
     {% endif %}
     {% if c100.partial %}
@@ -396,10 +408,13 @@
   </div>
   <div class="card">
     <div class="stat-label">{{ t('energy_charged') }}</div>
-    <div class="flex items-baseline gap-1">
+    {# The billed energy, the same pair of words as every other total: "delivered" beside it, and
+       what reached the battery under it when the two differ. #}
+    <div class="flex items-baseline gap-1" title="{{ t('cal_kwh_delivered_help') }}">
       <span class="stat-value">{{ (totals.total_kwh_charged or 0) | nice }}</span>
       <span class="text-slate-400 text-sm">kWh</span>
     </div>
+    <div class="text-slate-500 text-xs">{{ energy.delivered_line(t, totals.total_kwh_charged, totals.total_kwh_battery) }}</div>
     {% if totals.charge_count %}<div class="text-slate-500 text-xs mt-1">{{ totals.charge_count }} {{ t('charge_sessions') }}</div>{% endif %}
   </div>
 </div>

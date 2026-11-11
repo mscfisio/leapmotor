@@ -7,10 +7,14 @@ per install). Opt-in, because the position leaves the device.
 
 Cached hard: weather moves by the hour and a parked car doesn't move at all, so a fresh lookup only
 happens when the last one is STALE (older than _MAX_AGE_S) or the car has MOVED more than
-_MAX_MOVE_KM. A day of driving is then a few dozen calls, nowhere near the cap; a parked car makes
-none. The live samples are stored on each position, so they also become the trip's temperature
-(averaged along the real route) — elevation_enrich.fetch_trip_temperature stays as the fallback for
-trips with no live sample.
+_MAX_MOVE_KM, and a failed one is not asked again before _RETRY_S. A day of driving is then a few
+dozen calls, nowhere near the cap; a parked car makes none. The live samples are stored on each
+position, so they also become the trip's temperature (averaged along the real route) —
+elevation_enrich.fetch_trip_temperature stays as the fallback for trips with no live sample.
+
+A frame with no GPS fix is asked about where the car LAST had one, but only while the odometer says
+it is still there — on 13/10/2026 the cloud sent a parked B10's GPS as zero for hours, and after a
+restart the Overview lost the row. The last fix starts from the database (`Database.last_fix`).
 """
 import json
 import logging
@@ -27,6 +31,7 @@ _UA = "leapmotor-mate"
 _TIMEOUT_S = 8
 _MAX_AGE_S = 20 * 60          # refetch after 20 minutes…
 _MAX_MOVE_KM = 10.0          # …or after moving 10 km
+_RETRY_S = _MAX_AGE_S         # after a failed lookup, as long as a good reading is trusted
 
 
 def fetch_current_temp(lat: float, lon: float) -> Optional[float]:
@@ -60,18 +65,50 @@ class OutsideTempSampler:
     touching the network only when `_should_refetch` says so; otherwise the cached value. Injectable
     `fetch` for tests."""
 
-    def __init__(self, fetch: Callable[[float, float], Optional[float]] = fetch_current_temp):
+    def __init__(self, fetch: Callable[[float, float], Optional[float]] = fetch_current_temp,
+                 last_fix: Optional[tuple] = None, last_temp: Optional[tuple] = None):
         self._fetch = fetch
+        # (lat, lon, odometer_km) of the newest real fix — from the database at startup, then from
+        # each frame that has one. Odometer None = unknown, so it can't vouch the car is still there.
+        self._fix: Optional[tuple] = last_fix
+        # (temp, epoch) stored before a restart: the last reading on the first poll if still trusted
+        self._stored: Optional[tuple] = last_temp
         self._temp: Optional[float] = None
         self._ts: Optional[float] = None
         self._lat: Optional[float] = None
         self._lon: Optional[float] = None
+        self._failed_ts: Optional[float] = None
 
-    def sample(self, lat, lon, now_ts) -> Optional[float]:
-        if lat is None or lon is None:
-            return self._temp   # no fix → keep the last reading, don't guess a new place
+    def sample(self, lat, lon, now_ts, odometer_km=None) -> Optional[float]:
+        if self._stored is not None:
+            temp, ts = self._stored
+            self._stored = None
+            if 0 <= now_ts - ts < _MAX_AGE_S:
+                self._temp = temp
+        # `None` never arrives: `gps_position` returns (0, 0) when a frame has no fix, so
+        # this guard tested for something the parser cannot produce and a frame without a fix asked
+        # for the weather at 0,0 — Null Island, in the Gulf of Guinea — stored it as the car's
+        # outside temperature, and moved the anchor there, which then suppressed the next real fetch
+        # until the car had "moved" 10 km back. Exactly 0,0 is no fix: the same convention the rest
+        # of the poller already uses (`if data.latitude and data.longitude` for geohashes,
+        # `latitude != 0 AND longitude != 0` in the trip query).
+        if lat and lon:
+            self._fix = (lat, lon, odometer_km)
+        else:
+            # No fix: the car is where the last one was taken only if it hasn't driven since — the
+            # same odometer, both known. Otherwise keep the last reading and don't guess a place.
+            fix = self._fix
+            if fix is None or odometer_km is None or fix[2] is None or fix[2] != odometer_km:
+                return self._temp
+            lat, lon = fix[0], fix[1]
+        # Moving does not end the wait (a refusal is not the car's); a clock set back does.
+        if self._failed_ts is not None and 0 <= now_ts - self._failed_ts < _RETRY_S:
+            return self._temp
         if _should_refetch(self._ts, self._lat, self._lon, lat, lon, now_ts):
             t = self._fetch(lat, lon)
-            if t is not None:   # a failed lookup keeps the old value AND the old anchor → retry next poll
+            if t is not None:
                 self._temp, self._ts, self._lat, self._lon = t, now_ts, lat, lon
+                self._failed_ts = None
+            else:               # the old value and anchor stay
+                self._failed_ts = now_ts
         return self._temp

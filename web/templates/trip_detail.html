@@ -2,10 +2,14 @@
 {% block title %}{{ t('trip_singular')|capitalize }} {{ trip.id }} — LeapMotor Mate{% endblock %}
 
 {% block content %}
+{# A link onwards carries this page's address as `back`, and the arrows its own way back, so each "←" leads back a step. #}
+{% set back_q = '?back=' ~ back_link.href|urlencode if back_link else '' %}
+{% set here = 'trips/' ~ trip.id ~ back_q %}
 {# flex-wrap + nowrap title: on phones the buttons drop to a second row instead of
    squeezing the date into a 3-line column #}
 <div class="mb-5 flex flex-wrap items-center gap-3">
-  <a href="trips?highlight={{ trip.id }}" class="text-slate-400 hover:text-white text-sm">{{ t('back_trips') }}</a>
+  {% if back_link %}<a href="{{ back_link.href }}" class="text-slate-400 hover:text-white text-sm">{{ t(back_link.label) }}</a>
+  {% else %}<a href="trips?highlight={{ trip.id }}" class="text-slate-400 hover:text-white text-sm">{{ t('back_trips') }}</a>{% endif %}
   <span class="text-slate-600">/</span>
   <h1 class="text-xl font-bold text-white whitespace-nowrap">
     {{ trip.started_at | localdate if trip.started_at else 'Trip' }}
@@ -15,11 +19,11 @@
      get_adjacent_trips); a missing side just hides its arrow rather than showing a dead one. #}
   <div class="flex items-center gap-1">
     {% if prev_trip_id %}
-    <a href="trips/{{ prev_trip_id }}" title="{{ t('trip_prev') }}"
+    <a href="trips/{{ prev_trip_id }}{{ back_q }}" title="{{ t('trip_prev') }}"
        class="border border-slate-600 text-slate-300 rounded-lg w-7 h-7 flex items-center justify-center hover:border-brand hover:text-white flex-shrink-0">‹</a>
     {% endif %}
     {% if next_trip_id %}
-    <a href="trips/{{ next_trip_id }}" title="{{ t('trip_next') }}"
+    <a href="trips/{{ next_trip_id }}{{ back_q }}" title="{{ t('trip_next') }}"
        class="border border-slate-600 text-slate-300 rounded-lg w-7 h-7 flex items-center justify-center hover:border-brand hover:text-white flex-shrink-0">›</a>
     {% endif %}
   </div>
@@ -29,7 +33,7 @@
   {% endif %}
   {% set has_route = trip.positions and trip.positions|length > 1 %}
   {% if has_route %}
-  <a href="trips/{{ trip.id }}/similar"
+  <a href="trips/{{ trip.id }}/similar?back={{ here|urlencode }}"
      class="ml-auto border border-slate-600 text-slate-300 text-xs font-medium rounded-lg px-3 py-1.5 hover:border-brand flex-shrink-0">🔎 {{ t('similar_trips_btn') }}</a>
   <a href="trips/{{ trip.id }}/route.gpx" download
      class="border border-slate-600 text-slate-300 text-xs font-medium rounded-lg px-3 py-1.5 hover:border-brand flex-shrink-0">↓ {{ t('export_gpx') }}</a>
@@ -46,140 +50,147 @@
   <!-- Stats -->
   <div class="space-y-4">
     <div class="card">
-      {# stat-pairs: reserves two lines for every label in this grid. These cells are narrow (130px),
-         so whether a label wraps depends on the language — "Energia consumata" and "Verbruikte
-         energie" take two lines while "Consumo medio" beside them takes one, which pushed one
-         value 18px below its neighbour while the rows above and below lined up perfectly. #}
-      <div class="grid grid-cols-2 gap-4 stat-pairs">
-        <div>
+      {# ── The trip summary, in boxes, on every car — beta D #31 ────────────────────────────────────
+         @michapr's layout of 14/09 (from @gm27271's request of 15/08), approved by Silvio on 18/09/2026
+         for EVERY car: distance and duration, then the electricity and — only on a car with a tank —
+         the fuel beside it, then the total. What changed is where the figures sit, not the figures:
+         each box prints what the stacked areas printed, from the same fields and behind the same gates.
+         Two things of his card stay out. The driving-mode bar: its electric share is the distance minus
+         the generator's FLOOR, a ceiling that a coloured proportion draws as a fact (Silvio's no of
+         13/09). And the electric rate on a generator trip on the official build (below).
+         ⚠️ The pair is side by side at EVERY width, and that was measured before it was taken: this card
+         is the first column of an `lg:grid-cols-3` page, and at a 1024px window each box has 73px of
+         room. Hence the small type, `min-w-0` + `truncate` as a safety net, the price per litre on a
+         line of its own ("4.82 € · 1.912 €/L" needs 83px, "1.912 €/L" 43) and the generator's distance
+         on a full-width line under the boxes (112px with its words). Re-measure on the rendered page
+         before adding anything to a box. #}
+      <h2 class="text-xs font-semibold text-slate-300 uppercase tracking-wide mb-3">📍 {{ t('trip_summary_title') }}</h2>
+      {% include "partials/trip_place_lines.html" %}
+
+      {# 24px wrapped at 1024px ("112.0" over "km", "2h" over "03m"): 18px only while the page is three
+         narrow columns (lg), back to 24px from 1280px (xl), where the column has room again.
+         The values sit at the FOOT of their boxes (flex column + mt-auto), not right under the label:
+         whether a label wraps depends on the language and the width, and a value that follows its
+         label drops one line below its neighbour when only one of the two wraps (GitHub #199). The
+         boxes of a row are the same height, so the values stay level with no line reserved. #}
+      <div class="grid grid-cols-2 gap-3 mb-3">
+        <div class="rounded-lg border border-slate-700 px-3 py-2.5 min-w-0 flex flex-col">
           <div class="stat-label">{{ t('distance') }}</div>
-          <div class="stat-value">{{ (dist_val(trip.distance_km or 0))|dec(1) }}<span class="text-base font-normal text-slate-400"> {{ dist_unit() }}</span></div>
+          <div class="mt-auto text-2xl lg:text-lg xl:text-2xl font-bold text-white whitespace-nowrap">{{ (dist_val(trip.distance_km or 0))|dec(1) }}<span class="text-base lg:text-xs xl:text-base font-normal text-slate-400"> {{ dist_unit() }}</span></div>
         </div>
-        <div>
+        <div class="rounded-lg border border-slate-700 px-3 py-2.5 min-w-0 flex flex-col">
           <div class="stat-label">{{ t('duration') }}</div>
-          <div class="stat-value">{{ fmt_dur(trip.duration_min) }}</div>
-        </div>
-        <div>
-          <div class="stat-label">{{ t('avg_efficiency') }}</div>
-          {% if trip.efficiency_kwh_100km %}
-          {# number big, unit small — and one step smaller HERE than in the tiles beside it. These
-             cells are 130px: "16.5 kWh/100km" needs 138 at the shared 16px, so the unit dropped
-             under the number and left this tile a line taller than its neighbour, which is the
-             same orphaned-unit look reported on Statistics (#199). 12px keeps it inline with room
-             for a three-digit consumption and for mi/kWh in imperial. #}
-          <div class="stat-value {% if trip.efficiency_kwh_100km < 18 %}text-green-400{% elif trip.efficiency_kwh_100km < 22 %}text-yellow-400{% else %}text-red-400{% endif %}">
-            {{ eff_val(trip.efficiency_kwh_100km)|nice }}<span class="text-xs font-normal text-slate-400"> {{ eff_unit() }}</span>
-          </div>
-          {% else %}<div class="stat-value text-slate-500">—</div>{% endif %}
-        </div>
-        <div>
-          {# On a range extender this tile shows getEC and NOTHING derived from SoC (@michapr,
-             beta #11). Both of the branches below are SoC arithmetic: `battery_net_kwh` is
-             ΔSoC × capacity outright, and `energy_kwh` is efficiency × distance, where the
-             efficiency itself was computed from ΔSoC when the trip closed (poller/db.py). On a
-             series hybrid the generator refills the pack mid-drive, so neither says what the
-             driving used — and neither is what the money beside them is billed on: a REEV trip is
-             priced by drawing the paid stock down by `ec_kwh` (reev_trip_electric_cost). His words:
-             *"we should only show the getEC value that is actually used for the calculation"*.
-             `is_reev` alone, no research gate — same as the regen tile below, and because a SoC
-             number on a range extender is wrong on every build, not only the beta one. #}
-          {% if is_reev %}
-          <div class="stat-label">{{ t('energy_used') }}</div>
-          {% if trip.ec_kwh %}
-          <div class="stat-value text-amber-400">{{ trip.ec_kwh|dec(1) }}<span class="text-base font-normal text-slate-400"> kWh</span></div>
-          {% else %}<div class="stat-value text-slate-500">—</div>{% endif %}
-          {# …and the rate that completes it. 🔴 The trips LIST has printed this for a generator trip
-             since Phase D (partials/trip_row.html) while THIS page printed a dash in AVG CONSUMPTION
-             for the same trip — one car, one drive, two pages disagreeing (@michapr, beta #27,
-             07/08/26). The value was already in hand: get_trip_detail calls `_reev_trip_elec` and the
-             template simply never used it.
-
-             It stays HERE, beside the litres, and NOT in the AVG CONSUMPTION tile. Over the whole
-             distance this is what left the pack per 100 km — the electric half of what the drive
-             cost, whose other half is the ⛽ line below. It is NOT the car's appetite: the generator
-             feeds the wheels without passing through the pack, so 1.8 here and 13.1 on an electric
-             trip are different quantities, and putting it under the same label would compare them.
-             Marked instead — blue, ⚡, outside the tile — which is his own suggestion: *«in brackets
-             or in other color to show that it is a calculated value only»*.
-
-             The rate alone, never the kWh: that number is the stat-value directly above, and
-             reprinting it is the three-times-in-one-column duplication beta #27 opened with.
-             `research`-gated to match the list exactly — gating one and not the other would only
-             move the disagreement to the other build. #}
-          {% if research and trip.reev_elec_kwh_100km is not none %}
-          <div class="mt-1 text-[13px] font-semibold text-blue-400/90 leading-none">
-            ⚡ {{ trip.reev_elec_kwh_100km|nice }} kWh/100km
-          </div>
-          {% endif %}
-          {# The petrol, right here beside the kWh — which is what a car with no tank already does
-             with its one energy figure (@michapr, beta #27). It used to live only in the block
-             below, framed in amber like a warning, for something a range-extender owner expects
-             every day. `fuel_used_l` alone, no research gate: the litres are on the trips list and
-             the calendar on every build, and hiding them here would be the odd one out. #}
-          {# ⚠️ Each figure is ATOMIC. This tile is 130px and the pair needs 140 at 13px, so it has
-             always wrapped — and it wrapped mid-figure, leaving "L/100km" alone on the second line
-             under a bare "6.8". Same orphaned-unit look as #199, shipped since v3.8.5.
-             Shrinking the type does not fix it: measured in the browser, a realistic big trip
-             ("⛽ 12.4 L · 15.7 L/100km") still needs 132px at 11px type, and 10px beside the 13px
-             line above reads as a different kind of information. The two halves on their own are
-             51px and 86px (57 and 91 at their widest), so making each unbreakable puts the wrap
-             between them: two whole figures, never a number torn from its unit. Wide enough, and
-             it stays on one line as before — leading-snug rather than leading-none so the two
-             lines do not touch when it does wrap. #}
-          {% if trip.fuel_used_l %}
-          <div class="mt-1 text-[13px] font-semibold text-amber-300/90 leading-snug">
-            <span class="whitespace-nowrap">⛽ {{ trip.fuel_used_l|nice }} L</span>{% if trip.fuel_l_100km is not none %} <span class="font-normal text-slate-400 whitespace-nowrap">· {{ trip.fuel_l_100km|nice }} L/100km</span>{% endif %}
-          </div>
-          {% endif %}
-          {# When the pack ended fuller than it started there is no consumption to print — the poller
-             withholds it on purpose — and the tile used to sit empty (beta #11). Show the NET gain
-             instead, under its own label: this is the battery's net change, not what the trip used. #}
-          {% elif trip.battery_net_kwh is not none %}
-          <div class="stat-label">{{ t('battery_net') }}</div>
-          <div class="stat-value text-green-400">{{ trip.battery_net_kwh|dec(1) }}<span class="text-base font-normal text-slate-400"> kWh</span></div>
-          {% else %}
-          <div class="stat-label">{{ t('energy_used') }}</div>
-          {% if trip.energy_kwh %}
-          <div class="stat-value text-amber-400">{{ trip.energy_kwh|dec(1) }}<span class="text-base font-normal text-slate-400"> kWh</span></div>
-          {% else %}<div class="stat-value text-slate-500">—</div>{% endif %}
-          {% endif %}
-        </div>
-        {% if not is_reev %}
-        <!-- Regen is hidden for REEVs: with a generator on board, "battery charging while driving" can't be
-             told apart from real braking regen (no dedicated regen sensor), so the number is unreliable. -->
-        <div>
-          <div class="stat-label">{{ t('regen') }}</div>
-          <div class="stat-value text-green-400">{{ (trip.regen_kwh or 0)|dec(2) }}<span class="text-base font-normal text-slate-400"> kWh</span></div>
-        </div>
-        {% endif %}
-        <div>
-          <div class="stat-label">{{ t('cost') }}</div>
-          {# What the trip actually cost = electricity drawn from the pack + petrol burned getting
-             there. On a BEV there is no fuel line, so cost_total IS cost and nothing changes. On a
-             REEV it is the difference between "—" and "24,63 €": the tile used to key off the
-             ELECTRIC figure alone, so a trip run on a tank of petrol showed no cost at all while
-             the fuel € sat in the block below (@michapr, beta #11). #}
-          {% if trip.cost_total is not none %}
-          <div class="stat-value text-green-400">{{ trip.cost_total | money }}</div>
-          {% if trip.fuel_cost is not none and trip.cost is not none %}
-          <div class="mt-1 text-[11px] leading-none text-slate-400">⚡ {{ trip.cost | money }} · ⛽ {{ trip.fuel_cost | money }}</div>
-          {% endif %}
-          {# #200 — the rate the € above was worked out at. It has been computed all along (get_trip_detail
-             sets it on the line beside the cost) and simply never printed, so the only way to check the
-             figure was to redo the arithmetic by hand. #}
-          {# `is not none`, not truthiness: 0.000 €/kWh is the real rate for an owner who charges
-             only from his own roof, and hiding it leaves a 0.00 € with nothing explaining it. #}
-          {% if trip.cost_per_kwh is not none %}
-          <div class="mt-1 text-[11px] leading-none text-slate-400" title="{{ t('blended_price_help') }}">
-            {{ trip.cost_per_kwh | price3 }} {{ currency.symbol }}/kWh
-          </div>
-          {% endif %}
-          {% else %}<div class="stat-value text-slate-500">—</div>{% endif %}
+          <div class="mt-auto text-2xl lg:text-lg xl:text-2xl font-bold text-white whitespace-nowrap">{{ fmt_dur(trip.duration_min) }}</div>
         </div>
       </div>
-      {% if is_reev and research and trip.engine_ran %}
-      <!-- REEV Phase C+D — the range-extender ran (fuel dropped). Dual energy for this trip: 🔋 electric
-           from the cloud's METERED getEC and ⛽ fuel from the tank % drop (over the generator-on km).
+
+      <div class="grid {% if is_reev %}grid-cols-2 gap-2{% else %}grid-cols-1{% endif %} mb-3">
+        {# ⚡ The energy is the one the old ENERGY USED tile printed, from the same source: on a range
+           extender getEC — what left the pack, and what the money is billed on (@michapr, beta #11: a
+           SoC number there is wrong on every build) — and on an electric car the SoC-based energy, or
+           the NET gain under its own label when the pack ended fuller (beta #11). #}
+        <div class="rounded-lg border border-green-800/60 bg-green-500/5 px-2 py-2 min-w-0">
+          <div class="text-[10px] font-medium text-green-400 mb-1 truncate">⚡ {{ t('trip_area_electric') }}{% if trip.energy_source %}<span class="text-xs text-slate-400 ml-2">{{ t('trip_energy_source_' ~ trip.energy_source) }}</span>{% endif %}</div>
+          {% if is_reev %}
+            {% if trip.ec_kwh %}<div class="text-base font-bold text-white leading-tight truncate">{{ trip.ec_kwh|dec(1) }}<span class="text-[10px] font-normal text-slate-400"> kWh</span></div>
+            {% else %}<div class="text-base font-bold text-slate-500">—</div>{% endif %}
+          {% elif trip.energy_source and trip.energy_kwh is not none %}
+          {{ '%.2f'|format(trip.energy_kwh) }} <span class="text-sm">kWh</span>
+        {% elif trip.battery_net_kwh is not none %}
+            <div class="text-[10px] text-slate-400 truncate">{{ t('battery_net') }}</div>
+            <div class="text-base font-bold text-green-400 leading-tight truncate">{{ trip.battery_net_kwh|dec(1) }}<span class="text-[10px] font-normal text-slate-400"> kWh</span></div>
+          {% elif trip.energy_kwh %}<div class="text-base font-bold text-white leading-tight truncate">{{ trip.energy_kwh|dec(1) }}<span class="text-[10px] font-normal text-slate-400"> kWh</span></div>
+          {% else %}<div class="text-base font-bold text-slate-500">—</div>{% endif %}
+          {# The consumption, under the rules of the tile it replaces. The poller WITHHOLDS the ΔSoC
+             efficiency when the range-extender ran, because the generator refilled the pack mid-drive;
+             the rate that does exist (getEC over the whole distance) is NOT the car's appetite — the
+             generator feeds the wheels without passing through the pack — and measured on real trips it
+             reads 46, 82.7, even 386 kWh/100km. So: the research line in blue on the beta build, to be
+             checked against the dashboard, and nothing on the official one (@michapr, beta #27). #}
+          {% if not (is_reev and trip.engine_ran) and trip.efficiency_kwh_100km is not none %}
+          <div class="text-[10px] font-semibold mt-0.5 truncate {% if trip.efficiency_kwh_100km < 18 %}text-green-400{% elif trip.efficiency_kwh_100km < 22 %}text-yellow-400{% else %}text-red-400{% endif %}">{{ eff_val(trip.efficiency_kwh_100km)|nice }} {{ eff_unit() }}</div>
+          {% elif is_reev and research and trip.engine_ran and trip.reev_elec_kwh_100km is not none %}
+          <div class="text-[10px] font-semibold text-blue-400/90 mt-0.5 truncate">⚡ {{ trip.reev_elec_kwh_100km|nice }} kWh/100km</div>
+          {% endif %}
+          {# The electric half of the money only where there are two halves: on an electric car it IS the
+             total, printed once below. #}
+          {% if is_reev and trip.cost is not none %}
+          <div class="text-[10px] text-slate-300 mt-1 truncate">{{ trip.cost | money }}</div>
+          {% endif %}
+          {# #200 — the rate the € was worked out at. `is not none`: 0.000 €/kWh is the real rate of an
+             owner who charges from his own roof, and hiding it leaves a 0.00 € with nothing explaining it. #}
+          {% if trip.cost_per_kwh is not none %}
+          <div class="text-[10px] text-slate-400 truncate" title="{{ t('blended_price_help') }}">{{ trip.cost_per_kwh | price3 }} {{ currency.symbol }}/kWh</div>
+          {% endif %}
+          {# Regen only on an electric car: with a generator on board, charging while driving cannot be
+             told apart from braking (no regen sensor), so the number would be unreliable. #}
+          {% if not is_reev %}
+          <div class="text-[10px] text-slate-400 mt-1 truncate">{{ t('regen') }} {{ (trip.regen_kwh or 0)|dec(2) }} kWh</div>
+          {% endif %}
+        </div>
+        {% if is_reev %}
+        {# ⛽ Only on a car with a tank — and always there on one, with a dash when nothing burned, which
+           is @michapr's layout. The price per litre is back on a line of its own (Silvio, 18/09). #}
+        <div class="rounded-lg border border-amber-800/60 bg-amber-500/5 px-2 py-2 min-w-0">
+          <div class="text-[10px] font-medium text-amber-400 mb-1 truncate">⛽ {{ t('trip_area_fuel') }}</div>
+          {% if trip.fuel_used_l %}
+          <div class="text-base font-bold text-white leading-tight truncate">{{ trip.fuel_used_l|nice }}<span class="text-[10px] font-normal text-slate-400"> L</span></div>
+          {% if trip.fuel_l_100km is not none %}<div class="text-[10px] text-slate-400 mt-0.5 truncate">{{ trip.fuel_l_100km|nice }} L/100km</div>{% endif %}
+          {% if trip.fuel_cost is not none %}<div class="text-[10px] text-slate-300 mt-1 truncate">{{ trip.fuel_cost | money }}</div>{% endif %}
+          {% if trip.fuel_price_per_l %}<div class="text-[10px] text-slate-400 truncate">{{ trip.fuel_price_per_l | price3 }} {{ currency.symbol }}/L</div>{% endif %}
+          {# Whose litres these are, on a line of its OWN. It first went beside the heading, mirroring
+             the ⚡ box — and the box is ~70px wide in the two-column summary, so `truncate` ate it:
+             the heading rendered as "⛽ Carburan…" and the label never appeared at all. Measured by
+             opening the page, which is the only thing that finds this
+             (feedback-a-layout-question-is-not-answered-by-measuring-harder). #}
+          {% if trip.fuel_source %}<div class="text-[10px] text-slate-500 truncate"
+               title="{{ t('trip_fuel_source_' ~ trip.fuel_source) }}">{{ t('trip_fuel_source_' ~ trip.fuel_source) }}</div>{% endif %}
+          {% elif trip.fuel_used_l is not none %}
+          {# Measured zero, not missing: the counter read the same millilitre value at both ends, or
+             the cloud answered 0.0. The dash below belongs to a drive whose tank was never read,
+             and the two must not look alike — that was the whole complaint (Silvio, 29/09/2026). #}
+          <div class="text-base font-bold text-slate-300 leading-tight truncate">{{ trip.fuel_used_l|nice }}<span class="text-[10px] font-normal text-slate-400"> L</span></div>
+          <div class="text-[10px] text-slate-500 truncate">{{ t('trip_fuel_all_electric') }}</div>
+          {% else %}<div class="text-base font-bold text-slate-500">—</div>{% endif %}
+        </div>
+        {% endif %}
+      </div>
+
+      {# The generator's distance, with the words that say it is a floor, wherever it is printed
+         (v3.14.24, @gm27271). There is no "generator on" signal in the cloud — all 89 were checked, the
+         best separates at 61% once the car is moving — so these kilometres are counted from the samples
+         where the odometer rises AND the fuel falls, short in one direction only: 54.0 against the
+         60.2 km @pdifeo's dashboard showed. Full width: no box has room for it at 1024px. #}
+      {% if is_reev and trip.engine_km %}
+      <div class="rounded-lg border border-slate-700 px-3 py-2 mb-3">
+        <div class="text-xs text-slate-300">⛽ {{ t('reev_engine_km_label') }}: <span class="font-semibold text-white">{{ trip.engine_km | dist(1) }}</span></div>
+        <div class="text-[10px] text-slate-500 leading-snug mt-0.5">{{ t('reev_engine_km_floor') }}</div>
+      </div>
+      {% endif %}
+
+      {# The total: electricity drawn from the pack + petrol burned (@michapr, beta #11 — a trip run on a
+         tank of petrol used to show no cost at all), and what it cost per distance (@michapr, beta #31),
+         with the helpers Statistics uses, so an imperial reader gets it per 100 mi. Gated on the
+         distance: a reconstructed trip can close with 0 km, and the division would take the page down. #}
+      <div class="flex items-center justify-between gap-2 rounded-lg border border-slate-700 px-3 py-2.5">
+        <div class="min-w-0">
+          <div class="stat-label">{{ t('total_cost') }}</div>
+          {% if trip.cost_total is not none %}<div class="stat-value text-green-400">{{ trip.cost_total | money }}</div>
+          {% else %}<div class="stat-value text-slate-500">—</div>{% endif %}
+        </div>
+        {# The label beside it may wrap (the Italian "COSTO TOTALE" and the Polish "ŁĄCZNY KOSZT" do at a
+           1024px window); the figure may not — it broke as "1,40 €/100" over "km", the orphaned
+           unit of #199. #}
+        {% if trip.cost_total is not none and trip.distance_km %}
+        <div class="text-xs text-slate-400 text-right whitespace-nowrap">{{ cost100_val(trip.cost_total / trip.distance_km * 100) | money }}/{{ dist100_unit() }}</div>
+        {% endif %}
+      </div>
+
+      {% if is_reev and trip.engine_ran %}
+      <!-- REEV Phase C+D — the range-extender ran. Dual energy for this trip: 🔋 electric from the
+           cloud's METERED getEC and ⛽ fuel from whichever source the box above NAMES — the car's own
+           cloud record where one matches, the tank's own arithmetic otherwise. It was the tank alone
+           until 4.7.0, and the two differ by about a fifth, which is why the box says which.
            ⚠️ getEC is NOT generator-proof — that claim was measured false on 30/07/26 against two
            cars' bundles: it counts roughly what LEFT THE BATTERY, and the generator's direct feed to
            the wheels never passes through the pack, so it is invisible here. Which is why it is the
@@ -197,9 +208,8 @@
           <div class="text-[11px] uppercase tracking-wide text-slate-400">{{ t('reev_trip_detail') }}</div>
           <div class="text-xs text-slate-400 font-mono">🔋 {{ trip.start_soc | nice }}%→{{ trip.end_soc | nice }}% · ⛽ {{ trip.fuel_start_pct | nice }}%→{{ trip.fuel_end_pct | nice }}%</div>
         </div>
-        {% if trip.fuel_cost is not none %}
-        <div class="text-[11px] font-semibold text-amber-200 mb-1">💶 {{ trip.fuel_cost | money }}{% if trip.fuel_price_per_l %} <span class="font-normal text-amber-300/70">· {{ trip.fuel_price_per_l | price3 }} {{ currency.symbol }}/L</span>{% endif %}</div>
-        {% endif %}
+        {# The petrol's money moved up into the FUEL section with the litres it paid for; printing it
+           here as well would say the same thing twice on one page. #}
         {# The money split, kept OUT of the "electric used" column on purpose: that figure is the
            DRIVING share alone (getEC's driverEC), while what has to be paid for is everything that
            left the pack — climate and accessories included. So it carries its own total, or the two
@@ -212,7 +222,11 @@
           💶 {{ trip.paid_kwh | nice }} {{ t('reev_elec_paid') }}{% if trip.free_kwh %} · ⛽ {{ trip.free_kwh | nice }} {{ t('reev_elec_from_generator') }}{% endif %}
         </div>
         {% endif %}
-        <div class="text-[10px] text-slate-500 mt-2 leading-snug">🔋 {{ t('reev_elec_source_note') }}{% if trip.engine_km %} · ⛽ {{ t('reev_engine_km') }}: {{ trip.engine_km | nice }} km{% endif %}</div>
+        {# The generator's distance was promoted to a line of its own here in v3.14.24, after
+           @gm27271 called it "a crappy comment after loads of text". It is now a labelled figure in
+           the FUEL section above, beside the litres that produced it — same number, same floor note,
+           one step further along the road he asked for. It is not repeated here. #}
+        <div class="text-[10px] text-slate-500 mt-2 leading-snug">🔋 {{ t('reev_elec_source_note') }}</div>
       </div>
       {% endif %}
       {% if trip.ec_pending %}
@@ -238,10 +252,11 @@
         <span id="ec-convert-msg" class="ml-2"></span>
       </div>
       {% endif %}
-      {% if trip.ec_stable and not trip.reconstructed %}
+      {% if trip.ec_stable and not trip.reconstructed and trip.efficiency_soc is not none %}
       <!-- Revert this trip's official-data conversion back to the SoC estimate (the value backed up
            at convert time). Recovery path if a conversion landed on incomplete cloud data (#96).
-           Reconstructed trips are ec_stable=1 to skip enrichment but were never converted → no revert. -->
+           Reconstructed trips are ec_stable=1 to skip enrichment but were never converted → no revert.
+           A trip with no estimate kept aside (one from the cloud's history) has nothing to go back to either. -->
       <div class="mt-3">
         <button type="button"
                 class="inline-flex items-center gap-1.5 rounded-lg border border-slate-600 text-slate-300 px-3 py-1.5 text-xs font-medium hover:border-slate-400 hover:text-white"
@@ -252,46 +267,82 @@
       </div>
       {% endif %}
     </div>
-    <div class="card space-y-3 text-sm">
+    {# The secondary readings, foldable — @gm27271's point 5 on beta #31 ("the battery and fuel
+       level changes could be moved into a smaller, less prominent section at the bottom"), in the
+       shape @michapr built for it. Native <details>, so it costs no script and keeps the keyboard
+       and screen-reader behaviour the browser already gives a disclosure.
+       🔴 OPEN by default, deliberately: folding is OFFERED, nothing is taken away. Every reading in
+       here has been visible on this page since it existed, and shipping it closed would look like
+       data had been removed — which is the complaint this card is already answering, not one to
+       create. The rows keep their own indentation; the wrapper carries the spacing they had. #}
+    <details class="card" open>
+      <summary class="cursor-pointer text-sm font-medium text-slate-300 hover:text-white">{{ t('trip_details_section') }}</summary>
+      <div class="space-y-3 text-sm mt-3">
+      {# The change in brackets is signed: a drive on a range extender can end with a fuller pack. #}
       <div class="flex justify-between">
-        <span class="text-slate-400">{{ t('start_soc') }}</span>
-        <span class="text-white font-medium">{{ (trip.start_soc or 0)|dec(1) }}%</span>
+        <span class="text-slate-400">{{ t('soc') }}</span>
+        <span class="text-white font-medium">
+          {%- if trip.start_soc is not none or trip.end_soc is not none -%}
+          {{ (trip.start_soc|dec(1) ~ '%') if trip.start_soc is not none else '—' }}&nbsp;→&nbsp;{{ (trip.end_soc|dec(1) ~ '%') if trip.end_soc is not none else '—' }}
+          {%- if trip.start_soc is not none and trip.end_soc is not none %}{% set _d = trip.end_soc - trip.start_soc %} <span class="text-slate-400">({{ '+' if _d > 0 else '' }}{{ _d|dec(1) }}%)</span>{% endif -%}
+          {%- else -%}{{ t('data_unavailable') }}{%- endif -%}
+        </span>
       </div>
       <div class="flex justify-between">
-        <span class="text-slate-400">{{ t('end_soc') }}</span>
-        <span class="text-white font-medium">{{ (trip.end_soc or 0)|dec(1) }}%</span>
-      </div>
-      {% if is_reev and research and trip.engine_ran and (trip.end_soc or 0) > (trip.start_soc or 0) %}
-      <!-- REEV engine-on trip where the generator OUT-produced the motor → the pack ended fuller than it
-           started. "SoC used −3%" reads as nonsense here; show it as what it is: a net recharge. -->
-      <div class="flex justify-between">
-        <span class="text-slate-400">🔋 {{ t('reev_battery_recharged') }}</span>
-        <span class="text-blue-300 font-medium">+{{ ((trip.end_soc or 0) - (trip.start_soc or 0))|dec(1) }}%</span>
-      </div>
-      {% else %}
-      <div class="flex justify-between">
-        <span class="text-slate-400">{{ t('soc_used') }}</span>
-        <span class="text-white font-medium">{{ ((trip.start_soc or 0) - (trip.end_soc or 0))|dec(1) }}%</span>
-      </div>
-      {% endif %}
-      <div class="flex justify-between">
-        <span class="text-slate-400">{{ t('start_odometer') }}</span>
-        <span class="text-white font-medium">{{ (trip.start_odometer_km or 0) | dist(0) }}</span>
+        <span class="text-slate-400">{{ t('odometer') }}</span>
+        <span class="text-white font-medium">
+          {%- if trip.start_odometer_km or trip.end_odometer_km -%}
+          {{ (trip.start_odometer_km | dist(0)) if trip.start_odometer_km else '—' }}&nbsp;→&nbsp;{{ (trip.end_odometer_km | dist(0)) if trip.end_odometer_km else '—' }}
+          {%- if trip.start_odometer_km and trip.end_odometer_km %} <span class="text-slate-400">({{ (trip.end_odometer_km - trip.start_odometer_km) | dist(0) }})</span>{% endif %}
+          {%- else -%}—{%- endif -%}
+        </span>
       </div>
       <div class="flex justify-between">
-        <span class="text-slate-400">{{ t('end_odometer') }}</span>
-        <span class="text-white font-medium">{% if trip.end_odometer_km %}{{ trip.end_odometer_km | dist(0) }}{% else %}—{% endif %}</span>
+        <span class="text-slate-400">{{ t('duration') }}{% if trip.driving_min is not none %} <span class="text-slate-600 cursor-help" tabindex="0" data-tip="{{ t('trip_time_split_help') }}">ⓘ</span>{% endif %}</span>
+        <span class="text-right">
+          <span class="text-white font-medium">{{ fmt_dur(trip.duration_min) }}</span>
+          {%- if trip.driving_min is not none %}
+          <span class="block text-xs text-slate-500">{{ t('trip_time_split').replace('{driving}', fmt_dur(trip.driving_min)).replace('{stopped}', fmt_dur(trip.stopped_min)) }}</span>
+          {%- if trip.unknown_min >= 1 %}
+          <span class="block text-xs text-slate-500">{{ t('trip_time_unknown').replace('{unknown}', fmt_dur(trip.unknown_min)) }}</span>
+          {%- endif %}
+          {%- endif %}
+        </span>
       </div>
       <div class="flex justify-between">
         <span class="text-slate-400">{{ t('avg_speed') }}</span>
-        <span class="text-white font-medium">{% if trip.avg_speed_kmh is not none %}{{ trip.avg_speed_kmh | speed(0) }}{% else %}—{% endif %}</span>
+        <span class="text-right">
+          <span class="text-white font-medium">{% if trip.avg_speed_kmh is not none %}{{ trip.avg_speed_kmh | speed(0) }}{% else %}—{% endif %}</span>
+          {%- if trip.median_speed_kmh is not none %}
+          <span class="block text-xs text-slate-500">{{ t('trip_speed_median').replace('{median}', trip.median_speed_kmh | speed(0)) }}</span>
+          {%- endif %}
+        </span>
       </div>
       <div class="flex justify-between">
-        <span class="text-slate-400">{{ t('max_speed') }}</span>
+        <span class="text-slate-400">{{ t('max_speed') }}{% if trip.max_speed_sampled %} <span class="text-slate-600 cursor-help" tabindex="0" data-tip="{{ t('max_speed_sampled_help') }}">ⓘ</span>{% endif %}</span>
         <span class="text-white font-medium">{% if trip.max_speed_kmh is not none %}{{ trip.max_speed_kmh | speed(0) }}{% else %}—{% endif %}</span>
       </div>
+      {# Hidden on a range extender like the regen figure: with the generator running, the pack's power is not the drive's. #}
+      {% if not is_reev %}
       <div class="flex justify-between">
-        <span class="text-slate-400">{{ t('elevation') }}</span>
+        <span class="text-slate-400">{{ t('max_power') }} <span class="text-slate-600 cursor-help" tabindex="0" data-tip="{{ t('max_power_help') }}">ⓘ</span></span>
+        <span class="text-white font-medium">{% if trip.max_power_kw is not none %}{{ trip.max_power_kw|dec(0) }} kW{% else %}—{% endif %}</span>
+      </div>
+      <div class="flex justify-between">
+        <span class="text-slate-400">{{ t('max_regen') }} <span class="text-slate-600 cursor-help" tabindex="0" data-tip="{{ t('max_regen_help') }}">ⓘ</span></span>
+        <span class="text-white font-medium">{% if trip.max_regen_kw is not none %}{{ trip.max_regen_kw|dec(0) }} kW{% else %}—{% endif %}</span>
+      </div>
+      {% endif %}
+      <div class="flex justify-between">
+        <span class="text-slate-400">{{ t('battery_temp') }} <span class="text-slate-600 cursor-help" tabindex="0" data-tip="{{ t('battery_temp_trip_help') }}">ⓘ</span></span>
+        <span class="text-white font-medium">
+          {%- if trip.battery_temp_max_c is not none -%}
+          {{ trip.battery_temp_min_c | temp_range(trip.battery_temp_max_c, 0) }}
+          {%- else -%}—{%- endif -%}
+        </span>
+      </div>
+      <div class="flex justify-between">
+        <span class="text-slate-400">{{ t('elevation_ascent_descent') }} <span class="text-slate-600 cursor-help" tabindex="0" data-tip="{{ t('elevation_trip_help') }}">ⓘ</span></span>
         <span class="text-white font-medium">
           {%- if trip.elevation_gain_m is not none -%}
           <span title="{{ t('elevation_gain') }}">↑&nbsp;{{ trip.elevation_gain_m | elev(0) }}</span>&nbsp;&nbsp;<span title="{{ t('elevation_loss') }}">↓&nbsp;{{ trip.elevation_loss_m | elev(0) }}</span>
@@ -299,12 +350,10 @@
         </span>
       </div>
       <div class="flex justify-between">
-        <span class="text-slate-400">{{ t('outside_temp') }}</span>
+        <span class="text-slate-400">{{ t('outside_temp') }} <span class="text-slate-600 cursor-help" tabindex="0" data-tip="{{ t('outside_temp_trip_help') }}">ⓘ</span></span>
         <span class="text-white font-medium">
-          {%- if trip.outside_temp_start_c is not none and trip.outside_temp_end_c is not none -%}
-          {{ trip.outside_temp_start_c | temp(1) }}&nbsp;→&nbsp;{{ trip.outside_temp_end_c | temp(1) }}
-          {%- elif trip.outside_temp_start_c is not none -%}{{ trip.outside_temp_start_c | temp(1) }}
-          {%- elif trip.outside_temp_end_c is not none -%}{{ trip.outside_temp_end_c | temp(1) }}
+          {%- if trip.outside_temp_max_c is not none -%}
+          {{ trip.outside_temp_min_c | temp_range(trip.outside_temp_max_c, 1) }}
           {%- else -%}—{%- endif -%}
         </span>
       </div>
@@ -329,7 +378,8 @@
         <span class="text-slate-400">{{ t('gps_points') }}</span>
         <span class="text-white font-medium">{{ trip.positions|length }}</span>
       </div>
-    </div>
+      </div>
+    </details>
 
     {% if trip.ec_stable and trip.ec_kwh and trip.ec_kwh > 0 %}
     <!-- Consumo ufficiale (cloud getEC) di QUESTO viaggio: totale + Guida/AC/Altro in kWh.
@@ -372,19 +422,23 @@
     <div class="card">
       <div class="flex items-center justify-between mb-3">
         <h2 class="font-semibold text-white text-sm">📝 {{ t('user_note') }}</h2>
-        <button type="button" title="{{ t('auto_note_generate_btn') }}"
-                hx-post="api/trips/{{ trip.id }}/auto-note"
-                hx-target="#trip-note-text-{{ trip.id }}" hx-swap="outerHTML"
-                hx-disabled-elt="this" hx-indicator="#trip-auto-note-spin-{{ trip.id }}"
-                {% if trip.note %}hx-confirm="{{ t('auto_note_overwrite_confirm') }}"{% endif %}
-                class="text-slate-500 hover:text-brand disabled:opacity-40"
-                style="background:none;border:none;cursor:pointer;padding:0;font-size:14px;line-height:1">
-          <span id="trip-auto-note-spin-{{ trip.id }}" class="htmx-indicator">⏳</span><span>🧭</span>
-        </button>
       </div>
       <form hx-post="api/trips/{{ trip.id }}/note" hx-target="#trip-note-msg" hx-swap="innerHTML"
             hx-on::after-request="if(event.detail.successful){var m=document.getElementById('trip-note-msg');setTimeout(function(){if(m)m.textContent='';},2500);}">
         {% include "partials/trip_note_textarea.html" %}
+
+        {% if trip.additional_segment_notes %}
+        <div class="mt-3 space-y-3">
+          {% for segment in trip.additional_segment_notes %}
+          <div class="border-t border-slate-700/70 pt-3">
+            <div class="mb-1 text-xs font-medium text-slate-400">
+              {{ segment.started_at[11:16] }} &rarr; {{ segment.ended_at|end_time(segment.started_at) }}
+            </div>
+            <div class="whitespace-pre-wrap break-words text-sm text-slate-200">{{ segment.note }}</div>
+          </div>
+          {% endfor %}
+        </div>
+        {% endif %}
 
         <div class="grid grid-cols-2 gap-3 mt-3">
           <div>
@@ -426,8 +480,9 @@
     <div id="map" style="height:460px"></div>
     <link rel="stylesheet" href="static/vendor/leaflet/leaflet.css"/>
     <script src="static/vendor/leaflet/leaflet.js"></script>
+    <script src="static/trip-track.js"></script>
     <script>
-      const coords = {{ trip.positions | tojson }};
+      const coords ={{ trip.positions | tojson }};
       const latlngs = coords.map(p => [p.latitude, p.longitude]);
       const map = L.map('map').fitBounds(L.latLngBounds(latlngs).pad(0.15));
       L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -436,21 +491,8 @@
         referrerPolicy: 'origin'
       }).addTo(map);
 
-      // Route: single red with white outline for visibility. A gap-bridge run (real signal
-      // loss — see db_reader._split_track_gaps) gets its own white casing too, then a bold
-      // magenta dash on top — a colour used nowhere else on this map (not the route red, not
-      // OSM's own grey/brown dashed tracks and borders), wide enough to read as a deliberate
-      // marking instead of blending into the base tiles.
       const routeSegments = {{ trip.route_segments | tojson }};
-      routeSegments.forEach(function (run) {
-        if (run.gap) {
-          L.polyline(run.points, { color: '#ffffff', weight: 6, opacity: 0.6, lineCap: 'round' }).addTo(map);
-          L.polyline(run.points, { color: '#ec4899', weight: 3.5, opacity: 0.95, dashArray: '10,8', lineCap: 'round' }).addTo(map);
-        } else {
-          L.polyline(run.points, { color: '#ffffff', weight: 8, opacity: 0.7 }).addTo(map);
-          L.polyline(run.points, { color: '#e63946', weight: 5, opacity: 1.0 }).addTo(map);
-        }
-      });
+      tripTrack(routeSegments).addTo(map);
 
       // Flag markers
       const flagIcon = (color, checkered) => L.divIcon({
@@ -489,301 +531,18 @@
         const popup = '<div style="min-width:160px">'
           + '<b>' + (c.location_name ? c.location_name.replace(/</g, '&lt;') : '{{ t('map_unnamed_station') }}') + '</b><br>'
           + c.kwh + ' kWh' + (c.cost_fmt != null ? ' · ' + c.cost_fmt : '') + '<hr style="margin:6px 0;border-color:#334155">'
-          + '<a href="charges?highlight=' + c.id + '" style="color:#f59e0b;font-weight:600;text-decoration:none">'
+          + '<a href="charges?highlight=' + c.id + '&amp;back=' + {{ here|urlencode|tojson }} + '" style="color:#f59e0b;font-weight:600;text-decoration:none">'
           + '{{ t('trip_charge_view') }}</a></div>';
         L.marker([c.latitude, c.longitude], {icon: chargeIcon}).addTo(map).bindPopup(popup);
       });
     </script>
-    <!-- SoC & speed profile -->
-    <div style="padding:12px 16px 16px; background:#1e293b; border-top:1px solid #334155">
-      <div class="flex flex-col sm:flex-row justify-between sm:items-center gap-2 mb-1">
-        <span style="font-size:11px;color:#94a3b8;text-transform:uppercase;letter-spacing:.06em">{{ t('trip_profile') }}</span>
-        <span class="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-500">
-          <span class="whitespace-nowrap"><span style="color:#22c55e">■</span> {{ t('soc') }}</span>
-          <span class="whitespace-nowrap"><span style="color:#38bdf8">■</span> {{ t('speed') }}</span>
-          <span id="trip-profile-elev-legend" class="whitespace-nowrap" style="display:none"><span style="color:#c9975f">■</span> {{ t('altitude') }}</span>
-        </span>
-      </div>
-      <div id="trip-profile" style="height:200px"></div>
-    </div>
-    <script>
-    (function () {
-      var el = document.getElementById('trip-profile');
-      if (!el || typeof ApexCharts === 'undefined') return;
-      if (el._c) { try { el._c.destroy(); } catch (e) {} }
-      var pts = coords.filter(function (p) { return p.soc != null || p.speed_kmh != null; });
-      if (!pts.length) return;
-
-      // X labels = minutes since trip start (or sample index if timestamps absent). The axis is
-      // categorical, so every sample takes an equal slot no matter the time between them — hence
-      // the blank filling below, without which a gap would silently close up.
-      var t0 = pts[0].recorded_at ? new Date(pts[0].recorded_at).getTime() : NaN;
-      var useTime = !isNaN(t0);
-      var labels = [], socArr = [], spdArr = [], elevArr = [];
-      var plot = [];        // mirrors the series (blanks included) so hover indices stay aligned
-
-      // Typical spacing between samples — the yardstick for telling a gap from a sample. Median,
-      // so the gaps we are looking for don't skew the very measure meant to find them.
-      var step = 0;
-      if (useTime) {
-        var deltas = [];
-        for (var j = 1; j < pts.length; j++) {
-          var d = new Date(pts[j].recorded_at).getTime() - new Date(pts[j - 1].recorded_at).getTime();
-          if (d > 0) deltas.push(d);
-        }
-        deltas.sort(function (a, b) { return a - b; });
-        step = deltas.length ? deltas[Math.floor(deltas.length / 2)] : 0;
-      }
-
-      var labelMs = [];     // the instant behind each category, so a pause can be pinned to one
-      function pushLabel(ms) {
-        labelMs.push(useTime && !isNaN(ms) ? ms : NaN);
-        labels.push(useTime && !isNaN(ms)
-          ? Math.max(0, Math.round((ms - t0) / 60000)) + "′"
-          : String(labels.length));
-      }
-
-      pts.forEach(function (p, i) {
-        var t = useTime ? new Date(p.recorded_at).getTime() : NaN;
-        // A hole in the recording: the car was off-grid and the cloud was re-serving its last frame,
-        // so the poller wrote nothing rather than invent samples (#128). Fill the stretch with blanks
-        // — ApexCharts breaks a line on null — so the hole shows at its true width. Joining the two
-        // ends instead would draw a straight, plausible-looking line over minutes that never existed.
-        if (useTime && step > 0 && i > 0 && !isNaN(t)) {
-          var prev = new Date(pts[i - 1].recorded_at).getTime();
-          if (!isNaN(prev) && t - prev > step * 3) {
-            var blanks = Math.min(Math.round((t - prev) / step) - 1, 300);   // sanity cap
-            for (var k = 1; k <= blanks; k++) {
-              pushLabel(prev + step * k);
-              socArr.push(null); spdArr.push(null); elevArr.push(null); plot.push(null);
-            }
-          }
-        }
-        pushLabel(t);
-        socArr.push(p.soc != null ? p.soc : null);
-        spdArr.push(p.speed_kmh != null ? p.speed_kmh : 0);
-        elevArr.push(p.elevation_m != null ? p.elevation_m : null);
-        plot.push(p);
-      });
-
-      // ⏸ The stops INSIDE a joined journey. Without them this stretch is a blank identical to a
-      // signal dropout — and that is exactly how it was read: @pdifeo (#159) was told twice that
-      // his own stop was the car losing the cloud. The band says who made the gap; the label says
-      // how long it lasted.
-      var pauseAnns = [];
-      var mergePauses = {{ (trip.merge_pauses or []) | tojson }};
-      if (useTime && mergePauses.length) {
-        var nearest = function (ms) {          // the category closest in time to that instant
-          var best = -1, bestD = Infinity;
-          for (var q = 0; q < labelMs.length; q++) {
-            if (isNaN(labelMs[q])) continue;
-            var dd = Math.abs(labelMs[q] - ms);
-            if (dd < bestD) { bestD = dd; best = q; }
-          }
-          return best;
-        };
-        mergePauses.forEach(function (p) {
-          var a = new Date(p.from).getTime(), b = new Date(p.to).getTime();
-          if (isNaN(a) || isNaN(b)) return;
-          var ia = nearest(a), ib = nearest(b);
-          if (ia < 0 || ib < 0 || ia === ib) return;
-          pauseAnns.push({
-            x: labels[ia], x2: labels[ib],
-            fillColor: '#64748b', opacity: 0.14, borderColor: '#64748b',
-            label: { text: '⏸ ' + p.minutes + '′', borderColor: '#64748b',
-                     style: { background: '#334155', color: '#e2e8f0', fontSize: '10px' } }
-          });
-        });
-      }
-
-      var nmSoc = {{ t('soc')|tojson }};
-      var nmSpd = {{ t('speed')|tojson }};
-      var nmElev = {{ t('altitude')|tojson }};
-      // Display-time speed unit conversion (data stays metric km/h).
-      var spdFactor = {{ speed_val(1, 6) }};   // 1 (metric) or 0.621371 (imperial)
-      var spdUnit = {{ speed_unit()|tojson }}; // "km/h" or "mph"
-      spdArr = spdArr.map(function (v) { return v != null ? v * spdFactor : v; });
-      var spdMax = 1;
-      spdArr.forEach(function (v) { if (v != null && v > spdMax) spdMax = v; });
-      spdMax = Math.ceil(spdMax / 10) * 10;
-
-      // Elevation is a lookup on a downsampled + interpolated track (see _interpolate_elevation) —
-      // only enriched trips have it, so the series is added only when at least one real value made it
-      // through. Older / not-yet-enriched trips keep the plain SoC+speed chart unchanged.
-      var hasElev = elevArr.some(function (v) { return v != null; });
-      var elevFactor = {{ elev_val(1, 6) }};    // 1 (metric) or 3.28084 (imperial)
-      var elevUnit = {{ elev_unit()|tojson }};  // "m" or "ft"
-      if (hasElev) {
-        elevArr = elevArr.map(function (v) { return v != null ? v * elevFactor : v; });
-        document.getElementById('trip-profile-elev-legend').style.display = '';
-      }
-
-      // Bridge gaps in the terrain line with a dashed segment. SoC/speed truly are unknowable during
-      // a signal drop-out and stay blank (see above), but the ground under the car didn't disappear —
-      // linearly interpolating between the last and next known elevation gives a readable relief
-      // silhouette, with the dash marking it as reconstructed rather than measured.
-      var elevDashArr = elevArr.map(function () { return null; });
-      var hasElevDash = false;
-      if (hasElev) {
-        var gapStart = -1;
-        for (var g = 0; g < elevArr.length; g++) {
-          if (elevArr[g] == null) {
-            if (gapStart < 0) gapStart = g;
-          } else if (gapStart >= 0) {
-            var before = gapStart - 1;
-            if (before >= 0 && elevArr[before] != null) {
-              var v0 = elevArr[before], v1 = elevArr[g], span = g - before;
-              elevDashArr[before] = v0;
-              for (var k = gapStart; k < g; k++) {
-                elevDashArr[k] = v0 + (v1 - v0) * ((k - before) / span);
-              }
-              elevDashArr[g] = v1;
-              hasElevDash = true;
-            }
-            gapStart = -1;
-          }
-        }
-      }
-
-      // Zoom the SoC axis to the trip's own range (it usually only drops a few %),
-      // otherwise a 96→90% drive looks flat pinned to the top of a 0–100 axis.
-      var socVals = socArr.filter(function (v) { return v != null; });
-      var sMin = Math.min.apply(null, socVals), sMax = Math.max.apply(null, socVals);
-      var socLo = Math.max(0, Math.floor(sMin - 1));
-      var socHi = Math.min(100, Math.ceil(sMax + 1));
-      if (socHi - socLo < 4) { socLo = Math.max(0, socHi - 4); }   // keep a sane minimum span
-
-      // Cursor marker: shown on the map while hovering the chart. Indexes plot[] (not pts[]) —
-      // the blanks inserted for gaps shift every later sample, and a null there hides the marker,
-      // which is right: over a gap we have no position to point at.
-      var cursorMarker = null;
-      function showCursor(i) {
-        if (i < 0 || !plot[i] || plot[i].latitude == null) { hideCursor(); return; }
-        var ll = [plot[i].latitude, plot[i].longitude];
-        if (!cursorMarker) {
-          cursorMarker = L.circleMarker(ll, {
-            radius: 7, color: '#fff', weight: 2,
-            fillColor: '#38bdf8', fillOpacity: 1, interactive: false
-          }).addTo(map);
-        } else {
-          cursorMarker.setLatLng(ll);
-          if (!map.hasLayer(cursorMarker)) cursorMarker.addTo(map);
-        }
-      }
-      function hideCursor() {
-        if (cursorMarker && map.hasLayer(cursorMarker)) map.removeLayer(cursorMarker);
-      }
-
-      // Mirrors the proven charge-power chart config: plain-array data + categories +
-      // seriesName-bound y-axes (multi-axis needs the binding or nothing draws). Elevation, when
-      // present, is unshifted to the FRONT of every array — ApexCharts stacks series bottom-to-top in
-      // array order, so it draws as the backdrop terrain relief that SoC/speed sit over, matching a
-      // topographic cross-section under the trip's actual telemetry.
-      var series = [{ name: nmSoc, type: 'area', data: socArr },
-                    { name: nmSpd, type: 'line', data: spdArr }];
-      var colors = ['#22c55e', '#38bdf8'];
-      var strokeWidth = [2, 2];
-      var strokeDash = [0, 0];
-      var fillType = ['gradient', 'solid'];
-      var fillOpacity = [1, 1];
-      var opacityFrom = [0.35, 0.35];
-      var opacityTo = [0.05, 0.05];
-      var yaxis = [
-        { seriesName: nmSoc, min: socLo, max: socHi, forceNiceScale: true,
-          labels: { style: { colors: '#22c55e', fontSize: '10px' }, formatter: function (v) { return v != null ? v.toFixed(0) : ''; } },
-          title: { text: 'SoC %', style: { color: '#22c55e', fontSize: '10px' } } },
-        { opposite: true, seriesName: nmSpd, min: 0, max: spdMax,
-          labels: { style: { colors: '#38bdf8', fontSize: '10px' }, formatter: function (v) { return v != null ? v.toFixed(0) : ''; } },
-          title: { text: spdUnit, style: { color: '#38bdf8', fontSize: '10px' } } },
-      ];
-      if (hasElev) {
-        // Light warm tan (not a dark brown) — on this dark navy surface a dark tone would nearly
-        // vanish; a light one stays readable at a flat low-opacity fill and sits far in hue from both
-        // SoC green and speed blue, so it's never confused with either even under a CVD sim.
-        var elevColor = '#c9975f';
-        // A plain line, drawn exactly like SoC and speed — no area fill. Filled, the terrain became
-        // the loudest thing on the chart and buried the two series it exists to give context to
-        // (#159): a soft gradient in v2.7.0, then a flat slab. The relief reads fine as an outline.
-        series.unshift({ name: nmElev, type: 'line', data: elevArr });
-        colors.unshift(elevColor);
-        strokeWidth.unshift(2);
-        strokeDash.unshift(0);
-        fillType.unshift('solid');
-        fillOpacity.unshift(1);      // NOT 0 — on a 'line' series Apex derives the stroke's alpha
-                                     // from this too, so a low value would fade the line itself
-        opacityFrom.unshift(0);      // unused (gradient-only), kept for array-length parity
-        opacityTo.unshift(0);
-        // Hidden axis, no forced min — the relief should read as the trip's OWN climb/descent shape
-        // (auto-scaled to its own min/max), not a slab measured from sea level. A third labelled axis
-        // is also too cramped at 200px; the shared tooltip gives exact values.
-        var elevVals = elevArr.filter(function (v) { return v != null; });
-        var elevLo = Math.floor(Math.min.apply(null, elevVals));
-        var elevHi = Math.ceil(Math.max.apply(null, elevVals));
-        if (elevHi === elevLo) { elevHi = elevLo + 1; }
-        yaxis.unshift({ seriesName: nmElev, show: false, min: elevLo, max: elevHi });
-
-        if (hasElevDash) {
-          // A distinct name, bound to its own y-axis pinned to the SAME min/max as the elevation
-          // axis above — ApexCharts' internal per-series bookkeeping breaks if two series share a
-          // name, and independently auto-scaled axes could otherwise offset the dash from where the
-          // solid line actually ends. Excluded from the tooltip below to avoid a duplicate row.
-          var nmElevDash = nmElev + '__dash';
-          series.push({ name: nmElevDash, type: 'line', data: elevDashArr });
-          colors.push(elevColor);
-          strokeWidth.push(2);       // same weight as the solid elevation line it continues
-          strokeDash.push(4);
-          fillType.push('solid');
-          fillOpacity.push(1);   // NOT 0 — for a 'line' series Apex derives the stroke's alpha from
-                                  // this value too, so 0 here made the dash invisible despite drawing
-          opacityFrom.push(0);
-          opacityTo.push(0);
-          yaxis.push({ seriesName: nmElevDash, show: false, min: elevLo, max: elevHi });
-        }
-      }
-
-      var tooltipSeries = series.map(function (_, i) { return i; });
-      if (hasElevDash) tooltipSeries.pop();   // drop the bridge series — same values, duplicate row
-
-      el._c = new ApexCharts(el, {
-        chart: { type: 'line', height: 200, toolbar: { show: false }, zoom: { enabled: false },
-                 fontFamily: 'inherit', background: 'transparent', parentHeightOffset: 0,
-                 animations: { enabled: false },
-                 events: {
-                   mouseMove: function (event, ctx, config) { showCursor(config.dataPointIndex); },
-                   mouseLeave: function () { hideCursor(); }
-                 } },
-        series: series,
-        colors: colors,
-        stroke: { curve: 'smooth', width: strokeWidth, dashArray: strokeDash },
-        fill: { type: fillType, opacity: fillOpacity,
-                gradient: { shadeIntensity: 1, opacityFrom: opacityFrom, opacityTo: opacityTo, stops: [0, 100] } },
-        dataLabels: { enabled: false },
-        markers: { size: 0 },
-        annotations: { xaxis: pauseAnns },
-        xaxis: { categories: labels, tickAmount: 6, tooltip: { enabled: false },
-                 labels: { style: { colors: '#64748b', fontSize: '10px' }, rotate: 0, hideOverlappingLabels: true },
-                 axisBorder: { show: false }, axisTicks: { show: false } },
-        yaxis: yaxis,
-        grid: { borderColor: '#1e293b', strokeDashArray: 4, padding: { left: 8, right: 8 } },
-        legend: { show: false },
-        tooltip: { theme: 'dark', shared: true, intersect: false, enabledOnSeries: tooltipSeries,
-                   y: { formatter: function (v, o) {
-                          if (v == null) return '';
-                          var nm = o.w.config.series[o.seriesIndex].name;
-                          if (nm === nmSpd) return v.toFixed(0) + ' ' + spdUnit;
-                          if (nm === nmElev) return v.toFixed(0) + ' ' + elevUnit;
-                          return v.toFixed(1) + ' %';
-                        } } },
-      });
-      el._c.render();
-    })();
-    </script>
+    {% with points_js='coords', pauses=trip.merge_pauses, map_cursor=true %}{% include "partials/trip_profile_chart.html" %}{% endwith %}
 
     {% else %}
     <div class="flex items-center justify-center h-64 text-slate-500">
       <div class="text-center px-4">
         <div class="text-4xl mb-2">{% if trip.reconstructed %}✨{% else %}📍{% endif %}</div>
-        <div>{{ t('trip_no_route') if trip.reconstructed else t('not_enough_gps') }}</div>
+        <div>{{ t('gps_unavailable') if trip.is_cloud else (t('trip_no_route') if trip.reconstructed else t('not_enough_gps')) }}</div>
         {% if trip.reconstructed %}
         <div class="text-xs text-slate-600 mt-1 max-w-xs mx-auto">{{ t('trip_reconstructed_hint') }}</div>
         {% endif %}

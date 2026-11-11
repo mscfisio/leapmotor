@@ -4,7 +4,7 @@
 companion (think *TeslaMate* for Leapmotor). Runs as a **standalone Docker container** or as a
 **Home Assistant add-on**.
 
-Supported models: **B05 · B10 · C10 · T03** — full‑electric (BEV) only, European spec (the Leapmotor lineup distributed by Stellantis/Leapmotor). Not for REEV / range‑extender versions.
+Supported models: **B03X · B05 · B10 · C10 · T03**, European spec (the Leapmotor lineup distributed by Stellantis/Leapmotor) — battery‑electric and, since **4.7.0**, the **REEV** range‑extender versions. A range extender does not get a regen figure: a generator refilling the pack while you drive cannot be told apart from braking.
 
 ![Overview](https://raw.githubusercontent.com/ProtossBlaster/leapmotor-mate/main/docs/screenshots/overview.png)
 
@@ -16,7 +16,7 @@ Supported models: **B05 · B10 · C10 · T03** — full‑electric (BEV) only, E
 - 🎛️ **Remote control** — climate, locks, windows, seat heating, charge limit, schedules, one-touch "prepare car"
 - 🏠 **Home Assistant / MQTT** — full MQTT Discovery: sensors, switches and controls appear automatically
 - 🗺️ **Live map**, statistics, vampire-drain insight, ABRP and EVCC integration
-- 🌍 English · Italiano · Français · Deutsch · Polski · Nederlands · Português · Español — metric & imperial units
+- 🌍 English · Italiano · Français · Deutsch · Polski · Nederlands · Português · Español · Čeština — metric & imperial units
 - 🔒 **Self-hosted & private** — your data stays in a local SQLite database, no third-party cloud
 
 ## Quick start
@@ -34,8 +34,7 @@ Then open **http://localhost:4000** and follow the setup wizard (Leapmotor accou
 
 The database is stored in `./data/` (mounted at `/data` in the container).
 
-To update: `docker pull protossblaster/leapmotor-mate:latest` and recreate the container
-(or use [Watchtower](https://containrrr.dev/watchtower/) for automatic updates).
+To update: `docker pull protossblaster/leapmotor-mate:latest` and recreate the container.
 
 ## Tags
 

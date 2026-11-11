@@ -10,6 +10,7 @@ That split is the thing worth protecting: put the date in the card unconditional
 calendar starts repeating its own heading under itself, once per charge.
 """
 import json
+import re
 import pathlib
 
 import pytest
@@ -33,12 +34,16 @@ def _card(**over):
     env = jinja2.Environment(loader=jinja2.FileSystemLoader(str(TEMPLATES)), autoescape=True)
     env.filters["money"] = lambda v: f"{v:.2f} €"
     env.filters["dec"] = lambda v, n=1: "\u2014" if v is None else f"{float(v):.{n}f}"
+    env.filters["end_time"] = lambda end, start: end[11:16]
     return env.get_template("partials/charge_card.html").render(
         # `gross_kwh_ok` is a template GLOBAL in the app (templates.env.globals), not a route
         # variable — that is what stopped the pencil vanishing from the day drawer. A test
         # environment has to mirror it, or the card renders against a Jinja that does not
         # have it.
         gross_kwh_ok=lambda: True,
+        charge_energy=db_reader.charge_energy_view, billed_kwh=db_reader._billed_kwh,
+        billed_basis=db_reader.billed_basis,
+        solar_kwh_ok=lambda: True, solar_mode_on=lambda: False,
         # The price box is labelled in the reader's own money, so every context that
         # renders this card carries the currency — including the four routes that did not.
         currency=db_reader.CURRENCIES["EUR"],
@@ -55,25 +60,27 @@ def test_a_search_result_shows_its_day():
 def test_a_calendar_card_does_not_repeat_the_heading():
     """No date_label → no date. The day drawer already says it once, above."""
     out = _card()
-    assert "2026" not in out.split("<!-- SOC bar -->")[0]
+    row = re.sub(r"<[^>]+>", " ", out.split("</summary>")[0])      # what is read, not the thumbnail's address
+    assert "2026" not in row
 
 
 def test_the_date_sits_above_the_time_not_inside_it():
     """Cosmetic but load-bearing: it must not break the "start → end" line apart."""
     out = _card(date_label="21 lug 2026")
-    head = out.split("<!-- SOC bar -->")[0]
+    head = out.split("</summary>")[0]
     assert head.index("21 lug 2026") < head.index("16:38")
     assert "16:38" in head and "→" in head
 
 
 def test_the_search_route_is_what_sets_it():
-    """Grep the routes rather than run them: the point is that ONLY a search route adds the label,
-    so the calendar views can't start showing it by accident and repeat their own day heading.
+    """Grep the routes rather than run them: the point is that ONLY a route whose rows stand alone (a
+    search, the Overview) adds the label, so the calendar views can't start showing it by accident and
+    repeat their own day heading.
 
-    Viaggi got the same split in #204's release, so there are now two setters — one per page. The
-    rule is not "how many" but "where": every assignment must live inside a /search route. Counting
-    them instead would just need bumping each time a page gains a search, which is how a guard
-    quietly turns into a formality."""
+    Viaggi got the same split in #204's release, so each page's search sets it, and the Overview's
+    recent trips stand alone too. The rule is not "how many" but "where": every assignment must live
+    inside a /search route or the Overview's. Counting them instead would just need bumping each time
+    a page gains a search, which is how a guard quietly turns into a formality."""
     main = (ROOT / "web" / "main.py").read_text()
     search = main[main.index('@app.get("/api/charges/search"'):]
     search = search[:search.index("@app.get", 10)]
@@ -84,7 +91,8 @@ def test_the_search_route_is_what_sets_it():
     setters = [c.splitlines()[0] for c in chunks if '["date_label"] =' in c]
     assert setters, "nobody sets date_label any more — the search results lost their date"
     for route in setters:
-        assert "/search" in route, f"date_label is set outside a search route: @app.{route}"
+        assert "/search" in route or route.startswith('get("/",'), \
+            f"date_label is set outside a search route or the Overview: @app.{route}"
 
 
 def test_the_label_matches_the_history_tree_format():

@@ -6,6 +6,8 @@ network. See web/security.py for the two attack shapes and why add-on mode is ex
 """
 import time
 
+import pytest
+
 import auth
 import security
 
@@ -103,8 +105,130 @@ def test_https_behind_a_proxy_is_not_locked_out(monkeypatch):
 
 def test_framing_is_refused(monkeypatch):
     """Clickjacking is the half no origin check can see: the click really is inside Mate."""
-    assert security.SECURITY_HEADERS["X-Frame-Options"] == "DENY"
-    assert "frame-ancestors 'none'" in security.SECURITY_HEADERS["Content-Security-Policy"]
+    monkeypatch.delenv("MATE_FRAME_ANCESTORS", raising=False)
+    headers = security.security_headers()
+    assert headers["X-Frame-Options"] == "DENY"
+    assert "frame-ancestors 'none'" in headers["Content-Security-Policy"]
+
+
+def test_framing_is_allowed_for_a_declared_frame_ancestor(monkeypatch):
+    """A dashboard you named (e.g. your own Home Assistant) may embed Mate as a panel; nothing
+    else can, since X-Frame-Options has no way to say "this one origin" and would just re-block
+    it, so it's dropped in favor of CSP frame-ancestors alone. 'self' is not added for free —
+    only the origin actually named."""
+    monkeypatch.setenv("MATE_FRAME_ANCESTORS", "https://hass.example.com")
+    headers = security.security_headers()
+    assert "X-Frame-Options" not in headers
+    assert headers["Content-Security-Policy"] == "frame-ancestors https://hass.example.com"
+
+
+def test_trusting_an_origin_for_writes_does_not_also_allow_it_to_frame_mate(monkeypatch):
+    """MATE_TRUSTED_ORIGINS and MATE_FRAME_ANCESTORS are different permissions. Before they were
+    split, setting the one for a reverse proxy silently dropped X-Frame-Options for everyone who
+    had — a proxy host is not automatically a page you want framing the app."""
+    monkeypatch.delenv("MATE_FRAME_ANCESTORS", raising=False)
+    monkeypatch.setenv("MATE_TRUSTED_ORIGINS", "https://mate.example.com")
+    headers = security.security_headers()
+    assert headers["X-Frame-Options"] == "DENY"
+    assert "frame-ancestors 'none'" in headers["Content-Security-Policy"]
+
+
+def test_multiple_frame_ancestors_are_all_named(monkeypatch):
+    """The join() between origins is only exercised with 2+ entries."""
+    monkeypatch.setenv("MATE_FRAME_ANCESTORS", "https://hass.example.com, https://other.example")
+    headers = security.security_headers()
+    assert headers["Content-Security-Policy"] == \
+        "frame-ancestors https://hass.example.com https://other.example"
+
+
+@pytest.mark.parametrize("bad", [
+    "*",
+    "https://*.example.com",
+    "https://a.test; script-src *",
+    "https://a.test/some/path",
+    "https://user@a.test",
+    "https://a.test?x=1",
+    "ftp://a.test",
+    "a.test",
+    "https://пример.рф",
+    "https://a b.test",
+])
+def test_a_malformed_frame_ancestor_is_dropped_not_forwarded(monkeypatch, bad):
+    """Each of these is either an inert-looking permission that is actually real (a wildcard, an
+    injected second directive) or a value that crashes the response outright: current Starlette
+    encodes header values as latin-1, so a non-ASCII entry like the Cyrillic one here would turn
+    EVERY response into a 500 — /healthz included — while the app itself starts clean. Dropping
+    anything that isn't exactly scheme://host[:port] means neither can happen."""
+    monkeypatch.setenv("MATE_FRAME_ANCESTORS", bad)
+    headers = security.security_headers()
+    assert headers["X-Frame-Options"] == "DENY"
+    assert "frame-ancestors 'none'" in headers["Content-Security-Policy"]
+
+
+def test_a_good_entry_survives_alongside_bad_ones(monkeypatch):
+    monkeypatch.setenv("MATE_FRAME_ANCESTORS", "not a url, https://hass.example.com, *")
+    headers = security.security_headers()
+    assert headers["Content-Security-Policy"] == "frame-ancestors https://hass.example.com"
+
+
+def test_a_trailing_slash_from_the_address_bar_is_forgiven(monkeypatch):
+    """What a browser shows for a bare origin — copy it as-is and it still works, since that's
+    the single most likely way anyone pastes one in."""
+    monkeypatch.setenv("MATE_FRAME_ANCESTORS", "https://hass.example.com/")
+    headers = security.security_headers()
+    assert headers["Content-Security-Policy"] == "frame-ancestors https://hass.example.com"
+
+
+def test_a_slash_followed_by_an_actual_path_is_still_rejected(monkeypatch):
+    """The forgiveness above is for the bare trailing "/" only — a real path must still fail."""
+    monkeypatch.setenv("MATE_FRAME_ANCESTORS", "https://hass.example.com/lovelace/")
+    headers = security.security_headers()
+    assert "frame-ancestors 'none'" in headers["Content-Security-Policy"]
+
+
+def test_an_ipv6_literal_is_accepted(monkeypatch):
+    """CSP host-source syntax wants the brackets kept, same as a URL does."""
+    monkeypatch.setenv("MATE_FRAME_ANCESTORS", "http://[::1]:8123")
+    headers = security.security_headers()
+    assert headers["Content-Security-Policy"] == "frame-ancestors http://[::1]:8123"
+
+
+def test_a_rejected_entry_is_logged(monkeypatch, caplog):
+    """Silent used to mean untraceable: MATE_FRAME_ANCESTORS is set to something, the panel still
+    won't embed, and nothing says why. The web log (readable from Settings) now does."""
+    monkeypatch.setenv("MATE_FRAME_ANCESTORS", "https://hass.example.com/some/path")
+    with caplog.at_level("WARNING", logger="security"):
+        security.security_headers()
+    assert "MATE_FRAME_ANCESTORS" in caplog.text
+    assert "https://hass.example.com/some/path" in caplog.text
+
+
+def test_a_rejected_entry_is_logged_once_and_not_once_per_response(monkeypatch, caplog):
+    """security_headers() runs on EVERY response, so a warning built into it repeats with the
+    traffic: Mate's own polling alone is thousands of requests a day, and a single typo would
+    bury the rest of the web log — the log the message tells you to go and read. Warn per bad
+    value, not per request; a different bad value is still worth its own line."""
+    monkeypatch.setattr(security, "_warned", set())
+    monkeypatch.setenv("MATE_FRAME_ANCESTORS", "https://hass.example.com/some/path")
+    with caplog.at_level("WARNING", logger="security"):
+        for _ in range(50):
+            security.security_headers()
+        assert caplog.text.count("MATE_FRAME_ANCESTORS") == 1
+
+        monkeypatch.setenv("MATE_FRAME_ANCESTORS", "https://other.example/*")
+        for _ in range(50):
+            security.security_headers()
+        assert caplog.text.count("MATE_FRAME_ANCESTORS") == 2
+
+
+def test_no_header_value_can_ever_break_latin1_encoding(monkeypatch):
+    """What Starlette actually does when writing a response header out — this reproduces the
+    crash a validation gap would cause, independent of whether fastapi/starlette are installed
+    in this test environment."""
+    for bad in ("https://пример.рф", "*", "https://a.test; evil", "https://a.test\r\nX: y"):
+        monkeypatch.setenv("MATE_FRAME_ANCESTORS", bad)
+        for value in security.security_headers().values():
+            value.encode("latin-1")  # must not raise
 
 
 # ── the login throttle ───────────────────────────────────────────────────────
